@@ -79,6 +79,8 @@ local CFG = {
                                  -- an active quest's kill count to zero.
                                  -- Accept quests by hand.
     QuestRetrySeconds  = 45,
+    QuestGiverName     = nil,    -- exact NPC name, e.g. "Adventurer"
+
 
     -- ENEMY PULL
     -- Roblox hands the nearest player network ownership of unanchored NPCs,
@@ -98,7 +100,7 @@ local CFG = {
     MagnetDistance     = 6,      -- studs in FRONT of you they are stacked
     MagnetDrop         = 2,      -- studs below your root
     MagnetMax          = 40,     -- cap the stack so the client does not choke
-    MagnetAllTypes     = true,   -- false = only your selected enemy names
+    MagnetAllTypes     = false,  -- true = drag every enemy, ignoring selection
 
     -- LEASH
     -- Every Blox Fruits NPC belongs to an area and stops being damageable once
@@ -108,6 +110,17 @@ local CFG = {
     -- and one that cannot be gathered without breaking its leash is left alone.
     LeashRadius        = 120,
     MagnetSeek         = false,  -- move YOU to the spot that reaches the most
+
+    -- ONE TYPE AT A TIME
+    -- Selecting Snow Bandit and Snowman should not mean dragging both species
+    -- into one pile: they live in different parts of the island, each has its
+    -- own leash, and a mixed pile is mostly enemies that cannot be hurt. The
+    -- farm instead works one type through to exhaustion at that type's own
+    -- centre, then moves to the next type's centre.
+    RotateTypes        = true,
+    TypeDwell          = 60,     -- seconds on one type before rotating
+    TypeCentre         = true,   -- stand at the centre of the current type
+    RecentreDistance   = 60,     -- re-centre once you drift this far
 
     -- Pitch applied while hovering and attacking. Attacking from directly above
     -- puts the enemy behind the swing arc; tilting nose-down points it at them.
@@ -233,6 +246,11 @@ local blacklist      = {}          -- model -> expiry clock
 local countedDead    = {}          -- model -> clock, so a corpse counts once
 local targetNames    = nil         -- set of names, or nil = any
 local activeNames    = nil         -- resolved target set (hoisted: pullStep reads it)
+local typeOrder      = {}          -- the selected names, in rotation order
+local typeIdx        = 1
+local typeSince      = 0
+local focusSet       = nil         -- {name = true} for the type being worked now
+local lastQuestAt    = 0
 local anyEnemyMode   = false
 local travelGoal     = nil
 
@@ -678,8 +696,17 @@ local function homeOf(model, root)
     return h
 end
 
+-- Which names may be pulled right now. While rotating, only the type being
+-- worked -- pulling the other selected species just stacks enemies that are
+-- outside their own area and cannot be damaged.
+local function pullFilter()
+    if CFG.MagnetAllTypes then return nil end
+    if CFG.RotateTypes and focusSet then return focusSet end
+    return activeNames
+end
+
 -- Collect live enemies within range, remembering where each one belongs.
-local function gather(range, filtered)
+local function gather(range, names)
     local folder = workspace:FindFirstChild("Enemies")
     local _, root = parts()
     if not folder or not root then return {} end
@@ -689,7 +716,7 @@ local function gather(range, filtered)
             local hum = m:FindFirstChildOfClass("Humanoid")
             local r = m:FindFirstChild("HumanoidRootPart")
             if hum and r and hum.Health > 0 then
-                if (not filtered) or (not activeNames) or activeNames[cleanName(m)] then
+                if (not names) or names[cleanName(m)] then
                     local d = (r.Position - root.Position).Magnitude
                     if d <= range then
                         table.insert(list, { m = m, r = r, d = d, home = homeOf(m, r) })
@@ -704,8 +731,8 @@ end
 
 -- Stack enemies around a point, refusing any move that would break a leash.
 -- Used by both PULL (held under you) and MAGNET (held in front of you).
-local function holdEnemies(centre, radius, range, filtered, cap)
-    local list = gather(range, filtered)
+local function holdEnemies(centre, radius, range, names, cap)
+    local list = gather(range, names)
     table.clear(pulled)
     local n, skipped = 0, 0
     for i, e in ipairs(list) do
@@ -734,7 +761,7 @@ end
 -- count how many others share its neighbourhood, and take that centroid.
 -- This is the "stand where I can pull them all" position.
 local function packCentre()
-    local list = gather(CFG.MagnetRange, not CFG.MagnetAllTypes)
+    local list = gather(CFG.MagnetRange, pullFilter())
     if #list == 0 then return nil, 0 end
     local bestPos, bestN = nil, 0
     for _, a in ipairs(list) do
@@ -756,14 +783,14 @@ local function magnetStep()
     if not root then return end
     local centre = (root.CFrame * CFrame.new(0, -CFG.MagnetDrop, -CFG.MagnetDistance)).Position
     stats.pulled = holdEnemies(centre, 3, CFG.MagnetRange,
-        not CFG.MagnetAllTypes, CFG.MagnetMax)
+        pullFilter(), CFG.MagnetMax)
 end
 
 local function pullStep()
     local _, root = parts()
     if not root then return end
     local centre = root.Position - Vector3.new(0, CFG.PullDrop, 0)
-    stats.pulled = holdEnemies(centre, CFG.PullRadius, CFG.PullRange, true, 60)
+    stats.pulled = holdEnemies(centre, CFG.PullRadius, CFG.PullRange, pullFilter(), 60)
 end
 
 -- One connection drives both. Magnet wins when both are on, because holding a
@@ -839,10 +866,11 @@ local function questMarker(model)
     return ok and hit or false
 end
 
-local function findQuestGiver(maxRange)
+local function findQuestGiver(maxRange, wantName)
     local _, root = parts()
     if not root then return nil end
     maxRange = maxRange or 300
+    local want = wantName and string.lower(wantName) or nil
 
     local cands, seen = {}, {}
     for _, src in ipairs(npcSources()) do
@@ -857,13 +885,21 @@ local function findQuestGiver(maxRange)
                         local named = string.find(low, "quest", 1, true)
                                    or string.find(low, "giver", 1, true)
                         local marker = questMarker(m)
-                        -- a marked giver always beats an unmarked NPC
-                        local score = d - (marker and 5000 or 0) - (named and 1000 or 0)
-                        if marker or named or m:FindFirstChildOfClass("Humanoid") then
+                        -- an exact name beats everything: quest givers are
+                        -- ordinary NPCs with island-specific names, and the
+                        -- name is the most reliable identifier there is
+                        local exact = want and (low == want)
+                        local score = d
+                            - (exact and 50000 or 0)
+                            - (marker and 5000 or 0)
+                            - (named and 1000 or 0)
+                        if exact or marker or named
+                            or m:FindFirstChildOfClass("Humanoid") then
                             table.insert(cands, {
                                 model = m, part = part, dist = d, name = m.Name,
                                 score = score,
-                                signal = (marker and "QUEST marker")
+                                signal = (exact and "EXACT NAME")
+                                      or (marker and "QUEST marker")
                                       or (named and "name") or "npc",
                                 interact = m:FindFirstChildWhichIsA("ClickDetector", true)
                                         or m:FindFirstChildWhichIsA("ProximityPrompt", true),
@@ -1044,6 +1080,17 @@ end
 -- the names public Blox Fruits scripts have used for years; where one is wrong
 -- the server simply refuses and nothing is lost. The QUEST tab has a box for
 -- typing a name directly when a mapping here is stale.
+-- Quest givers are ordinary NPCs with island-specific flavour names. Naming
+-- one makes it unmissable; without a name the "?" billboard is the fallback.
+-- Add to this as you confirm them, or type one into the QUEST tab.
+local GIVER_NAMES = {
+    ["Monkey"]      = "Adventurer",
+    ["Gorilla"]     = "Adventurer",
+    ["Snow Bandit"] = "Villager",
+    ["Snowman"]     = "Villager",
+}
+P.giverNames = GIVER_NAMES
+
 local QUESTS = {
     ["Bandit"]                = { "BanditQuest1", 1 },
     ["Monkey"]                = { "JungleQuest", 1 },
@@ -1149,7 +1196,13 @@ function P.takeQuest()
         return false
     end
 
-    local giver = findQuestGiver(300) or findQuestGiver(2500)
+    -- Prefer a named giver: whatever you typed, else the one known for the
+    -- enemy being farmed, else fall back to the QUEST billboard scan.
+    local want = CFG.QuestGiverName
+    if not want or want == "" then
+        for n in pairs(activeNames or {}) do want = GIVER_NAMES[n] or want end
+    end
+    local giver = findQuestGiver(300, want) or findQuestGiver(2500, want)
     if not giver then
         P.lastQuestResult = "no NPC found - try START QUEST instead"
         say(P.lastQuestResult)
@@ -1213,7 +1266,8 @@ function P.takeQuest()
 
     clearHold()
     anchor = nil
-    setState("RESOLVE")
+    -- straight back to fighting; re-resolving would restart the type rotation
+    setState("ENGAGE")
     progress()
     return clicked
 end
@@ -1342,6 +1396,50 @@ local function escalate(currentCluster)
 end
 
 -- =========================================================
+-- TYPE ROTATION
+-- =========================================================
+-- Picking Snow Bandit and Snowman does not mean fighting them as one pile.
+-- They occupy different parts of the island and each has its own leash, so a
+-- mixed gather is mostly enemies that cannot be damaged. One type is worked to
+-- exhaustion at that type's own centre, then the next type's centre.
+local function locFor(name)
+    for _, row in ipairs(LEVELS) do
+        if row[3] == name then return row[4] end
+    end
+    return nil
+end
+
+local function setFocus(i)
+    typeSince = os.clock()
+    local n = typeOrder[i]
+    focusSet = n and { [n] = true } or nil
+    P.focusName = n
+    if n then
+        travelGoal = locFor(n) or travelGoal
+        say(string.format("type %d/%d: %s", i, #typeOrder, n))
+    end
+end
+
+local function rotateType()
+    typeSince = os.clock()
+    if #typeOrder < 2 then return end
+    typeIdx = (typeIdx % #typeOrder) + 1
+    setFocus(typeIdx)
+    anchor = nil
+end
+P.nextType = rotateType
+
+local function buildTypeOrder(names)
+    table.clear(typeOrder)
+    if names then
+        for n in pairs(names) do table.insert(typeOrder, n) end
+        table.sort(typeOrder)
+    end
+    typeIdx = 1
+    setFocus(1)
+end
+
+-- =========================================================
 -- RESOLVE  (which enemies, and where)
 -- =========================================================
 local function resolveTargets()
@@ -1432,13 +1530,33 @@ local function step()
             label = table.concat(list, ", ")
         end
         say("targets: " .. label)
+        buildTypeOrder(names)
         setState("ENGAGE")
         progress()
         return
     end
 
+    -- ---------- AUTO QUEST ----------
+    -- Only when asked. With AUTO off nothing is ever taken, which is the
+    -- correct behaviour for farming a spot that has no quest.
+    if CFG.AutoQuest and not anyEnemyMode
+        and os.clock() - lastQuestAt > CFG.QuestRetrySeconds
+        and not P.questActive() then
+        lastQuestAt = os.clock()
+        pcall(P.takeQuest)
+        return
+    end
+
     -- ---------- find work ----------
-    local list = liveEnemies(activeNames)
+    -- While rotating, only the focused type counts as work.
+    local wantNames = (CFG.RotateTypes and focusSet) or activeNames
+    local list = liveEnemies(wantNames)
+
+    -- this type is finished here: move on to the next selected type
+    if #list == 0 and CFG.RotateTypes and #typeOrder > 1 then
+        rotateType()
+        list = liveEnemies(focusSet)
+    end
 
     if #list == 0 and CFG.AnyEnemyFallback and activeNames then
         list = liveEnemies(nil)      -- nothing of the quest type loaded: take EXP
@@ -1468,6 +1586,24 @@ local function step()
 
     -- ---------- ENGAGE ----------
     if state ~= "ENGAGE" then setState("ENGAGE") end
+
+    -- Position on THIS type's patch of the island. homePos is where each one
+    -- was first seen, so the centre is the species' real ground, not a point
+    -- skewed by enemies a previous pull already moved.
+    if CFG.RotateTypes and CFG.TypeCentre and #list > 1 then
+        local sum = Vector3.zero
+        for _, e in ipairs(list) do
+            sum += (homePos[e.model] or e.root.Position)
+        end
+        local centre = sum / #list
+        if (root.Position - centre).Magnitude > CFG.RecentreDistance then
+            say("centring on " .. tostring(P.focusName or "targets"))
+            moveTo(centre + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
+            setAnchor(centre, nil)
+            local _, r2 = parts()
+            if r2 then root = r2 end
+        end
+    end
 
     -- ONE target at a time, exactly like the chest finder picks one chest.
     -- Cluster anchoring looked clever and did not work: it hovered over a
@@ -1550,6 +1686,12 @@ local function step()
     if os.clock() - lastProgressAt > CFG.StuckSeconds then
         blacklist[target.model] = os.clock() + 20
         escalate(nil)
+    end
+
+    -- time is up on this type even if it is not exhausted
+    if CFG.RotateTypes and #typeOrder > 1
+        and os.clock() - typeSince > CFG.TypeDwell then
+        rotateType()
     end
 
     if os.clock() - stateEnteredAt > CFG.EngageTimeout then
@@ -1927,6 +2069,31 @@ local function buildUI()
             end
             tgt.Text = #names > 0 and table.concat(names, ", ") or "any enemy"
         end)
+
+        label(page, "ONE TYPE AT A TIME")
+        local rrot = row(page)
+        button(rrot, 0, 200, "ROTATE", NEU, function()
+            CFG.RotateTypes = not CFG.RotateTypes
+        end, function(b)
+            b.Text = CFG.RotateTypes and "ROTATE: ONE TYPE" or "ROTATE: ALL AT ONCE"
+            b.BackgroundColor3 = CFG.RotateTypes and ON or NEU
+        end)
+        button(rrot, 208, 100, "NEXT TYPE", Color3.fromRGB(40, 56, 74), function()
+            pcall(P.nextType)
+        end)
+        button(rrot, 314, 100, "CENTRE", NEU, function()
+            CFG.TypeCentre = not CFG.TypeCentre
+        end, function(b)
+            b.Text = CFG.TypeCentre and "CENTRE: ON" or "CENTRE: OFF"
+            b.BackgroundColor3 = CFG.TypeCentre and ON or NEU
+        end)
+        local focusLbl = label(page, "", 11, Color3.fromRGB(210, 226, 240))
+        table.insert(live, function()
+            focusLbl.Text = "working: " .. tostring(P.focusName or "-")
+        end)
+        stepper(page, "secs per type",
+            function() return CFG.TypeDwell end,
+            function(v) CFG.TypeDwell = v end, 15, 15, 600)
 
         -- pick a specific enemy from whatever is loaded right now
         label(page, "PICK A LOADED ENEMY")
@@ -2316,6 +2483,31 @@ local function buildUI()
         scanTxt.LayoutOrder = nextOrder()
         scanTxt.Parent = page
 
+        label(page, "QUEST GIVER NAME  (exact, e.g. Adventurer)")
+        local grow = row(page, 24)
+        local gbox = Instance.new("TextBox")
+        gbox.Size = UDim2.fromOffset(300, 22)
+        gbox.BackgroundColor3 = Color3.fromRGB(22, 27, 35)
+        gbox.BorderSizePixel = 0
+        gbox.ClearTextOnFocus = false
+        gbox.Font = Enum.Font.Code
+        gbox.TextSize = 11
+        gbox.TextXAlignment = Enum.TextXAlignment.Left
+        gbox.TextColor3 = Color3.fromRGB(225, 236, 246)
+        gbox.PlaceholderText = "blank = use the QUEST marker"
+        gbox.Text = ""
+        gbox.Parent = grow
+        local gc = Instance.new("UICorner") gc.CornerRadius = UDim.new(0, 4) gc.Parent = gbox
+        button(grow, 308, 106, "USE NAME", Color3.fromRGB(40, 56, 74), function()
+            local n = (gbox.Text:gsub("^%s+", ""):gsub("%s+$", ""))
+            CFG.QuestGiverName = (#n > 0) and n or nil
+        end)
+        table.insert(live, function()
+            if not gbox:IsFocused() and CFG.QuestGiverName and gbox.Text == "" then
+                gbox.Text = CFG.QuestGiverName
+            end
+        end)
+
         label(page, "START QUEST DIRECTLY  (no NPC, no dialog)")
         local qtier = 1
         local qrow = row(page, 24)
@@ -2499,6 +2691,9 @@ local function buildUI()
                                 .. "  leash " .. CFG.LeashRadius,
                 "held/skipped " .. stats.pulled .. " / " .. (stats.outOfLeash or 0),
                 "tilt         " .. CFG.AttackTilt,
+                "working type " .. tostring(P.focusName or "-")
+                                .. "  (" .. typeIdx .. "/" .. #typeOrder .. ")",
+                "giver name   " .. tostring(CFG.QuestGiverName or "-"),
                 "last travel  " .. tostring(P.lastTravel or "-"),
                 "level        " .. tostring(playerLevel() or "?"),
                 "health       " .. (hum and math.floor(hum.Health) or "?"),

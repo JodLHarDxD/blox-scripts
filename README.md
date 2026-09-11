@@ -49,6 +49,18 @@ _G.BFP.stop()
 | `ONLY THIS` | Clear the selection and farm just that one |
 | `FARM SELECTED` | Farm every added type at once |
 | `FARM TYPED` | Type names yourself, comma separated — works for enemies not yet loaded |
+| `ROTATE` | **One type at a time** (default) or all at once |
+| `CENTRE` | Move to the current type's own centre before fighting it |
+| `NEXT TYPE` | Skip to the next selected type now |
+| secs per type | How long one type gets before rotating |
+
+**One type at a time.** Selecting Snow Bandit *and* Snowman does not mean dragging both
+species into one pile — they live in different parts of the island, each has its own leash,
+and a mixed pile is mostly enemies that cannot be hurt. The farm works Snow Bandit to
+exhaustion at the Snow Bandit centre, then moves to the Snowman centre and works those.
+The centre is computed from where each enemy was *first seen*, so it is the species' real
+ground rather than a point skewed by enemies a previous pull already moved. The magnet
+follows the focused type too — the other selected species are left alone until their turn.
 
 **COMBAT** — attack mode (`SKILLS` / `M1` / `BOTH` / `M1HOLD`), weapon picker from your
 live backpack, per-key skill toggles (Z X C V F — turn off what you have not unlocked),
@@ -81,6 +93,15 @@ reports `held N | left alone (outside their area) N`. If a lot are being left al
 only input path that reaches this game). `SCAN` lists the nearest NPCs, their distance,
 and which quest signal each carries. `PROBE NEAREST NPC` dumps that NPC's full structure
 to the panel and clipboard.
+
+**QUEST GIVER NAME.** Givers are ordinary NPCs with island-specific names — `Adventurer`
+in the Jungle, `Villager` in the snow village. Type the exact name and press `USE NAME`
+and it becomes unmissable: an exact name outscores every other signal. Leave it blank and
+detection falls back to the "?" QUEST billboard. A few names are built in already.
+
+With `AUTO` on, a quest is re-taken as soon as the previous one finishes, and never while
+one is active. With `AUTO` off nothing is ever taken — the right setting for a spot with
+no quest.
 
 `START QUEST DIRECTLY` skips the NPC entirely — type a quest name (`JungleQuest`), pick a
 tier, press it. Leave the box empty and it looks the name up from the enemy you are
@@ -125,6 +146,9 @@ _G.BFP.config.HoverHeight = 20       -- live tuning, every CFG key works
 _G.BFP.config.Magnet = true
 _G.BFP.config.LeashRadius = 150      -- live, like every other CFG key
 _G.BFP.config.AttackTilt = -45
+_G.BFP.config.RotateTypes = false    -- fight every selected type together
+_G.BFP.config.QuestGiverName = "Adventurer"
+_G.BFP.nextType()                    -- skip to the next type now
 ```
 
 **Reading the panel** — `weapon:` must show your **sword** or **Combat**, never
