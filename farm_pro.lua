@@ -357,17 +357,29 @@ end
 -- =========================================================
 -- MOVEMENT
 -- =========================================================
+-- Hovering is "pin the CFrame and kill all velocity", NOT "push upward".
+-- Injecting upward velocity every frame accumulates and launches you into
+-- the sky, because nothing ever cancels it.
+local function killVelocity(root)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
 local function hoverAt(pos)
     local _, root = parts()
     if not root then return false end
     root.CFrame = CFrame.new(pos)
-    root.Velocity = Vector3.new(0, 50, 0)
+    killVelocity(root)
     return true
 end
 
-local function float()
+-- Re-assert the anchor every iteration. Roblox physics fights a floating
+-- character continuously, so position must be re-pinned, not set once.
+local function pin(pos)
     local _, root = parts()
-    if root then root.Velocity = Vector3.new(0, 50, 0) end
+    if not root then return end
+    if pos then root.CFrame = CFrame.new(pos) end
+    killVelocity(root)
 end
 
 local function aimAt(pos)
@@ -548,13 +560,15 @@ local function retreat()
     stats.retreats += 1
     say("retreating - low health")
     local _, root = parts()
+    local safeSpot
     if root then
         local p = root.Position
-        hoverAt(Vector3.new(p.X, p.Y + CFG.RetreatHeight, p.Z))
+        safeSpot = Vector3.new(p.X, p.Y + CFG.RetreatHeight, p.Z)
+        hoverAt(safeSpot)
     end
     local deadline = os.clock() + CFG.RegenWait
     while P.running and os.clock() < deadline do
-        float()
+        pin(safeSpot)
         if healthPct() > 0.9 then break end
         task.wait(0.2)
     end
@@ -610,8 +624,7 @@ local function step()
                 stats.travels += 1
             end
             say("no targets loaded - moving to farm spot")
-            hoverAt(travelGoal + Vector3.new(0, CFG.HoverHeight, 0))
-            float()
+            pin(travelGoal + Vector3.new(0, CFG.HoverHeight, 0))
             task.wait(0.6)
             if os.clock() - stateEnteredAt > CFG.TravelTimeout then
                 say("travel timeout - re-resolving")
@@ -648,7 +661,7 @@ local function step()
 
     local beforeCount = c.count
     swing()
-    float()
+    pin(anchor)          -- re-pin every swing so we never drift or accelerate
     task.wait(CFG.AttackGap)
 
     -- ---------- WATCHDOG: did anything actually happen? ----------
@@ -722,7 +735,7 @@ local function buildUI()
     gui.Parent = pg
 
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(340, 134)
+    panel.Size = UDim2.fromOffset(340, 178)
     panel.Position = UDim2.new(1, -352, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
     panel.BackgroundTransparency = 0.08
@@ -741,9 +754,48 @@ local function buildUI()
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = panel
 
+    -- ---------- CONTROLS ----------
+    local function mkButton(text, x, w, colour, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(w, 22)
+        b.Position = UDim2.fromOffset(x, 26)
+        b.BackgroundColor3 = colour
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 11
+        b.TextColor3 = Color3.fromRGB(238, 244, 250)
+        b.Text = text
+        b.Parent = panel
+        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 5) bc.Parent = b
+        b.Activated:Connect(function() pcall(cb, b) end)
+        return b
+    end
+
+    local startBtn
+    startBtn = mkButton("START", 10, 74, Color3.fromRGB(28, 66, 40), function()
+        if P.running then
+            P.stop()
+        else
+            -- restart in the same mode without tearing down the HUD
+            task.spawn(function() P.start(P.lastNames, P.lastOpts) end)
+        end
+    end)
+
+    mkButton("ANY ENEMY", 90, 90, Color3.fromRGB(30, 46, 72), function()
+        task.spawn(function() P.start(nil, { anyEnemy = true }) end)
+    end)
+
+    mkButton("BY LEVEL", 186, 84, Color3.fromRGB(30, 46, 72), function()
+        task.spawn(function() P.start(nil, {}) end)
+    end)
+
+    mkButton("X", 278, 52, Color3.fromRGB(62, 30, 34), function()
+        P.stop()
+        if gui then gui:Destroy() end
+    end)
+
     local body = Instance.new("TextLabel")
-    body.Size = UDim2.new(1, -16, 1, -28)
-    body.Position = UDim2.fromOffset(10, 26)
+    body.Size = UDim2.new(1, -16, 1, -54)
+    body.Position = UDim2.fromOffset(10, 52)
     body.BackgroundTransparency = 1
     body.Font = Enum.Font.Code
     body.TextSize = 11
@@ -751,6 +803,15 @@ local function buildUI()
     body.TextYAlignment = Enum.TextYAlignment.Top
     body.TextColor3 = Color3.fromRGB(172, 192, 212)
     body.Parent = panel
+
+    task.spawn(function()
+        while gui and gui.Parent do
+            startBtn.Text = P.running and "STOP" or "START"
+            startBtn.BackgroundColor3 = P.running
+                and Color3.fromRGB(72, 38, 30) or Color3.fromRGB(28, 66, 40)
+            task.wait(0.3)
+        end
+    end)
 
     task.spawn(function()
         while gui and gui.Parent do
@@ -777,6 +838,7 @@ end
 function P.start(names, opts)
     if P.running then P.stop() end
     opts = opts or {}
+    P.lastNames, P.lastOpts = names, opts
     anyEnemyMode = opts.anyEnemy == true
 
     targetNames = nil
@@ -798,7 +860,7 @@ function P.start(names, opts)
 
     installFastAttack()
     equipWeapon()
-    pcall(buildUI)
+    if not (gui and gui.Parent) then pcall(buildUI) end
 
     track(player.Idled:Connect(function()
         pcall(function()
@@ -825,12 +887,16 @@ function P.stop()
     fastOn = false
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
-    if gui then pcall(function() gui:Destroy() end) end
-    gui = nil
+    -- HUD deliberately survives stop, so START can restart from the panel.
+    -- The X button destroys it.
+    say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d escalations=%d", stats.kills, stats.swings, stats.escalations))
 end
 
 function P.stats() return stats end
 function P.state() return state, statusLine, escalation end
 
-print("[BFP] loaded.  _G.BFP.start()  |  _G.BFP.start({\"Swan Pirate\"})  |  _G.BFP.start(nil,{anyEnemy=true})")
+-- Show the panel immediately on load so no console command is required.
+say("loaded - press BY LEVEL or ANY ENEMY to begin")
+pcall(buildUI)
+print("[BFP] loaded. Use the panel, or _G.BFP.start()")
