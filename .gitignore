@@ -1,5 +1,6 @@
-# Track only the files listed below — ignore everything else in this folder
+# Track only the files listed below - ignore everything else in this folder
 *
 !.gitignore
 !solo_farm_v2.lua
 !probe.lua
+!tracker.lua
