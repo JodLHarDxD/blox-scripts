@@ -41,8 +41,8 @@ local player      = Players.LocalPlayer
 -- CONFIG
 -- =========================================================
 local CFG = {
-    HoverHeight        = 14,
-    BossHoverHeight    = 30,
+    HoverHeight        = 6,   -- melee reach is short; too high and nothing lands
+    BossHoverHeight    = 12,
     ClusterRange       = 260,
     ReanchorDistance   = 30,
 
@@ -55,12 +55,15 @@ local CFG = {
     MaxEscalation      = 4,
     EngageTimeout      = 120,    -- hard cap on one engagement
     TravelTimeout      = 45,
+    TargetTimeout      = 25,   -- max seconds on one enemy before moving on
 
     MinHealthPercent   = 0.30,
     RetreatHeight      = 200,
     RegenWait          = 5,
 
-    AutoQuest          = true,
+    AutoQuest          = false,  -- DANGER: re-invoking StartQuest resets
+                                 -- an active quest's kill count to zero.
+                                 -- Accept quests by hand.
     QuestRetrySeconds  = 45,
 
     AnyEnemyFallback   = true,   -- if quest enemies absent, hit whatever is loaded
@@ -160,7 +163,7 @@ local LEVELS = {
 -- =========================================================
 local stats = {
     kills = 0, swings = 0, reanchors = 0, retreats = 0,
-    escalations = 0, travels = 0, startedAt = 0,
+    escalations = 0, travels = 0, damaging = 0, startedAt = 0,
 }
 
 local conns = {}
@@ -174,6 +177,7 @@ local lastProgressAt = 0
 local lastClusterHP  = nil
 local anchor         = nil
 local blacklist      = {}          -- model -> expiry clock
+local countedDead    = {}          -- model -> clock, so a corpse counts once
 local targetNames    = nil         -- set of names, or nil = any
 local anyEnemyMode   = false
 local travelGoal     = nil
@@ -357,12 +361,94 @@ end
 -- =========================================================
 -- MOVEMENT
 -- =========================================================
--- Hovering is "pin the CFrame and kill all velocity", NOT "push upward".
--- Injecting upward velocity every frame accumulates and launches you into
--- the sky, because nothing ever cancels it.
+-- Movement is lifted from chest_finder_v2, which locates and reaches its
+-- target reliably. Two things make it work, and farm_pro had neither:
+--   * collisions off + AutoRotate off, re-applied every PHYSICS step
+--   * velocity zeroed every Heartbeat
+-- Roblox re-asserts both continuously, so a one-shot write is always undone.
+local TweenService = game:GetService("TweenService")
+
+local savedCollide = {}
+local stabConns = {}
+
 local function killVelocity(root)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function stabilize()
+    local char, root, hum = parts()
+    if not char or not root or not hum then return end
+    hum.AutoRotate = false
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if savedCollide[part] == nil then savedCollide[part] = part.CanCollide end
+            part.CanCollide = false
+        end
+    end
+    killVelocity(root)
+end
+
+local function startStabilizer()
+    if #stabConns > 0 then return end
+    table.insert(stabConns, RunService.PreSimulation:Connect(stabilize))
+    table.insert(stabConns, RunService.Heartbeat:Connect(function()
+        local _, root = parts()
+        if root then killVelocity(root) end
+    end))
+end
+
+local function stopStabilizer()
+    for _, c in ipairs(stabConns) do pcall(function() c:Disconnect() end) end
+    table.clear(stabConns)
+    local char = parts()
+    if char then
+        for part, was in pairs(savedCollide) do
+            if part and part.Parent then pcall(function() part.CanCollide = was end) end
+        end
+    end
+    table.clear(savedCollide)
+    local _, _, hum = parts()
+    if hum then pcall(function() hum.AutoRotate = true end) end
+end
+
+local activeTween = nil
+local function cancelMove()
+    if activeTween then pcall(function() activeTween:Cancel() end) end
+    activeTween = nil
+end
+
+-- Tween to a target, exactly as the chest finder does. A tween is smooth and
+-- the server follows it; a raw CFrame write teleports and makes the streaming
+-- system drop the NPCs you were about to hit.
+local MOVE_SPEED = 180
+local function moveTo(position, speed)
+    local _, root = parts()
+    if not root then return false end
+    local distance = (root.Position - position).Magnitude
+    if distance < 4 then return true end
+
+    cancelMove()
+    local duration = math.max(0.06, distance / (speed or MOVE_SPEED))
+    local tween = TweenService:Create(
+        root,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
+        { CFrame = CFrame.new(position) }
+    )
+    activeTween = tween
+    tween:Play()
+
+    local deadline = os.clock() + duration + 1.5
+    while os.clock() < deadline and P.running do
+        local _, r = parts()
+        if not r then return false end
+        if (r.Position - position).Magnitude < 8 then return true end
+        task.wait(0.05)
+    end
+    return (function()
+        local _, r = parts()
+        return r and (r.Position - position).Magnitude < 25
+    end)()
 end
 
 local function hoverAt(pos)
@@ -375,20 +461,21 @@ end
 
 -- Re-assert the anchor every iteration. Roblox physics fights a floating
 -- character continuously, so position must be re-pinned, not set once.
-local function pin(pos)
+-- lookAt turns the CHARACTER toward the target. Never touch the camera:
+-- writing CurrentCamera.CFrame locks the player's mouse and view.
+local function pin(pos, lookAt)
     local _, root = parts()
     if not root then return end
-    if pos then root.CFrame = CFrame.new(pos) end
+    if pos then
+        if lookAt and (lookAt - pos).Magnitude > 0.1 then
+            root.CFrame = CFrame.new(pos, lookAt)
+        else
+            root.CFrame = CFrame.new(pos)
+        end
+    end
     killVelocity(root)
 end
 
-local function aimAt(pos)
-    local cam = workspace.CurrentCamera
-    local _, root = parts()
-    if cam and root and pos then
-        pcall(function() cam.CFrame = CFrame.new(root.Position, pos) end)
-    end
-end
 
 -- =========================================================
 -- TARGETING
@@ -468,7 +555,6 @@ end
 local function swing()
     stats.swings += 1
     pcall(function()
-        VirtualUser:CaptureController()
         VirtualUser:Button1Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
     end)
     task.wait(CFG.AttackHold)
@@ -624,8 +710,8 @@ local function step()
                 stats.travels += 1
             end
             say("no targets loaded - moving to farm spot")
-            pin(travelGoal + Vector3.new(0, CFG.HoverHeight, 0))
-            task.wait(0.6)
+            moveTo(travelGoal + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
+            task.wait(0.4)
             if os.clock() - stateEnteredAt > CFG.TravelTimeout then
                 say("travel timeout - re-resolving")
                 setState("RESOLVE")
@@ -640,45 +726,71 @@ local function step()
     -- ---------- ENGAGE ----------
     if state ~= "ENGAGE" then setState("ENGAGE") end
 
-    local c = cluster(list, root.Position)
-    if not c then task.wait(0.2) return end
-
-    tryQuest(c.seed.name)
-
-    local height = c.boss and CFG.BossHoverHeight or CFG.HoverHeight
-    local desired = c.pos + Vector3.new(0, height, 0)
-
-    if not anchor or (anchor - desired).Magnitude > CFG.ReanchorDistance then
-        anchor = desired
-        stats.reanchors += 1
-        hoverAt(anchor)
+    -- ONE target at a time, exactly like the chest finder picks one chest.
+    -- Cluster anchoring looked clever and did not work: it hovered over a
+    -- moving average, never actually reaching anything.
+    local target, bestD = nil, math.huge
+    for _, e in ipairs(list) do
+        local d = (e.root.Position - root.Position).Magnitude
+        if d < bestD then target, bestD = e, d end
     end
+    if not target then task.wait(0.2) return end
 
-    aimAt(c.pos)
-    say(string.format("%s x%d  hp %.0f  hover %d%s",
-        c.seed.name, c.count, c.hp, height,
+    local hpStart = target.hum.Health
+    say(string.format("%s  %.0f studs  hp %.0f%s",
+        target.name, bestD, hpStart,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
-    local beforeCount = c.count
-    swing()
-    pin(anchor)          -- re-pin every swing so we never drift or accelerate
-    task.wait(CFG.AttackGap)
+    -- Go to it, slightly above so melee AI cannot path to us.
+    local goal = target.root.Position + Vector3.new(0, CFG.HoverHeight, 0)
+    moveTo(goal, MOVE_SPEED)
 
-    -- ---------- WATCHDOG: did anything actually happen? ----------
-    local after = cluster(liveEnemies(activeNames), root.Position)
-    local afterHP    = after and after.hp or 0
-    local afterCount = after and after.count or 0
+    -- Then hold on it and swing until it dies, it leaves, or we stall.
+    local holdUntil = os.clock() + CFG.TargetTimeout
+    local lastHP = hpStart
+    while P.running and os.clock() < holdUntil do
+        local m, hum = target.model, target.hum
+        if not m or not m.Parent then break end
+        if hum.Health <= 0 then
+            if not countedDead[m] then
+                countedDead[m] = os.clock()
+                stats.kills += 1
+            end
+            progress()
+            break
+        end
 
-    if afterCount < beforeCount then
-        stats.kills += (beforeCount - afterCount)
-        progress()
-    elseif lastClusterHP and afterHP < lastClusterHP - 1 then
-        progress()                       -- damage is landing, just not lethal yet
+        local _, r = parts()
+        if not r then break end
+
+        -- Re-seat on the target each swing; it moves, and so do we.
+        local tp = target.root.Position + Vector3.new(0, CFG.HoverHeight, 0)
+        if (r.Position - tp).Magnitude > 12 then
+            r.CFrame = CFrame.new(tp, target.root.Position)
+            killVelocity(r)
+        end
+
+        swing()
+        task.wait(CFG.AttackGap)
+
+        if hum.Health < lastHP - 0.5 then
+            stats.damaging += 1
+            progress()
+        end
+        lastHP = hum.Health
     end
-    lastClusterHP = afterHP
+
+    -- Forget old corpses so the table cannot grow without bound.
+    if math.random() < 0.02 then
+        local now = os.clock()
+        for model, t in pairs(countedDead) do
+            if now - t > 120 then countedDead[model] = nil end
+        end
+    end
 
     if os.clock() - lastProgressAt > CFG.StuckSeconds then
-        escalate(c)
+        blacklist[target.model] = os.clock() + 20
+        escalate(nil)
     end
 
     if os.clock() - stateEnteredAt > CFG.EngageTimeout then
@@ -735,7 +847,7 @@ local function buildUI()
     gui.Parent = pg
 
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(340, 178)
+    panel.Size = UDim2.fromOffset(340, 194)
     panel.Position = UDim2.new(1, -352, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
     panel.BackgroundTransparency = 0.08
@@ -825,6 +937,7 @@ local function buildUI()
                 statusLine,
                 held and held.Name or "NONE",
                 stats.kills, stats.kills / mins, stats.swings,
+                stats.damaging,
                 stats.reanchors, stats.escalations, stats.travels, stats.retreats,
                 os.clock() - lastProgressAt)
             task.wait(0.25)
@@ -854,12 +967,14 @@ function P.start(names, opts)
     activeNames, anchor, lastClusterHP = nil, nil, nil
     escalation = 0
     blacklist = {}
+    countedDead = {}
     lastProgressAt = os.clock()
     P.running = true
     setState("RESOLVE")
 
     installFastAttack()
     equipWeapon()
+    startStabilizer()
     if not (gui and gui.Parent) then pcall(buildUI) end
 
     track(player.Idled:Connect(function()
@@ -885,6 +1000,8 @@ end
 function P.stop()
     P.running = false
     fastOn = false
+    cancelMove()
+    stopStabilizer()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
     -- HUD deliberately survives stop, so START can restart from the panel.
