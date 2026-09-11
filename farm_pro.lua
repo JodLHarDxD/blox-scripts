@@ -41,14 +41,20 @@ local player      = Players.LocalPlayer
 -- CONFIG
 -- =========================================================
 local CFG = {
-    HoverHeight        = 6,   -- melee reach is short; too high and nothing lands
-    BossHoverHeight    = 12,
+    HoverHeight        = 14,  -- Z lands at 14; high enough that melee NPCs cannot reach
+    BossHoverHeight    = 22,
     ClusterRange       = 260,
     ReanchorDistance   = 30,
 
+    -- Attack keys, cycled. Z is proven; X/C/V add DPS while Z cools down.
+    SkillKeys          = { Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V },
+    -- Exact tool name to force-equip, e.g. "Light-Light" or "Pipe".
+    -- nil = pick automatically (highest measured damage first).
+    ForceWeapon        = nil,
+
     HitboxMagnitude    = 150,
     ComboIncrement     = 4,
-    AttackHold         = 0.05,
+    AttackHold         = 0.04,
     AttackGap          = 0.05,
 
     StuckSeconds       = 7,      -- no cluster damage for this long -> escalate
@@ -233,16 +239,17 @@ end
 -- Weapon choice decides whether anything lands at all. A Devil Fruit fires
 -- fruit moves on M1, and the mobile ConsoleTool is not a weapon, so neither
 -- can be left equipped. Melee tools carry WeaponType="Melee".
+-- Ranked by MEASURED damage on this account, not by assumption:
+--   Demon Fruit 170 >> Melee 33 > Sword 28
 local function scoreTool(t)
-    if t:GetAttribute("ConsoleTool") then return -1 end     -- mobile button
+    if CFG.ForceWeapon and t.Name == CFG.ForceWeapon then return 1000 end
+    if t:GetAttribute("ConsoleTool") then return -1 end      -- mobile button
     local wt = t:GetAttribute("WeaponType")
-    if wt == "Melee" then
-        -- Prefer a real sword over bare fists when both are present.
-        return (string.lower(t.Name) == "combat") and 50 or 100
-    end
+    if wt == "Demon Fruit" then return 120 end
+    if wt == "Melee" then return 60 end
+    if wt == "Sword" then return 50 end
     if wt ~= nil then return 20 end                          -- gun, etc.
-    if t:GetAttribute("MovesetV2") then return 10 end
-    return 0                                                 -- fruit / unknown
+    return 0
 end
 
 local function bestTool()
@@ -552,15 +559,32 @@ end
 -- =========================================================
 -- ATTACK
 -- =========================================================
-local function swing()
-    stats.swings += 1
-    pcall(function()
-        VirtualUser:Button1Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-    end)
+-- Measured, not guessed: attacktest.lua tried nine methods against a live
+-- enemy. Every mouse path (VirtualUser Button1, VirtualInputManager mouse
+-- clicks, Tool:Activate) dealt ZERO. Only VirtualInputManager KEY events land,
+-- and they land at hover height as well as point blank.
+--
+--   Light-Light  Z -> 170   (one-shot on a Monkey)
+--   Combat       Z ->  33
+--   Pipe         Z ->  28
+--
+-- Skills have cooldowns, so the keys are cycled: by the time Z comes round
+-- again it has had three other casts' worth of time to recover.
+local VIM = game:GetService("VirtualInputManager")
+local keyIndex = 0
+
+local function pressKey(key)
+    VIM:SendKeyEvent(true, key, false, game)
     task.wait(CFG.AttackHold)
-    pcall(function()
-        VirtualUser:Button1Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-    end)
+    VIM:SendKeyEvent(false, key, false, game)
+end
+
+local function swing()
+    local keys = CFG.SkillKeys
+    if not keys or #keys == 0 then return end
+    stats.swings += 1
+    keyIndex = (keyIndex % #keys) + 1
+    pcall(pressKey, keys[keyIndex])
 end
 
 -- =========================================================
