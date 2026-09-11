@@ -46,8 +46,15 @@ local CFG = {
     ClusterRange       = 260,
     ReanchorDistance   = 30,
 
-    -- Attack keys, cycled. Z is proven; X/C/V add DPS while Z cools down.
-    SkillKeys          = { Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V },
+    -- "M1"     : left click only (default)
+    -- "SKILLS" : cycle SkillKeys only
+    -- "BOTH"   : M1 every swing, a skill every SkillEvery-th swing
+    -- Switch live:  _G.BFP.config.AttackMode = "SKILLS"
+    AttackMode         = "M1",
+    SkillEvery         = 4,
+    -- Only list skills you have actually UNLOCKED. Pressing a locked key
+    -- burns a cycle slot and deals nothing.
+    SkillKeys          = { Enum.KeyCode.Z, Enum.KeyCode.X },
     -- Exact tool name to force-equip, e.g. "Light-Light" or "Pipe".
     -- nil = pick automatically (highest measured damage first).
     ForceWeapon        = nil,
@@ -556,6 +563,78 @@ local function tryQuest(name)
     pcall(function() commF:InvokeServer("StartQuest", name .. "Quest", 1) end)
 end
 
+
+-- =========================================================
+-- QUEST (manual only)
+-- =========================================================
+-- Blind StartQuest calls reset an active quest's kill count to zero, which is
+-- what destroyed real progress earlier. This instead walks to the quest giver
+-- and triggers it the way a player does, and it only ever runs when you press
+-- the button.
+local function findQuestGiver(maxRange)
+    local _, root = parts()
+    if not root then return nil end
+    local best, bestD = nil, maxRange or 1500
+
+    local function consider(model)
+        if not model:IsA("Model") then return end
+        local n = string.lower(model.Name)
+        if not (string.find(n, "quest", 1, true) or string.find(n, "giver", 1, true)) then return end
+        local r = model:FindFirstChild("HumanoidRootPart")
+            or model.PrimaryPart
+            or model:FindFirstChildWhichIsA("BasePart", true)
+        if not r then return end
+        local d = (r.Position - root.Position).Magnitude
+        if d < bestD then best, bestD = { model = model, part = r }, d end
+    end
+
+    for _, o in ipairs(workspace:GetDescendants()) do
+        consider(o)
+    end
+    return best, bestD
+end
+
+function P.takeQuest()
+    local giver, dist = findQuestGiver(1500)
+    if not giver then
+        say("no quest giver found nearby")
+        return false
+    end
+
+    say(string.format("quest giver %s at %.0f studs", giver.model.Name, dist or 0))
+    moveTo(giver.part.Position + Vector3.new(0, 4, 0), MOVE_SPEED)
+    task.wait(0.4)
+
+    local fired = false
+
+    -- ClickDetector is how most Blox Fruits quest givers are driven.
+    local cd = giver.model:FindFirstChildWhichIsA("ClickDetector", true)
+    if cd and fireclickdetector then
+        pcall(function() fireclickdetector(cd, 0) end)
+        fired = true
+    end
+
+    -- Some use a ProximityPrompt instead.
+    local pp = giver.model:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if pp then
+        if fireproximityprompt then
+            pcall(function() fireproximityprompt(pp) end)
+            fired = true
+        else
+            pcall(function()
+                pp:InputHoldBegin()
+                task.wait(pp.HoldDuration + 0.1)
+                pp:InputHoldEnd()
+            end)
+            fired = true
+        end
+    end
+
+    say(fired and ("quest giver triggered: " .. giver.model.Name)
+               or "quest giver found but no ClickDetector/Prompt to fire")
+    return fired
+end
+
 -- =========================================================
 -- ATTACK
 -- =========================================================
@@ -571,7 +650,7 @@ end
 -- Skills have cooldowns, so the keys are cycled: by the time Z comes round
 -- again it has had three other casts' worth of time to recover.
 local VIM = game:GetService("VirtualInputManager")
-local keyIndex = 0
+local keyIndex, swingIndex = 0, 0
 
 local function pressKey(key)
     VIM:SendKeyEvent(true, key, false, game)
@@ -579,12 +658,45 @@ local function pressKey(key)
     VIM:SendKeyEvent(false, key, false, game)
 end
 
-local function swing()
+-- M1 / left click. The attack test's mouse attempts passed repeatCount = 1;
+-- the in-game form is 0. Both VIM and VirtualUser are fired each swing so
+-- whichever the game accepts gets through.
+local function pressM1()
+    local cam = workspace.CurrentCamera
+    local vs = cam.ViewportSize
+    local x, y = vs.X * 0.5, vs.Y * 0.5
+
+    pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
+    task.wait(CFG.AttackHold)
+    pcall(function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
+
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(x, y), cam.CFrame)
+        VirtualUser:Button1Up(Vector2.new(x, y), cam.CFrame)
+    end)
+end
+
+local function nextSkill()
     local keys = CFG.SkillKeys
     if not keys or #keys == 0 then return end
-    stats.swings += 1
     keyIndex = (keyIndex % #keys) + 1
     pcall(pressKey, keys[keyIndex])
+end
+
+local function swing()
+    stats.swings += 1
+    swingIndex += 1
+    local mode = CFG.AttackMode
+
+    if mode == "SKILLS" then
+        nextSkill()
+    elseif mode == "BOTH" then
+        pressM1()
+        if swingIndex % math.max(1, CFG.SkillEvery) == 0 then nextSkill() end
+    else -- "M1"
+        pressM1()
+    end
 end
 
 -- =========================================================
@@ -871,7 +983,7 @@ local function buildUI()
     gui.Parent = pg
 
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(340, 194)
+    panel.Size = UDim2.fromOffset(372, 194)
     panel.Position = UDim2.new(1, -352, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
     panel.BackgroundTransparency = 0.08
@@ -924,7 +1036,11 @@ local function buildUI()
         task.spawn(function() P.start(nil, {}) end)
     end)
 
-    mkButton("X", 278, 52, Color3.fromRGB(62, 30, 34), function()
+    mkButton("QUEST", 278, 52, Color3.fromRGB(58, 48, 24), function()
+        task.spawn(function() pcall(P.takeQuest) end)
+    end)
+
+    mkButton("X", 336, 26, Color3.fromRGB(62, 30, 34), function()
         P.stop()
         if gui then gui:Destroy() end
     end)
