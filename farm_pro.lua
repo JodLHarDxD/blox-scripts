@@ -50,7 +50,7 @@ local CFG = {
     -- "SKILLS" : cycle SkillKeys only
     -- "BOTH"   : M1 every swing, a skill every SkillEvery-th swing
     -- Switch live:  _G.BFP.config.AttackMode = "SKILLS"
-    AttackMode         = "M1",
+    AttackMode         = "SKILLS",  -- M1 measured as zero damage on Solara
     SkillEvery         = 4,
     -- Only list skills you have actually UNLOCKED. Pressing a locked key
     -- burns a cycle slot and deals nothing.
