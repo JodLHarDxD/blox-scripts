@@ -35,6 +35,7 @@ local Players     = game:GetService("Players")
 local RS          = game:GetService("ReplicatedStorage")
 local RunService  = game:GetService("RunService")
 local VirtualUser = game:GetService("VirtualUser")
+local VIM         = game:GetService("VirtualInputManager")
 local player      = Players.LocalPlayer
 
 -- =========================================================
@@ -647,65 +648,178 @@ end
 local function findQuestGiver(maxRange)
     local _, root = parts()
     if not root then return nil end
-    local best, bestD = nil, maxRange or 1500
 
-    local function consider(model)
-        if not model:IsA("Model") then return end
-        local n = string.lower(model.Name)
-        if not (string.find(n, "quest", 1, true) or string.find(n, "giver", 1, true)) then return end
-        local r = model:FindFirstChild("HumanoidRootPart")
-            or model.PrimaryPart
-            or model:FindFirstChildWhichIsA("BasePart", true)
-        if not r then return end
-        local d = (r.Position - root.Position).Magnitude
-        if d < bestD then best, bestD = { model = model, part = r }, d end
+    -- The chest finder works because it locks onto the interactable PART, not
+    -- a guessed model position. Quest givers are the same: find the actual
+    -- ClickDetector/ProximityPrompt and use ITS parent part's full 3D
+    -- position. Guessing a model's PrimaryPart picked the wrong height on
+    -- multi-floor islands, landing under the NPC instead of at it.
+    local best, bestD = nil, maxRange or 2000
+
+    local function partOf(inst)
+        local par = inst.Parent
+        if par and par:IsA("BasePart") then return par end
+        if par then return par:FindFirstChildWhichIsA("BasePart", true) end
+        return nil
+    end
+
+    local function consider(inst)
+        local part = partOf(inst)
+        if not part then return end
+
+        local model = inst:FindFirstAncestorOfClass("Model")
+        local nm = string.lower((model and model.Name) or part.Name)
+        -- quest givers name themselves, and always sit on a humanoid NPC
+        local looksQuest = string.find(nm, "quest", 1, true)
+            or string.find(nm, "giver", 1, true)
+        local hasHum = model and model:FindFirstChildOfClass("Humanoid") ~= nil
+        if not (looksQuest or hasHum) then return end
+
+        -- full 3D distance, height included
+        local d = (part.Position - root.Position).Magnitude
+        -- a named quest giver outranks a nameless NPC at the same distance
+        local score = d - (looksQuest and 400 or 0)
+        if score < bestD then
+            bestD = score
+            best = { model = model, part = part, interact = inst, dist = d, name = nm }
+        end
     end
 
     for _, o in ipairs(workspace:GetDescendants()) do
-        consider(o)
+        if o:IsA("ClickDetector") or o:IsA("ProximityPrompt") then
+            consider(o)
+        end
     end
-    return best, bestD
+    return best, best and best.dist or nil
+end
+
+-- Detects an active quest so we never re-take one (re-taking zeroes its count).
+function P.questActive()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local ok, found = pcall(function()
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("GuiObject") and d.Visible and d.Name == "Quest" then
+                -- the tracker frame carries the objective text when active
+                for _, t in ipairs(d:GetDescendants()) do
+                    if t:IsA("TextLabel") and t.Visible
+                        and type(t.Text) == "string" and #t.Text > 3 then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end)
+    return ok and found or false
+end
+
+-- After the giver is clicked a dialog appears with one button per quest tier.
+-- Click the one naming the enemy we are farming, else the first real option.
+local function clickQuestDialog(wantName)
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local deadline = os.clock() + 3
+    while os.clock() < deadline do
+        local best, fallback
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextButton") and d.Visible and type(d.Text) == "string" then
+                local txt = string.lower(d.Text)
+                if wantName and string.find(txt, string.lower(wantName), 1, true) then
+                    best = d
+                elseif string.find(txt, "quest", 1, true)
+                    or string.find(txt, "accept", 1, true) then
+                    fallback = fallback or d
+                end
+            end
+        end
+        local pick = best or fallback
+        if pick then
+            local fired = false
+            pcall(function()
+                for _, conn in ipairs(getconnections and getconnections(pick.Activated) or {}) do
+                    conn:Fire()
+                    fired = true
+                end
+            end)
+            if not fired then
+                -- no getconnections on this executor: drive it as a real click
+                pcall(function()
+                    local ap = pick.AbsolutePosition
+                    local as = pick.AbsoluteSize
+                    local x, y = ap.X + as.X / 2, ap.Y + as.Y / 2
+                    VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+                    task.wait(0.06)
+                    VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+                end)
+            end
+            return true, pick.Text
+        end
+        task.wait(0.2)
+    end
+    return false
 end
 
 function P.takeQuest()
+    if P.questActive() then
+        P.lastQuestResult = "a quest is already active - not re-taking (would reset it)"
+        say(P.lastQuestResult)
+        return false
+    end
     local giver, dist = findQuestGiver(1500)
     if not giver then
         say("no quest giver found nearby")
         return false
     end
 
-    say(string.format("quest giver %s at %.0f studs", giver.model.Name, dist or 0))
-    moveTo(giver.part.Position + Vector3.new(0, 4, 0), MOVE_SPEED)
-    task.wait(0.4)
+    say(string.format("quest giver %s at %.0f studs",
+        tostring(giver.name), giver.dist or 0))
+
+    -- Land at the interactable's own position, height included.
+    moveTo(giver.part.Position + Vector3.new(0, 3, 0), MOVE_SPEED)
+    task.wait(0.5)
 
     local fired = false
+    local inst = giver.interact
 
-    -- ClickDetector is how most Blox Fruits quest givers are driven.
-    local cd = giver.model:FindFirstChildWhichIsA("ClickDetector", true)
-    if cd and fireclickdetector then
-        pcall(function() fireclickdetector(cd, 0) end)
-        fired = true
-    end
-
-    -- Some use a ProximityPrompt instead.
-    local pp = giver.model:FindFirstChildWhichIsA("ProximityPrompt", true)
-    if pp then
+    if inst:IsA("ClickDetector") then
+        if fireclickdetector then
+            pcall(function() fireclickdetector(inst, 0) end)
+            fired = true
+        end
+    elseif inst:IsA("ProximityPrompt") then
         if fireproximityprompt then
-            pcall(function() fireproximityprompt(pp) end)
+            pcall(function() fireproximityprompt(inst) end)
             fired = true
         else
             pcall(function()
-                pp:InputHoldBegin()
-                task.wait(pp.HoldDuration + 0.1)
-                pp:InputHoldEnd()
+                inst:InputHoldBegin()
+                task.wait((inst.HoldDuration or 0) + 0.1)
+                inst:InputHoldEnd()
             end)
             fired = true
         end
     end
 
-    say(fired and ("quest giver triggered: " .. giver.model.Name)
-               or "quest giver found but no ClickDetector/Prompt to fire")
-    return fired
+    if not fired then
+        P.lastQuestResult = "giver has no ClickDetector/Prompt"
+        say(P.lastQuestResult)
+        return false
+    end
+
+    -- second half: the dialog is open, now pick the quest
+    local wanted
+    if activeNames then for n in pairs(activeNames) do wanted = n break end end
+    local clicked, what = clickQuestDialog(wanted)
+    P.lastQuestResult = clicked and ("accepted: " .. tostring(what))
+                                or "dialog opened but no quest button found"
+    say(P.lastQuestResult)
+
+    -- go straight back to farming rather than standing at the giver
+    anchor = nil
+    setState("RESOLVE")
+    progress()
+    return clicked
 end
 
 -- =========================================================
@@ -722,7 +836,6 @@ end
 --
 -- Skills have cooldowns, so the keys are cycled: by the time Z comes round
 -- again it has had three other casts' worth of time to recover.
-local VIM = game:GetService("VirtualInputManager")
 local keyIndex, swingIndex = 0, 0
 
 local function pressKey(key)
@@ -1054,122 +1167,497 @@ local function buildUI()
     gui.DisplayOrder = 45
     gui.Parent = pg
 
+    -- ---------- shell ----------
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(372, 216)
-    panel.Position = UDim2.new(1, -352, 0, 12)
+    panel.Size = UDim2.fromOffset(400, 392)
+    panel.Position = UDim2.new(1, -412, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
-    panel.BackgroundTransparency = 0.08
     panel.BorderSizePixel = 0
     panel.Active = true
     panel.Draggable = true
     panel.Parent = gui
-    local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 8) c.Parent = panel
+    local pc = Instance.new("UICorner") pc.CornerRadius = UDim.new(0, 8) pc.Parent = panel
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -16, 0, 20)
-    title.Position = UDim2.fromOffset(10, 6)
+    title.Size = UDim2.new(1, -60, 0, 22)
+    title.Position = UDim2.fromOffset(10, 5)
     title.BackgroundTransparency = 1
     title.Font = Enum.Font.GothamBold
     title.TextSize = 12
     title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.fromRGB(235, 242, 250)
     title.Parent = panel
 
-    -- ---------- CONTROLS ----------
-    local function mkButton(text, x, w, colour, cb)
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.fromOffset(44, 18)
+    closeBtn.Position = UDim2.new(1, -52, 0, 6)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(62, 30, 34)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 10
+    closeBtn.TextColor3 = Color3.fromRGB(255, 200, 200)
+    closeBtn.Text = "CLOSE"
+    closeBtn.Parent = panel
+    local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 4) cc.Parent = closeBtn
+    closeBtn.Activated:Connect(function()
+        P.stop()
+        gui:Destroy()
+    end)
+
+    local statusLbl = Instance.new("TextLabel")
+    statusLbl.Size = UDim2.new(1, -20, 0, 15)
+    statusLbl.Position = UDim2.fromOffset(10, 26)
+    statusLbl.BackgroundTransparency = 1
+    statusLbl.Font = Enum.Font.Code
+    statusLbl.TextSize = 10
+    statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+    statusLbl.TextColor3 = Color3.fromRGB(150, 170, 190)
+    statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    statusLbl.Parent = panel
+
+    -- ---------- tabs ----------
+    local TABS = { "FARM", "COMBAT", "MOVE", "QUEST", "INFO" }
+    local pages, tabBtns = {}, {}
+    local current = "FARM"
+
+    local function showTab(name)
+        current = name
+        for n, page in pairs(pages) do
+            page.Visible = (n == name)
+        end
+        for n, b in pairs(tabBtns) do
+            b.BackgroundColor3 = (n == name)
+                and Color3.fromRGB(44, 58, 82) or Color3.fromRGB(24, 29, 38)
+        end
+    end
+
+    for i, name in ipairs(TABS) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(74, 22)
+        b.Position = UDim2.fromOffset(8 + (i - 1) * 77, 45)
+        b.BackgroundColor3 = Color3.fromRGB(24, 29, 38)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 10
+        b.TextColor3 = Color3.fromRGB(215, 228, 240)
+        b.Text = name
+        b.Parent = panel
+        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 4) bc.Parent = b
+        b.Activated:Connect(function() showTab(name) end)
+        tabBtns[name] = b
+
+        local page = Instance.new("Frame")
+        page.Size = UDim2.new(1, -16, 1, -78)
+        page.Position = UDim2.fromOffset(8, 72)
+        page.BackgroundTransparency = 1
+        page.Visible = false
+        page.Parent = panel
+        local l = Instance.new("UIListLayout")
+        l.SortOrder = Enum.SortOrder.LayoutOrder
+        l.Padding = UDim.new(0, 4)
+        l.Parent = page
+        pages[name] = page
+    end
+
+    -- ---------- widget helpers ----------
+    local order = 0
+    local function nextOrder() order = order + 1 return order end
+
+    local function row(parent, height)
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(1, 0, 0, height or 24)
+        f.BackgroundTransparency = 1
+        f.LayoutOrder = nextOrder()
+        f.Parent = parent
+        return f
+    end
+
+    local function label(parent, text, size, colour)
+        local t = Instance.new("TextLabel")
+        t.Size = UDim2.new(1, 0, 0, 16)
+        t.BackgroundTransparency = 1
+        t.Font = Enum.Font.GothamBold
+        t.TextSize = size or 10
+        t.TextXAlignment = Enum.TextXAlignment.Left
+        t.TextColor3 = colour or Color3.fromRGB(130, 148, 168)
+        t.Text = text
+        t.LayoutOrder = nextOrder()
+        t.Parent = parent
+        return t
+    end
+
+    -- a button that reports its own state through a refresh function
+    local live = {}
+    local function button(parent, x, w, text, colour, cb, refresh)
         local b = Instance.new("TextButton")
         b.Size = UDim2.fromOffset(w, 22)
-        b.Position = UDim2.fromOffset(x, 26)
+        b.Position = UDim2.fromOffset(x, 0)
         b.BackgroundColor3 = colour
         b.Font = Enum.Font.GothamBold
-        b.TextSize = 11
+        b.TextSize = 10
         b.TextColor3 = Color3.fromRGB(238, 244, 250)
         b.Text = text
-        b.Parent = panel
-        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 5) bc.Parent = b
+        b.Parent = parent
+        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 4) bc.Parent = b
         b.Activated:Connect(function() pcall(cb, b) end)
+        if refresh then table.insert(live, function() pcall(refresh, b) end) end
         return b
     end
 
-    local startBtn
-    startBtn = mkButton("START", 10, 74, Color3.fromRGB(28, 66, 40), function()
-        if P.running then
-            P.stop()
-        else
-            -- restart in the same mode without tearing down the HUD
-            task.spawn(function() P.start(P.lastNames, P.lastOpts) end)
+    -- numeric stepper:  label  [-] value [+]
+    local function stepper(parent, name, get, set, step, minV, maxV)
+        local f = row(parent, 24)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.fromOffset(150, 22)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.Code
+        lbl.TextSize = 11
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextColor3 = Color3.fromRGB(180, 198, 216)
+        lbl.Parent = f
+        local function redraw() lbl.Text = name .. ": " .. tostring(get()) end
+        redraw()
+        table.insert(live, redraw)
+
+        button(f, 158, 28, "-", Color3.fromRGB(44, 34, 38), function()
+            set(math.max(minV, get() - step)) redraw()
+        end)
+        button(f, 190, 28, "+", Color3.fromRGB(32, 48, 40), function()
+            set(math.min(maxV, get() + step)) redraw()
+        end)
+        return f
+    end
+
+    local ON  = Color3.fromRGB(34, 74, 46)
+    local OFF = Color3.fromRGB(46, 34, 38)
+    local NEU = Color3.fromRGB(32, 42, 58)
+
+    -- =====================================================
+    -- FARM TAB
+    -- =====================================================
+    do
+        local page = pages.FARM
+        label(page, "RUN")
+        local r1 = row(page)
+        button(r1, 0, 110, "START", ON, function()
+            if P.running then P.stop()
+            else task.spawn(function() P.start(P.lastNames, P.lastOpts) end) end
+        end, function(b)
+            b.Text = P.running and "STOP" or "START"
+            b.BackgroundColor3 = P.running and OFF or ON
+        end)
+        button(r1, 118, 120, "ANY ENEMY", NEU, function()
+            task.spawn(function() P.start(nil, { anyEnemy = true }) end)
+        end)
+        button(r1, 246, 110, "BY LEVEL", NEU, function()
+            task.spawn(function() P.start(nil, {}) end)
+        end)
+
+        label(page, "TARGET")
+        local tgt = Instance.new("TextLabel")
+        tgt.Size = UDim2.new(1, 0, 0, 32)
+        tgt.BackgroundTransparency = 1
+        tgt.Font = Enum.Font.Code
+        tgt.TextSize = 11
+        tgt.TextXAlignment = Enum.TextXAlignment.Left
+        tgt.TextYAlignment = Enum.TextYAlignment.Top
+        tgt.TextColor3 = Color3.fromRGB(180, 198, 216)
+        tgt.TextWrapped = true
+        tgt.LayoutOrder = nextOrder()
+        tgt.Parent = page
+        table.insert(live, function()
+            local names = {}
+            if activeNames then
+                for n in pairs(activeNames) do table.insert(names, n) end
+                table.sort(names)
+            end
+            tgt.Text = #names > 0 and table.concat(names, ", ") or "any enemy"
+        end)
+
+        -- pick a specific enemy from whatever is loaded right now
+        label(page, "PICK A LOADED ENEMY")
+        local pick = Instance.new("TextLabel")
+        pick.Size = UDim2.new(1, 0, 0, 16)
+        pick.BackgroundTransparency = 1
+        pick.Font = Enum.Font.Code
+        pick.TextSize = 11
+        pick.TextXAlignment = Enum.TextXAlignment.Left
+        pick.TextColor3 = Color3.fromRGB(210, 226, 240)
+        pick.LayoutOrder = nextOrder()
+        pick.Parent = page
+
+        local loadedNames, pickIdx = {}, 1
+        local function refreshLoaded()
+            local seen, out = {}, {}
+            local folder = workspace:FindFirstChild("Enemies")
+            if folder then
+                for _, m in ipairs(folder:GetChildren()) do
+                    if m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
+                        local n = cleanName(m)
+                        if not seen[n] then seen[n] = true table.insert(out, n) end
+                    end
+                end
+            end
+            table.sort(out)
+            loadedNames = out
+            if pickIdx > #out then pickIdx = 1 end
+            pick.Text = (#out > 0)
+                and ("> " .. tostring(out[pickIdx]) .. "   (" .. #out .. " types loaded)")
+                or "> nothing loaded"
         end
-    end)
+        refreshLoaded()
+        table.insert(live, refreshLoaded)
 
-    mkButton("ANY ENEMY", 90, 90, Color3.fromRGB(30, 46, 72), function()
-        task.spawn(function() P.start(nil, { anyEnemy = true }) end)
-    end)
+        local r2 = row(page)
+        button(r2, 0, 110, "< PREV", NEU, function()
+            if #loadedNames > 0 then
+                pickIdx = ((pickIdx - 2) % #loadedNames) + 1
+                refreshLoaded()
+            end
+        end)
+        button(r2, 118, 110, "NEXT >", NEU, function()
+            if #loadedNames > 0 then
+                pickIdx = (pickIdx % #loadedNames) + 1
+                refreshLoaded()
+            end
+        end)
+        button(r2, 236, 120, "FARM THIS", Color3.fromRGB(44, 62, 40), function()
+            local n = loadedNames[pickIdx]
+            if n then task.spawn(function() P.start({ n }, {}) end) end
+        end)
+    end
 
-    mkButton("BY LEVEL", 186, 84, Color3.fromRGB(30, 46, 72), function()
-        task.spawn(function() P.start(nil, {}) end)
-    end)
-
-    mkButton("QUEST", 278, 52, Color3.fromRGB(58, 48, 24), function()
-        task.spawn(function() pcall(P.takeQuest) end)
-    end)
-
-    local pullBtn
-    pullBtn = mkButton("PULL: OFF", 336, 26, Color3.fromRGB(40, 34, 56), function()
-        CFG.PullEnemies = not CFG.PullEnemies
-        if CFG.PullEnemies then startPuller() else stopPuller() end
-    end)
-    pullBtn.Size = UDim2.fromOffset(82, 22)
-    pullBtn.Position = UDim2.fromOffset(10, 52)
-    task.spawn(function()
-        while gui and gui.Parent do
-            pullBtn.Text = CFG.PullEnemies and ("PULL: " .. stats.pulled) or "PULL: OFF"
-            pullBtn.BackgroundColor3 = CFG.PullEnemies
-                and Color3.fromRGB(58, 40, 86) or Color3.fromRGB(40, 34, 56)
-            task.wait(0.3)
+    -- =====================================================
+    -- COMBAT TAB
+    -- =====================================================
+    do
+        local page = pages.COMBAT
+        label(page, "ATTACK MODE")
+        local r1 = row(page)
+        local MODES = { "SKILLS", "M1", "BOTH" }
+        for i, m in ipairs(MODES) do
+            button(r1, (i - 1) * 120, 112, m, NEU, function()
+                CFG.AttackMode = m
+            end, function(b)
+                b.BackgroundColor3 = (CFG.AttackMode == m) and ON or NEU
+            end)
         end
-    end)
+        label(page, "M1 measured as ZERO damage on this executor.",
+            10, Color3.fromRGB(196, 150, 110))
 
-    mkButton("X", 336, 26, Color3.fromRGB(62, 30, 34), function()
-        P.stop()
-        if gui then gui:Destroy() end
-    end)
+        label(page, "WEAPON")
+        local wpn = Instance.new("TextLabel")
+        wpn.Size = UDim2.new(1, 0, 0, 16)
+        wpn.BackgroundTransparency = 1
+        wpn.Font = Enum.Font.Code
+        wpn.TextSize = 11
+        wpn.TextXAlignment = Enum.TextXAlignment.Left
+        wpn.TextColor3 = Color3.fromRGB(210, 226, 240)
+        wpn.LayoutOrder = nextOrder()
+        wpn.Parent = page
 
-    local body = Instance.new("TextLabel")
-    body.Size = UDim2.new(1, -16, 1, -80)
-    body.Position = UDim2.fromOffset(10, 78)
-    body.BackgroundTransparency = 1
-    body.Font = Enum.Font.Code
-    body.TextSize = 11
-    body.TextXAlignment = Enum.TextXAlignment.Left
-    body.TextYAlignment = Enum.TextYAlignment.Top
-    body.TextColor3 = Color3.fromRGB(172, 192, 212)
-    body.Parent = panel
-
-    task.spawn(function()
-        while gui and gui.Parent do
-            startBtn.Text = P.running and "STOP" or "START"
-            startBtn.BackgroundColor3 = P.running
-                and Color3.fromRGB(72, 38, 30) or Color3.fromRGB(28, 66, 40)
-            task.wait(0.3)
+        local tools, tIdx = {}, 1
+        local function refreshTools()
+            local out = {}
+            local char = player.Character
+            local bp = player:FindFirstChildOfClass("Backpack")
+            for _, src in ipairs({ char, bp }) do
+                if src then
+                    for _, t in ipairs(src:GetChildren()) do
+                        if t:IsA("Tool") and not t:GetAttribute("ConsoleTool") then
+                            table.insert(out, t.Name)
+                        end
+                    end
+                end
+            end
+            table.sort(out)
+            tools = out
+            if tIdx > #out then tIdx = 1 end
+            local held = char and char:FindFirstChildOfClass("Tool")
+            wpn.Text = "holding: " .. (held and held.Name or "NONE")
+                .. "   |   pick: " .. tostring(out[tIdx] or "-")
         end
-    end)
+        refreshTools()
+        table.insert(live, refreshTools)
 
-    task.spawn(function()
-        while gui and gui.Parent do
+        local r2 = row(page)
+        button(r2, 0, 110, "< PREV", NEU, function()
+            if #tools > 0 then tIdx = ((tIdx - 2) % #tools) + 1 refreshTools() end
+        end)
+        button(r2, 118, 110, "NEXT >", NEU, function()
+            if #tools > 0 then tIdx = (tIdx % #tools) + 1 refreshTools() end
+        end)
+        button(r2, 236, 120, "USE THIS", Color3.fromRGB(44, 62, 40), function()
+            local n = tools[tIdx]
+            if n then
+                CFG.ForceWeapon = n
+                equipWeapon()
+                refreshTools()
+            end
+        end)
+
+        label(page, "SKILL KEYS  (only ones you have unlocked)")
+        local r3 = row(page)
+        local ALLK = {
+            { "Z", Enum.KeyCode.Z }, { "X", Enum.KeyCode.X },
+            { "C", Enum.KeyCode.C }, { "V", Enum.KeyCode.V },
+            { "F", Enum.KeyCode.F },
+        }
+        local function hasKey(kc)
+            for _, k in ipairs(CFG.SkillKeys) do if k == kc then return true end end
+            return false
+        end
+        for i, pair in ipairs(ALLK) do
+            button(r3, (i - 1) * 60, 54, pair[1], NEU, function()
+                if hasKey(pair[2]) then
+                    for idx, k in ipairs(CFG.SkillKeys) do
+                        if k == pair[2] then table.remove(CFG.SkillKeys, idx) break end
+                    end
+                else
+                    table.insert(CFG.SkillKeys, pair[2])
+                end
+            end, function(b)
+                b.BackgroundColor3 = hasKey(pair[2]) and ON or OFF
+            end)
+        end
+
+        stepper(page, "swing gap",
+            function() return string.format("%.2f", CFG.AttackGap) end,
+            function(v) CFG.AttackGap = v end, 0.01, 0.01, 1)
+        stepper(page, "skill every N",
+            function() return CFG.SkillEvery end,
+            function(v) CFG.SkillEvery = v end, 1, 1, 12)
+    end
+
+    -- =====================================================
+    -- MOVE TAB
+    -- =====================================================
+    do
+        local page = pages.MOVE
+        label(page, "POSITION")
+        stepper(page, "hover height",
+            function() return CFG.HoverHeight end,
+            function(v) CFG.HoverHeight = v end, 2, 2, 60)
+        stepper(page, "boss hover",
+            function() return CFG.BossHoverHeight end,
+            function(v) CFG.BossHoverHeight = v end, 2, 2, 80)
+        stepper(page, "secs per target",
+            function() return CFG.TargetTimeout end,
+            function(v) CFG.TargetTimeout = v end, 5, 5, 120)
+
+        label(page, "ENEMY PULL")
+        local r1 = row(page)
+        button(r1, 0, 170, "PULL", NEU, function()
+            CFG.PullEnemies = not CFG.PullEnemies
+            if CFG.PullEnemies then startPuller() else stopPuller() end
+        end, function(b)
+            b.Text = CFG.PullEnemies and ("PULL ON  (" .. stats.pulled .. ")") or "PULL OFF"
+            b.BackgroundColor3 = CFG.PullEnemies and ON or OFF
+        end)
+
+        stepper(page, "pull range",
+            function() return CFG.PullRange end,
+            function(v) CFG.PullRange = v end, 10, 20, 500)
+        stepper(page, "pull radius",
+            function() return CFG.PullRadius end,
+            function(v) CFG.PullRadius = v end, 1, 1, 40)
+        stepper(page, "pull drop",
+            function() return CFG.PullDrop end,
+            function(v) CFG.PullDrop = v end, 1, 0, 40)
+
+        label(page, "Pulling writes NPC positions from the client.",
+            10, Color3.fromRGB(196, 150, 110))
+    end
+
+    -- =====================================================
+    -- QUEST TAB
+    -- =====================================================
+    do
+        local page = pages.QUEST
+        label(page, "QUEST")
+        local r1 = row(page)
+        button(r1, 0, 170, "TAKE QUEST NOW", Color3.fromRGB(58, 48, 24), function()
+            task.spawn(function() pcall(P.takeQuest) end)
+        end)
+        button(r1, 186, 170, "AUTO QUEST", NEU, function()
+            CFG.AutoQuest = not CFG.AutoQuest
+        end, function(b)
+            b.Text = CFG.AutoQuest and "AUTO QUEST: ON" or "AUTO QUEST: OFF"
+            b.BackgroundColor3 = CFG.AutoQuest and ON or OFF
+        end)
+
+        local qs = Instance.new("TextLabel")
+        qs.Size = UDim2.new(1, 0, 0, 90)
+        qs.BackgroundTransparency = 1
+        qs.Font = Enum.Font.Code
+        qs.TextSize = 10
+        qs.TextXAlignment = Enum.TextXAlignment.Left
+        qs.TextYAlignment = Enum.TextYAlignment.Top
+        qs.TextColor3 = Color3.fromRGB(170, 190, 210)
+        qs.TextWrapped = true
+        qs.LayoutOrder = nextOrder()
+        qs.Parent = page
+        table.insert(live, function()
+            qs.Text = "active quest: " .. (P.questActive() and "YES" or "no")
+                .. "\nlast: " .. tostring(P.lastQuestResult or "-")
+                .. "\n\nTAKE QUEST walks to the giver, opens it, and clicks the"
+                .. "\nmatching quest button. It refuses while a quest is already"
+                .. "\nactive, because re-taking one resets its kill count to 0."
+        end)
+    end
+
+    -- =====================================================
+    -- INFO TAB
+    -- =====================================================
+    do
+        local page = pages.INFO
+        local info = Instance.new("TextLabel")
+        info.Size = UDim2.new(1, 0, 1, 0)
+        info.BackgroundTransparency = 1
+        info.Font = Enum.Font.Code
+        info.TextSize = 11
+        info.TextXAlignment = Enum.TextXAlignment.Left
+        info.TextYAlignment = Enum.TextYAlignment.Top
+        info.TextColor3 = Color3.fromRGB(180, 198, 216)
+        info.LayoutOrder = nextOrder()
+        info.Parent = page
+        table.insert(live, function()
             local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
-            title.Text = "BF FARM PRO   [" .. state .. "]" .. (fastOn and "   fast ON" or "   fast OFF")
-            title.TextColor3 = fastOn and Color3.fromRGB(126, 226, 152) or Color3.fromRGB(245, 200, 110)
             local char = player.Character
             local held = char and char:FindFirstChildOfClass("Tool")
-            body.Text = string.format(
-                "%s\nweapon: %s\nkills %d  (%.1f/min)   swings %d\nreanchor %d  esc %d  travel %d  retreat %d\nlast progress %.1fs ago",
-                statusLine,
-                held and held.Name or "NONE",
-                tostring(CFG.AttackMode),
-                stats.kills, stats.kills / mins, stats.swings,
-                stats.damaging, stats.pulled,
-                stats.escalations, stats.travels, stats.retreats,
-                os.clock() - lastProgressAt)
-            task.wait(0.25)
+            local _, _, hum = parts()
+            info.Text = table.concat({
+                "state        " .. state,
+                "status       " .. statusLine,
+                "",
+                "kills        " .. stats.kills .. string.format("   (%.1f/min)", stats.kills / mins),
+                "DAMAGE HITS  " .. stats.damaging,
+                "swings       " .. stats.swings,
+                "pulled       " .. stats.pulled,
+                "",
+                "weapon       " .. (held and held.Name or "NONE"),
+                "mode         " .. tostring(CFG.AttackMode),
+                "hover        " .. CFG.HoverHeight,
+                "level        " .. tostring(playerLevel() or "?"),
+                "health       " .. (hum and math.floor(hum.Health) or "?"),
+                "",
+                "escalations  " .. stats.escalations,
+                "travels      " .. stats.travels,
+                "retreats     " .. stats.retreats,
+                string.format("last progress %.1fs ago", os.clock() - lastProgressAt),
+            }, "\n")
+        end)
+    end
+
+    showTab("FARM")
+
+    -- ---------- refresh loop ----------
+    task.spawn(function()
+        while gui and gui.Parent do
+            title.Text = "BF FARM PRO   [" .. state .. "]"
+            title.TextColor3 = P.running
+                and Color3.fromRGB(126, 226, 152) or Color3.fromRGB(200, 210, 224)
+            statusLbl.Text = statusLine
+            for _, fn in ipairs(live) do fn() end
+            task.wait(0.35)
         end
     end)
 end
