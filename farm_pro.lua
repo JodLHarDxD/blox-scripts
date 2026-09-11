@@ -226,20 +226,54 @@ local function playerLevel()
     return nil
 end
 
--- A dead or unequipped weapon is a very common cause of "stands there doing
--- nothing", so equipping is part of the escalation ladder.
+-- Weapon choice decides whether anything lands at all. A Devil Fruit fires
+-- fruit moves on M1, and the mobile ConsoleTool is not a weapon, so neither
+-- can be left equipped. Melee tools carry WeaponType="Melee".
+local function scoreTool(t)
+    if t:GetAttribute("ConsoleTool") then return -1 end     -- mobile button
+    local wt = t:GetAttribute("WeaponType")
+    if wt == "Melee" then
+        -- Prefer a real sword over bare fists when both are present.
+        return (string.lower(t.Name) == "combat") and 50 or 100
+    end
+    if wt ~= nil then return 20 end                          -- gun, etc.
+    if t:GetAttribute("MovesetV2") then return 10 end
+    return 0                                                 -- fruit / unknown
+end
+
+local function bestTool()
+    local char = player.Character
+    local bp = player:FindFirstChildOfClass("Backpack")
+    local best, bestScore = nil, -math.huge
+    for _, src in ipairs({ char, bp }) do
+        if src then
+            for _, t in ipairs(src:GetChildren()) do
+                if t:IsA("Tool") then
+                    local s = scoreTool(t)
+                    if s > bestScore then best, bestScore = t, s end
+                end
+            end
+        end
+    end
+    return best, bestScore
+end
+
 local function equipWeapon()
     local char = player.Character
-    local backpack = player:FindFirstChildOfClass("Backpack")
     if not char then return false end
-    if char:FindFirstChildOfClass("Tool") then return true end
-    local tool = backpack and backpack:FindFirstChildOfClass("Tool")
-    local hum  = char:FindFirstChildOfClass("Humanoid")
-    if tool and hum then
-        pcall(function() hum:EquipTool(tool) end)
-        return true
-    end
-    return false
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    local want = bestTool()
+    if not want then return false end
+
+    local held = char:FindFirstChildOfClass("Tool")
+    if held == want then return true end
+
+    -- Put the wrong tool away before equipping, or EquipTool can no-op.
+    if held then pcall(function() hum:UnequipTools() end) end
+    pcall(function() hum:EquipTool(want) end)
+    return true
 end
 
 -- =========================================================
@@ -688,7 +722,7 @@ local function buildUI()
     gui.Parent = pg
 
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(340, 118)
+    panel.Size = UDim2.fromOffset(340, 134)
     panel.Position = UDim2.new(1, -352, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
     panel.BackgroundTransparency = 0.08
@@ -723,9 +757,13 @@ local function buildUI()
             local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
             title.Text = "BF FARM PRO   [" .. state .. "]" .. (fastOn and "   fast ON" or "   fast OFF")
             title.TextColor3 = fastOn and Color3.fromRGB(126, 226, 152) or Color3.fromRGB(245, 200, 110)
+            local char = player.Character
+            local held = char and char:FindFirstChildOfClass("Tool")
             body.Text = string.format(
-                "%s\nkills %d  (%.1f/min)   swings %d\nreanchor %d  esc %d  travel %d  retreat %d\nlast progress %.1fs ago",
-                statusLine, stats.kills, stats.kills / mins, stats.swings,
+                "%s\nweapon: %s\nkills %d  (%.1f/min)   swings %d\nreanchor %d  esc %d  travel %d  retreat %d\nlast progress %.1fs ago",
+                statusLine,
+                held and held.Name or "NONE",
+                stats.kills, stats.kills / mins, stats.swings,
                 stats.reanchors, stats.escalations, stats.travels, stats.retreats,
                 os.clock() - lastProgressAt)
             task.wait(0.25)
