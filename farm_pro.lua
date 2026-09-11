@@ -79,6 +79,15 @@ local CFG = {
                                  -- Accept quests by hand.
     QuestRetrySeconds  = 45,
 
+    -- ENEMY PULL
+    -- Roblox hands the nearest player network ownership of unanchored NPCs,
+    -- so their CFrame can be written from the client and it replicates. That
+    -- is how enemies get stacked under you and held there.
+    PullEnemies        = false,  -- toggle with the PULL button
+    PullRange          = 170,    -- gather targets within this radius
+    PullRadius         = 7,      -- how tightly they are stacked
+    PullDrop           = 10,     -- studs BELOW you they are held
+
     AnyEnemyFallback   = true,   -- if quest enemies absent, hit whatever is loaded
     Debug              = false,
 }
@@ -176,7 +185,7 @@ local LEVELS = {
 -- =========================================================
 local stats = {
     kills = 0, swings = 0, reanchors = 0, retreats = 0,
-    escalations = 0, travels = 0, damaging = 0, startedAt = 0,
+    escalations = 0, travels = 0, damaging = 0, pulled = 0, startedAt = 0,
 }
 
 local conns = {}
@@ -192,6 +201,7 @@ local anchor         = nil
 local blacklist      = {}          -- model -> expiry clock
 local countedDead    = {}          -- model -> clock, so a corpse counts once
 local targetNames    = nil         -- set of names, or nil = any
+local activeNames    = nil         -- resolved target set (hoisted: pullStep reads it)
 local anyEnemyMode   = false
 local travelGoal     = nil
 
@@ -564,6 +574,69 @@ local function tryQuest(name)
 end
 
 
+
+-- =========================================================
+-- ENEMY PULL
+-- =========================================================
+-- Held every Heartbeat, because the server's own NPC movement fights it. A
+-- one-shot write is undone within a frame, exactly like character hovering.
+local pullConn = nil
+local pulled = {}
+
+local function pullStep()
+    if not CFG.PullEnemies then return end
+    local _, root = parts()
+    if not root then return end
+
+    local folder = workspace:FindFirstChild("Enemies")
+    if not folder then return end
+
+    local centre = root.Position - Vector3.new(0, CFG.PullDrop, 0)
+    local n = 0
+    table.clear(pulled)
+
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local r = m:FindFirstChild("HumanoidRootPart")
+            if hum and r and hum.Health > 0 then
+                local nm = cleanName(m)
+                if (not activeNames) or activeNames[nm] then
+                    if (r.Position - root.Position).Magnitude <= CFG.PullRange then
+                        n += 1
+                        table.insert(pulled, m)
+                        -- ring them around the centre so they do not fight
+                        -- each other for the same spot
+                        local a = (n / 8) * math.pi * 2
+                        local off = Vector3.new(
+                            math.cos(a) * CFG.PullRadius, 0,
+                            math.sin(a) * CFG.PullRadius)
+                        pcall(function()
+                            r.CFrame = CFrame.new(centre + off)
+                            r.AssemblyLinearVelocity = Vector3.zero
+                            r.AssemblyAngularVelocity = Vector3.zero
+                        end)
+                    end
+                end
+            end
+        end
+    end
+    stats.pulled = n
+end
+
+local function startPuller()
+    if pullConn then return end
+    pullConn = RunService.Heartbeat:Connect(function()
+        pcall(pullStep)
+    end)
+end
+
+local function stopPuller()
+    if pullConn then pcall(function() pullConn:Disconnect() end) end
+    pullConn = nil
+    stats.pulled = 0
+end
+
 -- =========================================================
 -- QUEST (manual only)
 -- =========================================================
@@ -776,7 +849,6 @@ end
 -- =========================================================
 -- MAIN LOOP
 -- =========================================================
-local activeNames = nil
 
 local function retreat()
     stats.retreats += 1
@@ -983,7 +1055,7 @@ local function buildUI()
     gui.Parent = pg
 
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(372, 194)
+    panel.Size = UDim2.fromOffset(372, 216)
     panel.Position = UDim2.new(1, -352, 0, 12)
     panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
     panel.BackgroundTransparency = 0.08
@@ -1040,14 +1112,30 @@ local function buildUI()
         task.spawn(function() pcall(P.takeQuest) end)
     end)
 
+    local pullBtn
+    pullBtn = mkButton("PULL: OFF", 336, 26, Color3.fromRGB(40, 34, 56), function()
+        CFG.PullEnemies = not CFG.PullEnemies
+        if CFG.PullEnemies then startPuller() else stopPuller() end
+    end)
+    pullBtn.Size = UDim2.fromOffset(82, 22)
+    pullBtn.Position = UDim2.fromOffset(10, 52)
+    task.spawn(function()
+        while gui and gui.Parent do
+            pullBtn.Text = CFG.PullEnemies and ("PULL: " .. stats.pulled) or "PULL: OFF"
+            pullBtn.BackgroundColor3 = CFG.PullEnemies
+                and Color3.fromRGB(58, 40, 86) or Color3.fromRGB(40, 34, 56)
+            task.wait(0.3)
+        end
+    end)
+
     mkButton("X", 336, 26, Color3.fromRGB(62, 30, 34), function()
         P.stop()
         if gui then gui:Destroy() end
     end)
 
     local body = Instance.new("TextLabel")
-    body.Size = UDim2.new(1, -16, 1, -54)
-    body.Position = UDim2.fromOffset(10, 52)
+    body.Size = UDim2.new(1, -16, 1, -80)
+    body.Position = UDim2.fromOffset(10, 78)
     body.BackgroundTransparency = 1
     body.Font = Enum.Font.Code
     body.TextSize = 11
@@ -1076,9 +1164,10 @@ local function buildUI()
                 "%s\nweapon: %s\nkills %d  (%.1f/min)   swings %d\nreanchor %d  esc %d  travel %d  retreat %d\nlast progress %.1fs ago",
                 statusLine,
                 held and held.Name or "NONE",
+                tostring(CFG.AttackMode),
                 stats.kills, stats.kills / mins, stats.swings,
-                stats.damaging,
-                stats.reanchors, stats.escalations, stats.travels, stats.retreats,
+                stats.damaging, stats.pulled,
+                stats.escalations, stats.travels, stats.retreats,
                 os.clock() - lastProgressAt)
             task.wait(0.25)
         end
@@ -1115,6 +1204,7 @@ function P.start(names, opts)
     installFastAttack()
     equipWeapon()
     startStabilizer()
+    if CFG.PullEnemies then startPuller() end
     if not (gui and gui.Parent) then pcall(buildUI) end
 
     track(player.Idled:Connect(function()
@@ -1142,6 +1232,7 @@ function P.stop()
     fastOn = false
     cancelMove()
     stopStabilizer()
+    stopPuller()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
     -- HUD deliberately survives stop, so START can restart from the panel.
