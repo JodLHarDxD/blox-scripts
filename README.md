@@ -22,7 +22,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/JodLHarDxD/blox-scrip
 
 ### `farm_pro.lua` — main farm ✅
 
-The one to use. Hovers above enemy clusters, attacks, never silently stalls.
+The one to use. Six tabs, everything toggleable in game, no console needed.
 
 **Run**
 ```lua
@@ -33,30 +33,91 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/JodLHarDxD/blox-scrip
 ```lua
 _G.BFP.stop()
 ```
-…or press **STOP** on the panel. **X** stops it *and* closes the panel.
+…or press **STOP** on the panel. **CLOSE** stops it *and* closes the panel.
 
-**Panel buttons**
+#### The tabs
 
-| Button | Does |
+**FARM**
+
+| Control | Does |
 |---|---|
-| `ANY ENEMY` | Kills whatever is loaded nearby. Never travels. Try this first. |
+| `START` / `STOP` | Toggle the loop |
+| `ANY ENEMY` | Kills whatever is loaded nearby. Never travels. |
 | `BY LEVEL` | Picks the enemy matching your level and travels there. |
-| `START` / `STOP` | Toggle |
-| `X` | Stop + close |
+| `< PREV` / `NEXT >` | Cycle the enemy types currently streamed in |
+| `ADD` | Add that type to the selection (multi-select) |
+| `ONLY THIS` | Clear the selection and farm just that one |
+| `FARM SELECTED` | Farm every added type at once |
+| `FARM TYPED` | Type names yourself, comma separated — works for enemies not yet loaded |
 
-**Optional commands**
+**COMBAT** — attack mode (`SKILLS` / `M1` / `BOTH` / `M1HOLD`), weapon picker from your
+live backpack, per-key skill toggles (Z X C V F — turn off what you have not unlocked),
+swing gap, skill frequency.
+
+**MOVE**
+
+| Control | Does |
+|---|---|
+| `ANTI-GRAVITY` | Re-pins your height every frame. **On by default.** Off = you sink between attacks and melee NPCs reach you. |
+| `HOLD HERE` | Freeze at your exact current position |
+| `RELEASE` | Let go of the hold |
+| hover height / boss hover / secs per target | Steppers |
+| `MAGNET` | Drags enemies to you and holds them in weapon range |
+| `ALL TYPES` | Magnet grabs every enemy, or only your selected names |
+| magnet range / distance / max | How far it reaches, how far in front they sit, how many at once |
+| `PULL` | Older variant — stacks them *under* you instead of in front |
+
+**QUEST** — `TAKE QUEST NOW`, `AUTO` toggle, and `SCAN`, which lists the nearest
+interactables with their distance and why each scored as a quest giver. Use SCAN when
+"take quest" cannot find one.
+
+**TRAVEL** — the fast-travel from `teliport.txt`, built in. Cycle the server's spawn
+points or type a name, press `TRAVEL`. `FORCE RESPAWN` re-sends your team. Farming pauses
+during the respawn and resumes on arrival.
+
+**INFO** — every counter: kills, kills/min, damage hits, swings, magnet count, weapon,
+mode, hover, anti-grav state, level, health, escalations, travels, retreats, seconds
+since the last damage landed.
+
+#### Commands
+
 ```lua
 _G.BFP.start()                       -- same as BY LEVEL
 _G.BFP.start(nil, {anyEnemy = true}) -- same as ANY ENEMY
 _G.BFP.start({"Swan Pirate"})        -- one specific enemy
 _G.BFP.start({"Swan Pirate", "Factory Staff"})  -- several
+_G.BFP.travelTo("Middle Town")       -- fast travel
+_G.BFP.spawnList()                   -- every spawn name for your team
+_G.BFP.questScan(400)                -- what the quest scan can see
+_G.BFP.takeQuest()                   -- walk to the giver and accept
 _G.BFP.stats()                       -- kills, swings, escalations
-_G.BFP.config.HoverHeight = 20       -- live tuning
+_G.BFP.config.HoverHeight = 20       -- live tuning, every CFG key works
+_G.BFP.config.Magnet = true
 ```
 
-**Reading the panel** — `weapon:` must show your **sword** or **Combat**, never `Light-Light`.
-A fruit fires fruit moves on M1, not melee. `last progress` counts seconds since the last
-damage landed; if it climbs past 7 the escalation ladder kicks in and `esc` increments.
+**Reading the panel** — `weapon:` must show your **sword** or **Combat**, never
+`Light-Light`. A fruit fires fruit moves on M1, not melee. `last progress` counts seconds
+since the last damage landed; if it climbs past 7 the escalation ladder kicks in and `esc`
+increments.
+
+---
+
+### `attacktest.lua` — which attack actually lands ✅
+
+Stand next to a live enemy, run it, wait ~30 seconds. It tries nine attack methods one at
+a time and watches that enemy's Health after each, then names the winner. This is how the
+farm's attack method was chosen instead of guessed.
+
+**Run**
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/JodLHarDxD/blox-scripts/main/attacktest.lua?cb=" .. tick()))()
+```
+
+**Stop** — finishes on its own. Press **CLOSE** to dismiss the panel.
+
+Measured results on Solara: every mouse path (VirtualUser Button1, VirtualInputManager
+mouse click, `Tool:Activate`) dealt **zero**. Only `VirtualInputManager:SendKeyEvent`
+landed — Light-Light `Z` 170, Combat `Z` 33, Pipe `Z` 28.
 
 ---
 
@@ -184,6 +245,13 @@ upvalue access to reach the combat controller.
 **No fast attack.** Update 30 removed `CombatFramework` from `PlayerScripts`, so every
 published fast-attack script targets a module that no longer exists. Solara also lacks the
 upvalue access those scripts need. Attacks run at normal speed with the animation visible.
+
+**M1 cannot be simulated.** Six different click paths were measured against a live enemy
+and every one dealt zero damage, at point blank as well as at hover height. The click
+never reaches Blox Fruits' combat handler, so this is not a range problem and widening the
+hitbox would not help. **MAGNET is the answer to reach**: rather than making the swing
+longer, it drags the enemy into the swing. `M1HOLD` mode holds the button down across
+frames instead of clicking — untested, worth one try.
 
 **Streaming window is small.** Only ~5–10 enemies load at a time. The client cannot see
 chests or enemies on islands you aren't near — they don't exist client-side until you
