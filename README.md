@@ -62,18 +62,44 @@ swing gap, skill frequency.
 | `HOLD HERE` | Freeze at your exact current position |
 | `RELEASE` | Let go of the hold |
 | hover height / boss hover / secs per target | Steppers |
+| attack tilt | Pitch while attacking from above. Straight down puts the enemy behind the swing arc; tilt aims into it. |
 | `MAGNET` | Drags enemies to you and holds them in weapon range |
 | `ALL TYPES` | Magnet grabs every enemy, or only your selected names |
 | magnet range / distance / max | How far it reaches, how far in front they sit, how many at once |
+| **leash radius** | **The cap that keeps a pulled enemy damageable.** See below. |
+| `GO TO PACK` | Moves you to the spot that can legally gather the most enemies |
 | `PULL` | Older variant — stacks them *under* you instead of in front |
 
-**QUEST** — `TAKE QUEST NOW`, `AUTO` toggle, and `SCAN`, which lists the nearest
-interactables with their distance and why each scored as a quest giver. Use SCAN when
-"take quest" cannot find one.
+**The leash.** Every Blox Fruits NPC belongs to an area and stops taking damage once
+dragged outside it. A magnet strong enough to reach across the map pulls them past that
+limit — they arrive, and your hits do nothing. So the magnet now refuses any move that
+would take an enemy further than `leash radius` from where it was found, and the MOVE tab
+reports `held N | left alone (outside their area) N`. If a lot are being left alone, press
+`GO TO PACK` — it repositions you to where the most enemies can be gathered legally.
+
+**QUEST** — `TAKE QUEST NOW` walks to the giver and presses **E** (key events are the
+only input path that reaches this game). `SCAN` lists the nearest NPCs, their distance,
+and which quest signal each carries. `PROBE NEAREST NPC` dumps that NPC's full structure
+to the panel and clipboard.
+
+`START QUEST DIRECTLY` skips the NPC entirely — type a quest name (`JungleQuest`), pick a
+tier, press it. Leave the box empty and it looks the name up from the enemy you are
+farming. This is the reliable path: no walking, no dialog, no clicking.
+
+Quest givers carry **no ClickDetector and no ProximityPrompt** — the "E Interact" ring is
+Blox Fruits' own proximity UI. Scanning for interactables found ziplines and campfires and
+missed the giver standing in front of you. Detection is now the "?" QUEST billboard above
+their head, which is the same signal the player uses.
 
 **TRAVEL** — the fast-travel from `teliport.txt`, built in. Cycle the server's spawn
 points or type a name, press `TRAVEL`. `FORCE RESPAWN` re-sends your team. Farming pauses
 during the respawn and resumes on arrival.
+
+Spawn names are **exact and case sensitive** — `middle town` is not `Middle Town`, and the
+server silently ignores a name it does not know, which looks identical to the teleport
+failing: you respawn where you already were. Typed names are now resolved against the real
+spawn list first, and the panel reports what the server answered plus how far you actually
+moved, ending in `<< DID NOT MOVE` when the spawn was rejected.
 
 **INFO** — every counter: kills, kills/min, damage hits, swings, magnet count, weapon,
 mode, hover, anti-grav state, level, health, escalations, travels, retreats, seconds
@@ -88,11 +114,17 @@ _G.BFP.start({"Swan Pirate"})        -- one specific enemy
 _G.BFP.start({"Swan Pirate", "Factory Staff"})  -- several
 _G.BFP.travelTo("Middle Town")       -- fast travel
 _G.BFP.spawnList()                   -- every spawn name for your team
-_G.BFP.questScan(400)                -- what the quest scan can see
-_G.BFP.takeQuest()                   -- walk to the giver and accept
+_G.BFP.questScan(300)                -- what the quest scan can see
+_G.BFP.questProbe()                  -- dump the nearest NPC's structure
+_G.BFP.takeQuest()                   -- walk to the giver, press E, accept
+_G.BFP.startQuest("JungleQuest", 2)  -- ask the server directly
+_G.BFP.startQuestForTarget()         -- look it up from what you are farming
+_G.BFP.packCentre()                  -- where the most enemies can be gathered
 _G.BFP.stats()                       -- kills, swings, escalations
 _G.BFP.config.HoverHeight = 20       -- live tuning, every CFG key works
 _G.BFP.config.Magnet = true
+_G.BFP.config.LeashRadius = 150      -- live, like every other CFG key
+_G.BFP.config.AttackTilt = -45
 ```
 
 **Reading the panel** — `weapon:` must show your **sword** or **Combat**, never
