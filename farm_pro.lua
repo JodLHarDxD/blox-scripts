@@ -2778,14 +2778,26 @@ end
 -- =========================================================
 -- UI
 -- =========================================================
--- One rule decided this rewrite: a control you have to think about is a broken
--- control. So there is exactly ONE primary button, every toggle looks like a
--- toggle and nothing else does, every number you might want to feel your way
--- to is a slider you drag, and the status line under the title always says in
--- plain words what the farm is doing right now.
+-- THE SCENE THIS IS DESIGNED FOR
+-- You are mid-fight. The character is hovering over a spawn, the game is loud
+-- and bright behind this panel, and you are reading it with one eye. So: state
+-- legible in under a second, one control reachable without aiming, everything
+-- else one tap deeper. Nothing on screen that is not being read right now.
 --
--- Things deliberately NOT here: duplicate paths to the same action, warning
--- paragraphs in orange, and any control whose label needs a manual.
+-- WHAT THAT RULED OUT
+--   * tabs      five of them meant five places a setting could be hiding
+--   * cards     a card inside a card is two borders saying nothing
+--   * a grid    equal tiles give every control equal weight; they do not have
+--               equal weight, and pretending otherwise is what made the old
+--               panel feel like a settings dump
+--   * blue      a dark panel with an iOS-blue accent is the first thing anyone
+--               reaches for, and blue fights the sea and sky behind it
+--
+-- WHAT IT IS INSTEAD
+--   One list of rows. Each row shows its live value and opens one screen.
+--   Every row does exactly one thing, so there is nothing to learn.
+--   Neutrals are warm, near-black, never pure black. Colour is reserved for
+--   state and nothing else: green is live, amber wants attention.
 local gui
 local function buildUI()
     local pg = player:WaitForChild("PlayerGui", 10)
@@ -2795,21 +2807,24 @@ local function buildUI()
 
     local UIS = game:GetService("UserInputService")
 
-    -- iOS system palette. One accent, one positive, one negative; everything
-    -- else is a grey. Colour carries meaning here, it is not decoration.
+    -- ---------- tokens ----------
+    -- Warm neutrals. Pure black on a bright cartoon world reads as a hole cut
+    -- in the screen; a warm near-black sits on it instead.
     local C = {
-        bg     = Color3.fromRGB(20, 20, 22),
-        card   = Color3.fromRGB(30, 30, 34),
-        card2  = Color3.fromRGB(44, 44, 49),
-        line   = Color3.fromRGB(62, 62, 68),
-        text   = Color3.fromRGB(245, 245, 247),
-        dim    = Color3.fromRGB(142, 142, 147),
-        faint  = Color3.fromRGB(99, 99, 105),
-        accent = Color3.fromRGB(10, 132, 255),
-        green  = Color3.fromRGB(48, 209, 88),
-        red    = Color3.fromRGB(255, 69, 58),
-        amber  = Color3.fromRGB(255, 159, 10),
+        base    = Color3.fromRGB(18, 17, 16),
+        raised  = Color3.fromRGB(31, 29, 27),
+        pressed = Color3.fromRGB(42, 39, 36),
+        hair    = Color3.fromRGB(53, 50, 46),
+        text    = Color3.fromRGB(242, 239, 234),
+        second  = Color3.fromRGB(154, 149, 141),
+        third   = Color3.fromRGB(107, 102, 95),
+        ivory   = Color3.fromRGB(232, 224, 212),   -- selection, fills, the hero
+        live    = Color3.fromRGB(63, 208, 126),
+        warn    = Color3.fromRGB(240, 166, 60),
+        stop    = Color3.fromRGB(232, 92, 78),
     }
+    -- 11 / 14 / 15 / 21: every step at least 1.25x the one below it
+    local F = { tiny = 11, small = 13, body = 14, label = 15, subject = 21 }
 
     local function mk(class, props)
         local o = Instance.new(class)
@@ -2819,12 +2834,15 @@ local function buildUI()
         if parent then o.Parent = parent end
         return o
     end
-
     local function corner(o, r)
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, r)
-        c.Parent = o
-        return c
+        mk("UICorner", { CornerRadius = UDim.new(0, r), Parent = o })
+        return o
+    end
+    -- Ease out, exponential. No bounce: a control panel that springs is a toy.
+    local EASE = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+    local QUICK = TweenInfo.new(0.11, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+    local function tween(o, props, info)
+        TweenService:Create(o, info or EASE, props):Play()
     end
 
     gui = mk("ScreenGui", {
@@ -2834,130 +2852,253 @@ local function buildUI()
 
     -- ---------- shell ----------
     local panel = mk("Frame", {
-        Size = UDim2.fromOffset(372, 548),
-        Position = UDim2.new(1, -388, 0, 16),
-        BackgroundColor3 = C.bg, BorderSizePixel = 0,
+        Size = UDim2.fromOffset(340, 470),
+        Position = UDim2.new(1, -358, 0, 18),
+        BackgroundColor3 = C.base, BorderSizePixel = 0,
         Active = true, Draggable = true, Parent = gui,
     })
-    corner(panel, 18)
-    mk("UIStroke", { Color = C.line, Transparency = 0.55, Parent = panel })
+    corner(panel, 20)
+    mk("UIStroke", { Color = C.hair, Transparency = 0.45, Parent = panel })
+    -- barely there: lifts the top edge so the panel has a light source
+    local grad = mk("UIGradient", {
+        Rotation = 90,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.94),
+            NumberSequenceKeypoint.new(0.35, 1),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+        Color = ColorSequence.new(Color3.fromRGB(255, 245, 230)),
+        Parent = panel,
+    })
+    grad.Enabled = true
 
-    local title = mk("TextLabel", {
-        Size = UDim2.fromOffset(160, 22), Position = UDim2.fromOffset(18, 14),
-        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 17,
-        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
-        Text = "Farm Pro", Parent = panel,
+    -- ---------- header ----------
+    local backBtn = mk("TextButton", {
+        Size = UDim2.fromOffset(54, 30), Position = UDim2.fromOffset(14, 14),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = C.second, Text = "Back", Visible = false,
+        AutoButtonColor = false, Parent = panel,
+    })
+
+    local heading = mk("TextLabel", {
+        Size = UDim2.new(1, -104, 0, 22), Position = UDim2.fromOffset(20, 18),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+        TextSize = F.label, TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = C.text, Text = "Farm Pro", Parent = panel,
     })
 
     local dot = mk("Frame", {
-        Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(252, 21),
-        BackgroundColor3 = C.faint, BorderSizePixel = 0, Parent = panel,
+        Size = UDim2.fromOffset(7, 7), Position = UDim2.new(1, -62, 0, 26),
+        BackgroundColor3 = C.third, BorderSizePixel = 0, Parent = panel,
     })
     corner(dot, 4)
 
-    local stateLbl = mk("TextLabel", {
-        Size = UDim2.fromOffset(60, 16), Position = UDim2.fromOffset(264, 17),
-        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
-        Text = "idle", Parent = panel,
+    local foldBtn = mk("TextButton", {
+        Size = UDim2.fromOffset(42, 30), Position = UDim2.new(1, -52, 0, 14),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = C.second, Text = "Hide", AutoButtonColor = false, Parent = panel,
     })
 
-    local hideBtn = mk("TextButton", {
-        Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, -40, 0, 13),
-        BackgroundColor3 = C.card, Font = Enum.Font.GothamBold, TextSize = 14,
-        TextColor3 = C.dim, Text = "×", AutoButtonColor = false, Parent = panel,
-    })
-    corner(hideBtn, 13)
-
-    -- Hidden, not destroyed. Closing a panel should never end the run, and a
-    -- run with no way back to its controls is worse than no panel at all.
-    local restore = mk("TextButton", {
-        Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -60, 0, 16),
-        BackgroundColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 16,
-        TextColor3 = C.text, Text = "BF", Visible = false, Parent = gui,
-    })
-    corner(restore, 22)
-    hideBtn.Activated:Connect(function()
-        panel.Visible = false
-        restore.Visible = true
-    end)
-    restore.Activated:Connect(function()
-        panel.Visible = true
-        restore.Visible = false
-    end)
-
-    -- ---------- primary action ----------
-    local runBtn = mk("TextButton", {
-        Size = UDim2.new(1, -36, 0, 44), Position = UDim2.fromOffset(18, 48),
-        BackgroundColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 15,
-        TextColor3 = C.text, Text = "Start farming", AutoButtonColor = false,
-        Parent = panel,
-    })
-    corner(runBtn, 13)
-
-    local statusLbl = mk("TextLabel", {
-        Size = UDim2.new(1, -36, 0, 14), Position = UDim2.fromOffset(18, 98),
-        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
-        TextTruncate = Enum.TextTruncate.AtEnd, Text = "", Parent = panel,
+    -- ---------- body ----------
+    local bodyFrame = mk("Frame", {
+        Size = UDim2.new(1, 0, 1, -52), Position = UDim2.fromOffset(0, 52),
+        BackgroundTransparency = 1, ClipsDescendants = true, Parent = panel,
     })
 
-    -- ---------- tabs ----------
-    local TABS = { "Farm", "Quest", "Travel", "Setup", "Stats" }
-    local pages, segs = {}, {}
-    local current = "Farm"
-
-    local segBG = mk("Frame", {
-        Size = UDim2.new(1, -36, 0, 30), Position = UDim2.fromOffset(18, 118),
-        BackgroundColor3 = C.card, BorderSizePixel = 0, Parent = panel,
-    })
-    corner(segBG, 9)
-
-    local function showTab(name)
-        current = name
-        for n, page in pairs(pages) do page.Visible = (n == name) end
-        for n, b in pairs(segs) do
-            b.BackgroundColor3 = (n == name) and C.card2 or C.card
-            b.TextColor3 = (n == name) and C.text or C.dim
-        end
-    end
-
-    for i, name in ipairs(TABS) do
-        local b = mk("TextButton", {
-            Size = UDim2.new(1 / #TABS, -4, 1, -6),
-            Position = UDim2.new((i - 1) / #TABS, 2, 0, 3),
-            BackgroundColor3 = C.card, Font = Enum.Font.GothamMedium, TextSize = 11,
-            TextColor3 = C.dim, Text = name, AutoButtonColor = false, Parent = segBG,
-        })
-        corner(b, 7)
-        b.Activated:Connect(function() showTab(name) end)
-        segs[name] = b
-
-        local page = mk("ScrollingFrame", {
-            Size = UDim2.new(1, -24, 1, -166), Position = UDim2.fromOffset(12, 158),
-            BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
-            ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(),
-            Visible = false, Parent = panel,
-        })
-        local l = mk("UIListLayout", {
-            SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), Parent = page,
-        })
-        mk("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = page })
-        l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-            page.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 16)
-        end)
-        pages[name] = page
-    end
-
-    -- =====================================================
-    -- WIDGETS
-    -- =====================================================
+    -- Live readouts, each tagged with the view that owns it. A closure on a
+    -- screen you are not looking at is work nobody asked for, and some of them
+    -- walk the whole enemy folder.
     local live = {}
+    local buildingView = nil
+    local function addLive(fn) table.insert(live, { v = buildingView, f = fn }) end
+
+    local views, viewOrder = {}, {}
+    local currentView = "home"
+
+    local function makeView(name)
+        local v = mk("ScrollingFrame", {
+            Name = name,
+            Size = UDim2.fromScale(1, 1), Position = UDim2.fromScale(1, 0),
+            BackgroundTransparency = 1, BorderSizePixel = 0,
+            ScrollBarThickness = 2, ScrollBarImageColor3 = C.hair,
+            CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            Visible = false, Parent = bodyFrame,
+        })
+        mk("UIListLayout", {
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            HorizontalAlignment = Enum.HorizontalAlignment.Center, Parent = v,
+        })
+        mk("UIPadding", { PaddingBottom = UDim.new(0, 16), Parent = v })
+        views[name] = v
+        buildingView = v
+        table.insert(viewOrder, name)
+        return v
+    end
+
+    local TITLES = {
+        home = "Farm Pro", targets = "Targets", magnet = "Magnet",
+        quest = "Quest", travel = "Teleport", combat = "Combat",
+        setup = "Tuning", stats = "Stats",
+    }
+
+    local function show(name, back)
+        if name == currentView then return end
+        local from, to = views[currentView], views[name]
+        if not to then return end
+        to.Position = UDim2.fromScale(back and -1 or 1, 0)
+        to.Visible = true
+        tween(to, { Position = UDim2.fromScale(0, 0) })
+        if from then
+            tween(from, { Position = UDim2.fromScale(back and 1 or -1, 0) })
+            task.delay(0.24, function()
+                if currentView ~= from.Name then from.Visible = false end
+            end)
+        end
+        currentView = name
+        heading.Text = TITLES[name] or name
+        heading.Position = UDim2.fromOffset(name == "home" and 20 or 76, 18)
+        backBtn.Visible = (name ~= "home")
+    end
+
+    backBtn.Activated:Connect(function() show("home", true) end)
+
+    -- =====================================================
+    -- PIECES
+    -- =====================================================
     local order = 0
     local function nextOrder() order += 1 return order end
 
-    -- One shared drag handler for every slider. Per-slider connections leak
-    -- and fight each other; one pointer to the slider being dragged does not.
+    -- Vertical air. Rhythm comes from varying this, not from padding every
+    -- element the same amount.
+    local function gap(view, h)
+        mk("Frame", {
+            Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+    end
+
+    local function heading2(view, text)
+        local t = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium, TextSize = F.tiny,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.third,
+            Text = string.upper(text), LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = t })
+        return t
+    end
+
+    -- inset from the left like a settings list, flush right
+    local function hairline(view)
+        local holder = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 1), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("Frame", {
+            Size = UDim2.new(1, -20, 0, 1), Position = UDim2.fromOffset(20, 0),
+            BackgroundColor3 = C.hair, BackgroundTransparency = 0.5,
+            BorderSizePixel = 0, Parent = holder,
+        })
+        return holder
+    end
+
+    -- Every tappable thing answers the finger the same way.
+    local function pressable(btn)
+        local base = btn.BackgroundColor3
+        btn.MouseButton1Down:Connect(function()
+            tween(btn, { BackgroundColor3 = C.pressed }, QUICK)
+        end)
+        local function release()
+            tween(btn, { BackgroundColor3 = base }, QUICK)
+        end
+        btn.MouseButton1Up:Connect(release)
+        btn.MouseLeave:Connect(release)
+        return btn
+    end
+
+    -- label left, live value right, chevron. One tap, one meaning.
+    local function navRow(view, label, valueFn, target)
+        local b = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 48), BackgroundColor3 = C.base,
+            BackgroundTransparency = 0, BorderSizePixel = 0, Text = "",
+            AutoButtonColor = false, LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("TextLabel", {
+            Size = UDim2.new(0, 130, 1, 0), Position = UDim2.fromOffset(20, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+            TextSize = F.label, TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = C.text, Text = label, Parent = b,
+        })
+        local val = mk("TextLabel", {
+            Size = UDim2.new(1, -190, 1, 0), Position = UDim2.fromOffset(150, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+            TextSize = F.body, TextXAlignment = Enum.TextXAlignment.Right,
+            TextColor3 = C.second, TextTruncate = Enum.TextTruncate.AtEnd,
+            Text = "", Parent = b,
+        })
+        mk("TextLabel", {
+            Size = UDim2.fromOffset(20, 48), Position = UDim2.new(1, -28, 0, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+            TextSize = 14, TextColor3 = C.third, TextTransparency = 0.15,
+            Text = ">", Parent = b,
+        })
+        pressable(b)
+        b.Activated:Connect(function() show(target) end)
+        if valueFn then
+            addLive(function()
+                local ok, v = pcall(valueFn)
+                val.Text = ok and tostring(v) or ""
+            end)
+        end
+        return b
+    end
+
+    local function switchRow(view, label, sub, get, set)
+        local h = sub and 58 or 46
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("TextLabel", {
+            Size = UDim2.new(1, -90, 0, 20),
+            Position = UDim2.fromOffset(20, sub and 9 or 13),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+            TextSize = F.label, TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = C.text, Text = label, Parent = f,
+        })
+        if sub then
+            mk("TextLabel", {
+                Size = UDim2.new(1, -90, 0, 16), Position = UDim2.fromOffset(20, 29),
+                BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+                TextSize = F.small, TextXAlignment = Enum.TextXAlignment.Left,
+                TextColor3 = C.third, Text = sub, Parent = f,
+            })
+        end
+        local pill = mk("TextButton", {
+            Size = UDim2.fromOffset(44, 26), Position = UDim2.new(1, -64, 0, (h - 26) / 2),
+            BackgroundColor3 = C.hair, Text = "", AutoButtonColor = false, Parent = f,
+        })
+        corner(pill, 13)
+        local knob = mk("Frame", {
+            Size = UDim2.fromOffset(22, 22), Position = UDim2.fromOffset(2, 2),
+            BackgroundColor3 = C.text, BorderSizePixel = 0, Parent = pill,
+        })
+        corner(knob, 11)
+        local function redraw()
+            local on = get() and true or false
+            tween(pill, { BackgroundColor3 = on and C.live or C.hair }, QUICK)
+            tween(knob, { Position = UDim2.fromOffset(on and 20 or 2, 2) }, QUICK)
+        end
+        pill.Activated:Connect(function() set(not get()) redraw() end)
+        addLive(redraw)
+        redraw()
+        return f
+    end
+
+    -- Drag anywhere on the row, not just the 4px track. A 4px target mid-fight
+    -- is a control you will miss.
     local dragTarget = nil
     UIS.InputChanged:Connect(function(i)
         if dragTarget and (i.UserInputType == Enum.UserInputType.MouseMovement
@@ -2972,122 +3113,38 @@ local function buildUI()
         end
     end)
 
-    local function group(page, heading)
-        if heading then
-            mk("TextLabel", {
-                Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
-                Font = Enum.Font.GothamBold, TextSize = 10,
-                TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
-                Text = string.upper(heading), LayoutOrder = nextOrder(), Parent = page,
-            })
-        end
-        local card = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundColor3 = C.card, BorderSizePixel = 0,
-            LayoutOrder = nextOrder(), Parent = page,
-        })
-        corner(card, 14)
-        mk("UIListLayout", {
-            SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2), Parent = card,
-        })
-        mk("UIPadding", {
-            PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
-            PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = card,
-        })
-        return card
-    end
-
-    local function note(parent, text)
-        return mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
-            TextWrapped = true, Text = text, LayoutOrder = nextOrder(), Parent = parent,
-        })
-    end
-
-    local function infoLine(parent, get)
-        local t = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 12,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
-            TextWrapped = true, Text = "", LayoutOrder = nextOrder(), Parent = parent,
-        })
-        table.insert(live, function() t.Text = get() end)
-        return t
-    end
-
-    local function switch(parent, titleText, sub, get, set)
-        local h = sub and 46 or 34
-        local f = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1,
-            LayoutOrder = nextOrder(), Parent = parent,
+    local function sliderRow(view, label, minV, maxV, stepV, get, set, unit)
+        local f = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 62), BackgroundTransparency = 1,
+            Text = "", AutoButtonColor = false,
+            LayoutOrder = nextOrder(), Parent = view,
         })
         mk("TextLabel", {
-            Size = UDim2.new(1, -60, 0, 18), Position = UDim2.fromOffset(0, sub and 5 or 8),
-            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
-            Text = titleText, Parent = f,
+            Size = UDim2.new(1, -120, 0, 20), Position = UDim2.fromOffset(20, 10),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+            TextSize = F.label, TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = C.text, Text = label, Parent = f,
         })
-        if sub then
-            mk("TextLabel", {
-                Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(0, 24),
-                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
-                TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
-                Text = sub, Parent = f,
-            })
-        end
-        local pill = mk("TextButton", {
-            Size = UDim2.fromOffset(44, 25), Position = UDim2.new(1, -44, 0, (h - 25) / 2),
-            BackgroundColor3 = C.line, Text = "", AutoButtonColor = false, Parent = f,
-        })
-        corner(pill, 13)
-        local knob = mk("Frame", {
-            Size = UDim2.fromOffset(21, 21), Position = UDim2.fromOffset(2, 2),
-            BackgroundColor3 = C.text, BorderSizePixel = 0, Parent = pill,
-        })
-        corner(knob, 11)
-        local function redraw()
-            local on = get() and true or false
-            pill.BackgroundColor3 = on and C.green or C.line
-            knob.Position = UDim2.fromOffset(on and 21 or 2, 2)
-        end
-        pill.Activated:Connect(function() set(not get()) redraw() end)
-        table.insert(live, redraw)
-        redraw()
-        return f
-    end
-
-    local function slider(parent, titleText, minV, maxV, stepV, get, set, unit)
-        local f = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 50), BackgroundTransparency = 1,
-            LayoutOrder = nextOrder(), Parent = parent,
-        })
-        mk("TextLabel", {
-            Size = UDim2.new(1, -80, 0, 16), Position = UDim2.fromOffset(0, 6),
-            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
-            Text = titleText, Parent = f,
-        })
+        -- the numeral is monospaced so it does not jitter while you drag
         local val = mk("TextLabel", {
-            Size = UDim2.fromOffset(80, 16), Position = UDim2.new(1, -80, 0, 6),
-            BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = C.accent,
-            Text = "", Parent = f,
+            Size = UDim2.fromOffset(100, 20), Position = UDim2.new(1, -120, 0, 10),
+            BackgroundTransparency = 1, Font = Enum.Font.Code,
+            TextSize = F.body, TextXAlignment = Enum.TextXAlignment.Right,
+            TextColor3 = C.second, Text = "", Parent = f,
         })
         local track = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 6), Position = UDim2.fromOffset(0, 32),
-            BackgroundColor3 = C.card2, BorderSizePixel = 0, Parent = f,
+            Size = UDim2.new(1, -40, 0, 4), Position = UDim2.fromOffset(20, 42),
+            BackgroundColor3 = C.hair, BorderSizePixel = 0, Parent = f,
         })
-        corner(track, 3)
+        corner(track, 2)
         local fill = mk("Frame", {
-            Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.accent,
+            Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.ivory,
             BorderSizePixel = 0, Parent = track,
         })
-        corner(fill, 3)
+        corner(fill, 2)
         local knob = mk("Frame", {
             Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = C.text,
+            Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = C.ivory,
             BorderSizePixel = 0, ZIndex = 2, Parent = track,
         })
         corner(knob, 8)
@@ -3097,162 +3154,194 @@ local function buildUI()
             local a = math.clamp((v - minV) / math.max(maxV - minV, 0.001), 0, 1)
             fill.Size = UDim2.fromScale(a, 1)
             knob.Position = UDim2.new(a, 0, 0.5, 0)
-            val.Text = ((stepV < 1) and string.format("%.2f", v) or tostring(math.floor(v)))
+            val.Text = ((stepV < 1) and string.format("%.1f", v) or tostring(math.floor(v)))
                 .. (unit or "")
         end
         local function apply(x)
             local a = math.clamp((x - track.AbsolutePosition.X)
                 / math.max(track.AbsoluteSize.X, 1), 0, 1)
-            local v = minV + a * (maxV - minV)
-            v = math.floor(v / stepV + 0.5) * stepV
-            v = math.clamp(v, minV, maxV)
+            local v = math.clamp(math.floor((minV + a * (maxV - minV)) / stepV + 0.5) * stepV,
+                minV, maxV)
             if stepV < 1 then v = tonumber(string.format("%.2f", v)) end
             set(v)
             redraw()
         end
-        track.InputBegan:Connect(function(i)
+        f.InputBegan:Connect(function(i)
             if i.UserInputType == Enum.UserInputType.MouseButton1
                 or i.UserInputType == Enum.UserInputType.Touch then
                 dragTarget = apply
+                tween(knob, { Size = UDim2.fromOffset(20, 20) }, QUICK)
                 apply(i.Position.X)
             end
         end)
-        table.insert(live, redraw)
+        f.InputEnded:Connect(function()
+            tween(knob, { Size = UDim2.fromOffset(16, 16) }, QUICK)
+        end)
+        addLive(redraw)
         redraw()
         return f
     end
 
-    local function button(parent, text, kind, cb, refresh)
-        local fills = { primary = C.accent, good = C.green, bad = C.red, plain = C.card2 }
-        local b = mk("TextButton", {
-            Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = fills[kind] or C.card2,
-            Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.text,
-            Text = text, AutoButtonColor = false, LayoutOrder = nextOrder(), Parent = parent,
-        })
-        corner(b, 10)
-        b.Activated:Connect(function() pcall(cb, b) end)
-        if refresh then table.insert(live, function() pcall(refresh, b) end) end
-        return b
-    end
-
-    -- two buttons on one line
-    local function buttonPair(parent, aText, aKind, aCb, bText, bKind, bCb)
+    local function choiceRow(view, label, items, get, set)
         local f = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
-            LayoutOrder = nextOrder(), Parent = parent,
+            Size = UDim2.new(1, 0, 0, 62), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
         })
-        local fills = { primary = C.accent, good = C.green, bad = C.red, plain = C.card2 }
-        local function half(text, kind, cb, x)
-            local b = mk("TextButton", {
-                Size = UDim2.new(0.5, -4, 1, 0), Position = UDim2.new(x, x == 0 and 0 or 4, 0, 0),
-                BackgroundColor3 = fills[kind] or C.card2, Font = Enum.Font.GothamMedium,
-                TextSize = 13, TextColor3 = C.text, Text = text,
-                AutoButtonColor = false, Parent = f,
+        if label then
+            mk("TextLabel", {
+                Size = UDim2.new(1, -40, 0, 18), Position = UDim2.fromOffset(20, 6),
+                BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+                TextSize = F.label, TextXAlignment = Enum.TextXAlignment.Left,
+                TextColor3 = C.text, Text = label, Parent = f,
             })
-            corner(b, 10)
-            b.Activated:Connect(function() pcall(cb, b) end)
-            return b
         end
-        return half(aText, aKind, aCb, 0), half(bText, bKind, bCb, 0.5)
-    end
-
-    local function textbox(parent, placeholder, actionText, cb)
-        local f = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
-            LayoutOrder = nextOrder(), Parent = parent,
+        local strip = mk("Frame", {
+            Size = UDim2.new(1, -40, 0, 30),
+            Position = UDim2.fromOffset(20, label and 28 or 16),
+            BackgroundColor3 = C.raised, BorderSizePixel = 0, Parent = f,
         })
-        local tb = mk("TextBox", {
-            Size = UDim2.new(1, -92, 1, 0), BackgroundColor3 = C.card2,
-            BorderSizePixel = 0, ClearTextOnFocus = false, Font = Enum.Font.Gotham,
-            TextSize = 12, TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
-            PlaceholderText = placeholder, PlaceholderColor3 = C.faint, Text = "",
-            Parent = f,
-        })
-        corner(tb, 10)
-        mk("UIPadding", { PaddingLeft = UDim.new(0, 10), Parent = tb })
-        local b = mk("TextButton", {
-            Size = UDim2.fromOffset(86, 36), Position = UDim2.new(1, -86, 0, 0),
-            BackgroundColor3 = C.card2, Font = Enum.Font.GothamMedium, TextSize = 12,
-            TextColor3 = C.text, Text = actionText, AutoButtonColor = false, Parent = f,
-        })
-        corner(b, 10)
-        local function fire()
-            local v = (tb.Text:gsub("^%s+", ""):gsub("%s+$", ""))
-            pcall(cb, v, tb)
-        end
-        b.Activated:Connect(fire)
-        tb.FocusLost:Connect(function(enter) if enter then fire() end end)
-        return tb
-    end
-
-    local function segmented(parent, items, get, set)
-        local f = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.card2,
-            BorderSizePixel = 0, LayoutOrder = nextOrder(), Parent = parent,
-        })
-        corner(f, 9)
+        corner(strip, 9)
         for i, it in ipairs(items) do
             local b = mk("TextButton", {
                 Size = UDim2.new(1 / #items, -4, 1, -6),
                 Position = UDim2.new((i - 1) / #items, 2, 0, 3),
-                BackgroundColor3 = C.card2, Font = Enum.Font.GothamMedium, TextSize = 12,
-                TextColor3 = C.dim, Text = it[1], AutoButtonColor = false, Parent = f,
+                BackgroundColor3 = C.raised, Font = Enum.Font.GothamMedium,
+                TextSize = F.small, TextColor3 = C.second, Text = it[1],
+                AutoButtonColor = false, Parent = strip,
             })
             corner(b, 7)
             b.Activated:Connect(function() set(it[2]) end)
-            table.insert(live, function()
+            addLive(function()
                 local on = (get() == it[2])
-                b.BackgroundColor3 = on and C.accent or C.card2
-                b.TextColor3 = on and C.text or C.dim
+                b.BackgroundColor3 = on and C.ivory or C.raised
+                b.TextColor3 = on and C.base or C.second
             end)
         end
         return f
     end
 
-    -- A scrolling list of tappable rows, rebuilt only when its contents change.
-    local function listView(parent, height)
-        local box = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, height), BackgroundColor3 = C.card,
-            BorderSizePixel = 0, LayoutOrder = nextOrder(), Parent = parent,
+    local function actionRow(view, label, tone, cb)
+        local b = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.base,
+            BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = F.label,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = (tone == "danger") and C.stop or C.ivory, Text = label,
+            AutoButtonColor = false, LayoutOrder = nextOrder(), Parent = view,
         })
-        corner(box, 14)
-        local sf = mk("ScrollingFrame", {
-            Size = UDim2.new(1, -12, 1, -12), Position = UDim2.fromOffset(6, 6),
-            BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
-            ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(), Parent = box,
-        })
-        local l = mk("UIListLayout", { Padding = UDim.new(0, 2), Parent = sf })
-        l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-            sf.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 4)
-        end)
-        return sf
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = b })
+        pressable(b)
+        b.Activated:Connect(function() task.spawn(function() pcall(cb, b) end) end)
+        return b
     end
 
-    local function listRow(sf, text, tagText, tagColour, cb, i)
-        local b = mk("TextButton", {
-            Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card2,
-            BackgroundTransparency = 0.45, Font = Enum.Font.Gotham, TextSize = 12,
-            TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
-            Text = "  " .. text, AutoButtonColor = false, LayoutOrder = i, Parent = sf,
+    local function textRow(view, placeholder, cb)
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 52), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
         })
-        corner(b, 8)
-        if tagText and tagText ~= "" then
+        local tb = mk("TextBox", {
+            Size = UDim2.new(1, -40, 0, 36), Position = UDim2.fromOffset(20, 8),
+            BackgroundColor3 = C.raised, BorderSizePixel = 0,
+            ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = F.body,
+            TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
+            PlaceholderText = placeholder, PlaceholderColor3 = C.third,
+            Text = "", Parent = f,
+        })
+        corner(tb, 10)
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 12), Parent = tb })
+        tb.FocusLost:Connect(function(enter)
+            if enter then
+                pcall(cb, (tb.Text:gsub("^%s+", ""):gsub("%s+$", "")), tb)
+            end
+        end)
+        return tb
+    end
+
+    local function caption(view, text)
+        local t = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = F.small,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.third,
+            TextWrapped = true, Text = text, LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("UIPadding", {
+            PaddingLeft = UDim.new(0, 20), PaddingRight = UDim.new(0, 20), Parent = t,
+        })
+        mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 6), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        return t
+    end
+
+    local function readout(view, fn)
+        local t = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = F.body,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.second,
+            TextWrapped = true, Text = "", LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("UIPadding", {
+            PaddingLeft = UDim.new(0, 20), PaddingRight = UDim.new(0, 20), Parent = t,
+        })
+        mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 8), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        addLive(function()
+            local ok, v = pcall(fn)
+            t.Text = ok and tostring(v) or ""
+        end)
+        return t
+    end
+
+    -- A list you pick from. Rebuilt only when its contents change, so it does
+    -- not flicker three times a second.
+    local function picker(view, height)
+        local box = mk("ScrollingFrame", {
+            Size = UDim2.new(1, 0, 0, height), BackgroundTransparency = 1,
+            BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = C.hair,
+            CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("UIListLayout", { Padding = UDim.new(0, 2), Parent = box })
+        mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 10), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = view,
+        })
+        mk("UIPadding", {
+            PaddingLeft = UDim.new(0, 20), PaddingRight = UDim.new(0, 20), Parent = box,
+        })
+        return box
+    end
+
+    local function pickerRow(box, i, label, tag, tagColour, cb)
+        local b = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.raised,
+            BackgroundTransparency = 0.35, BorderSizePixel = 0,
+            Font = Enum.Font.Gotham, TextSize = F.body, TextColor3 = C.text,
+            TextXAlignment = Enum.TextXAlignment.Left, Text = "   " .. label,
+            AutoButtonColor = false, LayoutOrder = i, Parent = box,
+        })
+        corner(b, 9)
+        if tag and tag ~= "" then
             mk("TextLabel", {
-                Size = UDim2.fromOffset(84, 30), Position = UDim2.new(1, -92, 0, 0),
-                BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 10,
-                TextXAlignment = Enum.TextXAlignment.Right,
-                TextColor3 = tagColour or C.dim, Text = tagText, Parent = b,
+                Size = UDim2.fromOffset(110, 34), Position = UDim2.new(1, -122, 0, 0),
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+                TextSize = F.small, TextXAlignment = Enum.TextXAlignment.Right,
+                TextColor3 = tagColour or C.third, Text = tag, Parent = b,
             })
         end
+        pressable(b)
         b.Activated:Connect(function() pcall(cb) end)
         return b
     end
 
     -- =====================================================
-    -- FARM
+    -- SELECTION STATE
     -- =====================================================
-    -- selection[name] = "farm" | "backup" | nil
-    local selection = {}
+    local selection = {}      -- name -> "farm" | "backup"
     local function selectionLists()
         local prim, back = {}, {}
         for n, kind in pairs(selection) do
@@ -3271,30 +3360,140 @@ local function buildUI()
         end)
     end
 
+    -- =====================================================
+    -- HOME
+    -- =====================================================
     do
-        local page = pages.Farm
+        local v = makeView("home")
+        v.Visible = true
+        v.Position = UDim2.fromScale(0, 0)
 
-        local card = group(page, "targets")
-        local list = listView(card, 154)
-        note(card, "Tap once to farm it. Tap again to keep it as a backup for when "
-            .. "the first lot are respawning. Tap a third time to drop it.")
+        gap(v, 4)
+
+        -- What it is doing, in the largest type on the panel. This is the one
+        -- thing you read from across the room.
+        local subject = mk("TextLabel", {
+            Size = UDim2.new(1, -40, 0, 26), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = F.subject,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
+            TextTruncate = Enum.TextTruncate.AtEnd, Text = "Idle",
+            LayoutOrder = nextOrder(), Parent = v,
+        })
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = subject })
+
+        local detail = mk("TextLabel", {
+            Size = UDim2.new(1, -40, 0, 18), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = F.small,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.second,
+            TextTruncate = Enum.TextTruncate.AtEnd, Text = "",
+            LayoutOrder = nextOrder(), Parent = v,
+        })
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = detail })
+
+        addLive(function()
+            if P.running then
+                subject.Text = tostring(P.focusName or "Farming")
+                local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
+                detail.Text = string.format("%d kills  ·  %.0f per minute  ·  %s",
+                    stats.kills, stats.kills / mins, statusLine)
+            else
+                subject.Text = "Idle"
+                detail.Text = statusLine
+            end
+        end)
+
+        gap(v, 14)
+
+        -- The only control you need without looking.
+        local hero = mk("TextButton", {
+            Size = UDim2.new(1, -40, 0, 52), BackgroundColor3 = C.ivory,
+            BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 16,
+            TextColor3 = C.base, Text = "Start", AutoButtonColor = false,
+            LayoutOrder = nextOrder(), Parent = v,
+        })
+        corner(hero, 14)
+        hero.Activated:Connect(function()
+            if P.running then P.stop() else startFarm() end
+        end)
+        hero.MouseButton1Down:Connect(function()
+            tween(hero, { Size = UDim2.new(1, -46, 0, 50) }, QUICK)
+        end)
+        local function heroUp()
+            tween(hero, { Size = UDim2.new(1, -40, 0, 52) }, QUICK)
+        end
+        hero.MouseButton1Up:Connect(heroUp)
+        hero.MouseLeave:Connect(heroUp)
+        addLive(function()
+            hero.Text = P.running and "Stop" or "Start"
+            hero.BackgroundColor3 = P.running and C.stop or C.ivory
+            hero.TextColor3 = P.running and C.text or C.base
+        end)
+
+        gap(v, 18)
+
+        navRow(v, "Targets", function()
+            local prim, back = selectionLists()
+            if #prim == 0 then return "by level" end
+            return prim[1] .. (#prim > 1 and (" +" .. (#prim - 1)) or "")
+                .. (#back > 0 and "  ·  " .. #back .. " backup" or "")
+        end, "targets")
+        hairline(v)
+        navRow(v, "Magnet", function()
+            if not CFG.Magnet then return "off" end
+            return string.format("%d held  ·  %d studs", stats.pulled or 0,
+                stats.nearestHeld or 0)
+        end, "magnet")
+        hairline(v)
+        navRow(v, "Quest", function()
+            if not CFG.AutoQuest then return "off" end
+            local q = P.readQuest()
+            if q then return q.have .. " of " .. q.need end
+            return tostring(P.questProgress or "waiting")
+        end, "quest")
+        hairline(v)
+        navRow(v, "Teleport", function()
+            return P.travelling() and "going" or "pick a place"
+        end, "travel")
+        hairline(v)
+        navRow(v, "Combat", function()
+            local held = player.Character
+                and player.Character:FindFirstChildOfClass("Tool")
+            return (held and held.Name or "no weapon")
+        end, "combat")
+        hairline(v)
+        navRow(v, "Tuning", function()
+            return string.format("hover %d", CFG.HoverHeight)
+        end, "setup")
+        hairline(v)
+        navRow(v, "Stats", function()
+            return stats.kills .. " killed"
+        end, "stats")
+
+        gap(v, 10)
+    end
+
+    -- =====================================================
+    -- TARGETS
+    -- =====================================================
+    do
+        local v = makeView("targets")
+        gap(v, 6)
+        caption(v, "Tap once to farm it. Tap again to keep it as a backup for "
+            .. "when the first lot are respawning. Tap a third time to drop it.")
+        local list = picker(v, 190)
 
         local signature = ""
-        local function refreshList()
+        local function refresh()
             local seen, out = {}, {}
             local folder = workspace:FindFirstChild("Enemies")
             if folder then
                 for _, m in ipairs(folder:GetChildren()) do
                     if m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
                         local n = cleanName(m)
-                        if not seen[n] then
-                            seen[n] = true
-                            table.insert(out, n)
-                        end
+                        if not seen[n] then seen[n] = true table.insert(out, n) end
                     end
                 end
             end
-            -- anything selected but not currently streamed in stays on the list
             for n in pairs(selection) do
                 if not seen[n] then seen[n] = true table.insert(out, n) end
             end
@@ -3309,110 +3508,141 @@ local function buildUI()
                 if c:IsA("GuiObject") then c:Destroy() end
             end
             if #out == 0 then
-                listRow(list, "nothing loaded here yet", "", C.faint, function() end, 1)
+                pickerRow(list, 1, "Nothing loaded here", "", C.third, function() end)
                 return
             end
             for i, n in ipairs(out) do
                 local kind = selection[n]
-                local tag = (kind == "farm" and "FARM")
-                    or (kind == "backup" and "BACKUP") or ""
-                local col = (kind == "farm" and C.accent)
-                    or (kind == "backup" and C.dim) or C.faint
-                listRow(list, n, tag, col, function()
-                    if selection[n] == nil then selection[n] = "farm"
-                    elseif selection[n] == "farm" then selection[n] = "backup"
-                    else selection[n] = nil end
-                    refreshList()
-                end, i)
+                pickerRow(list, i, n,
+                    (kind == "farm" and "farming") or (kind == "backup" and "backup") or "",
+                    (kind == "farm" and C.ivory) or (kind == "backup" and C.second) or C.third,
+                    function()
+                        if selection[n] == nil then selection[n] = "farm"
+                        elseif selection[n] == "farm" then selection[n] = "backup"
+                        else selection[n] = nil end
+                        refresh()
+                    end)
             end
         end
-        refreshList()
-        table.insert(live, refreshList)
+        refresh()
+        addLive(refresh)
 
-        buttonPair(page,
-            "Farm by level", "plain", function()
-                table.clear(selection)
-                P.setSecondary(nil)
-                task.spawn(function() P.start(nil, {}) end)
-            end,
-            "Farm anything", "plain", function()
-                table.clear(selection)
-                P.setSecondary(nil)
-                task.spawn(function() P.start(nil, { anyEnemy = true }) end)
-            end)
-
-        textbox(page, "or type names: Swan Pirate, Raider", "Use", function(v)
-            if #v == 0 then return end
+        actionRow(v, "Farm what I picked", nil, function()
+            startFarm()
+            show("home", true)
+        end)
+        hairline(v)
+        actionRow(v, "Farm by my level", nil, function()
             table.clear(selection)
-            for word in string.gmatch(v, "[^,]+") do
+            P.setSecondary(nil)
+            task.spawn(function() P.start(nil, {}) end)
+            show("home", true)
+        end)
+        hairline(v)
+        actionRow(v, "Hit anything loaded", nil, function()
+            table.clear(selection)
+            P.setSecondary(nil)
+            task.spawn(function() P.start(nil, { anyEnemy = true }) end)
+            show("home", true)
+        end)
+
+        gap(v, 14)
+        heading2(v, "or type them")
+        textRow(v, "Swan Pirate, Raider", function(val)
+            if #val == 0 then return end
+            table.clear(selection)
+            for word in string.gmatch(val, "[^,]+") do
                 word = (word:gsub("^%s+", ""):gsub("%s+$", ""))
                 if #word > 0 then selection[word] = "farm" end
             end
             startFarm()
         end)
 
-        local rot = group(page, "rotation")
-        switch(rot, "One type at a time",
-            "Each species has its own patch of ground and its own leash",
+        gap(v, 8)
+        heading2(v, "one type at a time")
+        switchRow(v, "Work one type through",
+            "Each species has its own patch and its own leash",
             function() return CFG.RotateTypes end,
-            function(v) CFG.RotateTypes = v end)
-        switch(rot, "Stand in the middle of them", nil,
+            function(x) CFG.RotateTypes = x end)
+        switchRow(v, "Stand in the middle of them", nil,
             function() return CFG.TypeCentre end,
-            function(v) CFG.TypeCentre = v end)
-        slider(rot, "Minutes per type", 0.5, 10, 0.5,
+            function(x) CFG.TypeCentre = x end)
+        sliderRow(v, "Minutes per type", 0.5, 10, 0.5,
             function() return CFG.TypeDwell / 60 end,
-            function(v) CFG.TypeDwell = math.floor(v * 60) end, " min")
-        button(rot, "Switch type now", "plain", function() pcall(P.nextType) end)
+            function(x) CFG.TypeDwell = math.floor(x * 60) end, " min")
+        actionRow(v, "Switch type now", nil, function() pcall(P.nextType) end)
+    end
 
-        local mag = group(page, "magnet")
-        switch(mag, "Pull enemies to me",
-            "Drags them into weapon range instead of you chasing them",
+    -- =====================================================
+    -- MAGNET
+    -- =====================================================
+    do
+        local v = makeView("magnet")
+        gap(v, 6)
+        switchRow(v, "Pull them to me",
+            "Drags enemies into range instead of you chasing them",
             function() return CFG.Magnet end,
-            function(v)
-                CFG.Magnet = v
+            function(x)
+                CFG.Magnet = x
                 syncPuller()
-                if v then startStabilizer() end
+                if x then startStabilizer() end
             end)
-        slider(mag, "Distance in front", 0, 100, 1,
+        hairline(v)
+
+        gap(v, 8)
+        heading2(v, "where the pile sits")
+        sliderRow(v, "Distance in front", 0, 100, 1,
             function() return CFG.MagnetDistance end,
-            function(v) CFG.MagnetDistance = v end, " studs")
-        slider(mag, "Height  (+ up  /  - down)", -80, 80, 1,
+            function(x) CFG.MagnetDistance = x end, " studs")
+        sliderRow(v, "Height above me", -80, 80, 1,
             function() return CFG.MagnetHeight end,
-            function(v) CFG.MagnetHeight = v end, " studs")
-        switch(mag, "Keep them on the ground",
-            "Ignores height - they stand where they normally stand",
+            function(x) CFG.MagnetHeight = x end, " studs")
+        switchRow(v, "Keep them on the ground",
+            "Ignores height. They stand where they normally stand",
             function() return CFG.MagnetGround end,
-            function(v) CFG.MagnetGround = v end)
-        slider(mag, "How spread out", 1, 40, 1,
+            function(x) CFG.MagnetGround = x end)
+        sliderRow(v, "How spread out", 1, 40, 1,
             function() return CFG.MagnetSpread end,
-            function(v) CFG.MagnetSpread = v end, " studs")
-        switch(mag, "Aim down at the pile",
+            function(x) CFG.MagnetSpread = x end, " studs")
+        switchRow(v, "Aim down at the pile",
             "A standing swing is flat and passes over them",
             function() return CFG.FaceStack end,
-            function(v) CFG.FaceStack = v end)
-        switch(mag, "Pull every enemy", "Off = only what you selected",
-            function() return CFG.MagnetAllTypes end,
-            function(v) CFG.MagnetAllTypes = v end)
-        infoLine(mag, function()
-            return string.format(
-                "holding %d  ·  nearest one is %d studs from you  ·  %d left alone",
-                stats.pulled or 0, stats.nearestHeld or 0, stats.outOfLeash or 0)
+            function(x) CFG.FaceStack = x end)
+
+        gap(v, 8)
+        readout(v, function()
+            return string.format("Holding %d. The closest is %d studs away.",
+                stats.pulled or 0, stats.nearestHeld or 0)
         end)
-        note(mag, "If anything is still landing on you, raise Distance in front "
-            .. "until the nearest-one number is past their reach. Their melee is "
-            .. "shorter than yours.")
-        button(mag, "Move me to the biggest group", "plain", function()
-            task.spawn(function()
-                local c, n = P.packCentre()
-                if c then
-                    clearHold()
-                    moveTo(c + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
-                    setAnchor(c, nil)
-                    say(string.format("moved to the group (%d reachable)", n))
-                else
-                    say("no enemies to gather")
-                end
-            end)
+        caption(v, "If anything still lands on you, raise the distance until "
+            .. "that number clears their reach. Their melee is shorter than yours.")
+
+        gap(v, 6)
+        heading2(v, "reach")
+        sliderRow(v, "Collect from", 20, 800, 20,
+            function() return CFG.MagnetRange end,
+            function(x) CFG.MagnetRange = x end, " studs")
+        sliderRow(v, "Leash limit", 20, 600, 10,
+            function() return CFG.LeashRadius end,
+            function(x) CFG.LeashRadius = x end, " studs")
+        caption(v, "An enemy dragged out of its own area still arrives, but "
+            .. "takes no damage. The leash limit is what prevents that.")
+        sliderRow(v, "Most at once", 5, 120, 5,
+            function() return CFG.MagnetMax end,
+            function(x) CFG.MagnetMax = x end, "")
+        switchRow(v, "Pull every enemy", "Off means only what you picked",
+            function() return CFG.MagnetAllTypes end,
+            function(x) CFG.MagnetAllTypes = x end)
+        actionRow(v, "Move me to the biggest group", nil, function()
+            local c, n = P.packCentre()
+            if c then
+                clearHold()
+                moveTo(c + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
+                setAnchor(c, nil)
+                say(string.format("moved to the group, %d reachable", n))
+            else
+                say("no enemies to gather")
+            end
         end)
     end
 
@@ -3420,163 +3650,151 @@ local function buildUI()
     -- QUEST
     -- =====================================================
     do
-        local page = pages.Quest
-
-        local card = group(page, "quest loop")
-        switch(card, "Run quests automatically",
+        local v = makeView("quest")
+        gap(v, 6)
+        switchRow(v, "Run quests on a loop",
             "Take it, kill the count, take the next one",
             function() return CFG.AutoQuest end,
-            function(v)
-                CFG.AutoQuest = v
-                if v then
-                    pcall(P.armQuest)
-                    say("quest loop on")
-                end
+            function(x)
+                CFG.AutoQuest = x
+                if x then pcall(P.armQuest) say("quest loop on") end
             end)
-        infoLine(card, function()
-            local q = P.readQuest and P.readQuest() or nil
+        hairline(v)
+        gap(v, 8)
+
+        readout(v, function()
+            local q = P.readQuest()
             if q then
-                return string.format("On a quest  ·  %d of %d  ·  %s",
-                    q.have, q.need, q.enemy or "target")
+                return string.format("On a quest. %d of %d %s.", q.have, q.need,
+                    q.enemy or "kills")
             end
-            return "No quest running right now"
+            return "No quest running."
         end)
-        infoLine(card, function() return tostring(P.lastQuestResult or "") end)
-        button(card, "Take a quest now", "primary", function()
-            task.spawn(function() pcall(P.acceptQuest) end)
-        end)
+        readout(v, function() return tostring(P.lastQuestResult or "") end)
+        actionRow(v, "Take one now", nil, function() pcall(P.acceptQuest) end)
 
-        local giver = group(page, "quest giver")
-        infoLine(giver, function()
-            local e = P.currentEnemy()
-            local name, spot = P.giverFor(e)
-            return string.format("For %s: %s%s", tostring(e or "-"),
-                name and ("\"" .. name .. "\"") or "nearest ? marker",
-                spot and "  ·  exact spot saved" or "")
-        end)
-        switch(giver, "Use the closest ? giver",
-            "When no name is set, take the nearest NPC with the quest marker",
-            function() return CFG.QuestGiverClosest end,
-            function(v) CFG.QuestGiverClosest = v end)
-        note(giver, "Every quest giver name from the wiki is built in, so the "
-            .. "right NPC is recognised on any island - Adventurer in the Jungle, "
-            .. "Villager in the Frozen Village, and the rest. Whichever one an "
-            .. "accept actually works at is then remembered for that enemy and "
-            .. "overrides the built-in list.")
-        buttonPair(giver,
-            "Save this spot", "plain", function() pcall(P.setGiverHere) end,
-            "Forget spot", "plain", function() pcall(P.clearGiver) end)
-        switch(giver, "Walk to the giver first", "Some islands refuse it from range",
-            function() return CFG.QuestHopToGiver end,
-            function(v) CFG.QuestHopToGiver = v end)
-        switch(giver, "Return to the farm after", nil,
-            function() return CFG.QuestReturnToFarm end,
-            function(v) CFG.QuestReturnToFarm = v end)
-        textbox(giver, "giver name, e.g. Adventurer", "Set", function(v)
-            CFG.QuestGiverName = (#v > 0) and v or nil
-            say("giver name: " .. tostring(CFG.QuestGiverName or "any"))
-        end)
-
-        local adv = group(page, "which quest")
-        infoLine(adv, function()
+        gap(v, 10)
+        heading2(v, "which quest")
+        readout(v, function()
             local lk = P.lockedQuest
             if lk and CFG.QuestLock ~= false then
-                return string.format("LOCKED on %s tier %d  ·  for %s",
+                return string.format("Repeating %s tier %d for %s.",
                     tostring(lk.name), lk.tier or 1, tostring(lk.enemy or "-"))
             end
             local qn, tier, enemy = P.questForNames()
             if CFG.QuestName then qn = CFG.QuestName end
             if CFG.QuestTier then tier = CFG.QuestTier end
-            return string.format("%s  tier %s  ·  for %s",
-                tostring(qn or "unknown"), tostring(tier or 1), tostring(enemy or "-"))
+            return string.format("%s, tier %s, for %s.", tostring(qn or "unknown"),
+                tostring(tier or 1), tostring(enemy or "-"))
         end)
-        switch(adv, "Keep repeating this quest",
-            "Chosen once, then the loop stays on it",
+        switchRow(v, "Keep repeating this one", "Chosen once, then it stays",
             function() return CFG.QuestLock end,
-            function(v) CFG.QuestLock = v end)
-        button(adv, "Forget the locked quest", "plain", function()
-            P.lockedQuest = nil
-            say("quest unlocked - the next accept picks from your targets")
-        end)
-        segmented(adv, { { "Tier 1", 1 }, { "Tier 2", 2 }, { "Tier 3", 3 }, { "Auto", false } },
+            function(x) CFG.QuestLock = x end)
+        choiceRow(v, "Tier", { { "One", 1 }, { "Two", 2 }, { "Three", 3 }, { "Auto", false } },
             function() return CFG.QuestTier or false end,
-            function(v) CFG.QuestTier = v or nil end)
-        textbox(adv, "override quest name, e.g. JungleQuest", "Set", function(v)
-            CFG.QuestName = (#v > 0) and v or nil
-            say("quest name: " .. tostring(CFG.QuestName or "auto"))
+            function(x) CFG.QuestTier = x or nil end)
+        textRow(v, "override quest name, e.g. JungleQuest", function(val)
+            CFG.QuestName = (#val > 0) and val or nil
+            say("quest name " .. tostring(CFG.QuestName or "auto"))
         end)
-        note(adv, "A quest is never re-taken while its count is running: asking "
-            .. "again would reset it to zero.")
+        actionRow(v, "Forget the locked quest", nil, function()
+            P.lockedQuest = nil
+            say("quest unlocked")
+        end)
 
-        local dbg = group(page, "if it cannot find the giver")
+        gap(v, 10)
+        heading2(v, "quest giver")
+        readout(v, function()
+            local e = P.currentEnemy()
+            local name, spot = P.giverFor(e)
+            return string.format("For %s: %s%s", tostring(e or "-"),
+                name and ("\"" .. name .. "\"") or "the nearest one with a marker",
+                spot and ". Exact spot saved." or ".")
+        end)
+        switchRow(v, "Use the closest giver",
+            "When no name is set, take the nearest marked NPC",
+            function() return CFG.QuestGiverClosest end,
+            function(x) CFG.QuestGiverClosest = x end)
+        switchRow(v, "Walk to them first", "Some islands refuse it from range",
+            function() return CFG.QuestHopToGiver end,
+            function(x) CFG.QuestHopToGiver = x end)
+        switchRow(v, "Come back after", nil,
+            function() return CFG.QuestReturnToFarm end,
+            function(x) CFG.QuestReturnToFarm = x end)
+        textRow(v, "giver name, e.g. Adventurer", function(val)
+            CFG.QuestGiverName = (#val > 0) and val or nil
+            say("giver " .. tostring(CFG.QuestGiverName or "any"))
+        end)
+        actionRow(v, "Save this spot as the giver", nil, function()
+            pcall(P.setGiverHere)
+        end)
+        actionRow(v, "Forget that spot", nil, function() pcall(P.clearGiver) end)
+        caption(v, "Every giver name from the wiki is built in. Whichever NPC "
+            .. "an accept actually works at is remembered and used from then on.")
+
+        gap(v, 8)
+        heading2(v, "if it cannot find one")
         local scanTxt = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
-            Text = "Scan lists the NPCs around you and what marked them.",
-            LayoutOrder = nextOrder(), Parent = dbg,
+            Size = UDim2.new(1, -40, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = F.small,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.third,
+            Text = "", LayoutOrder = nextOrder(), Parent = v,
         })
-        buttonPair(dbg,
-            "Scan for NPCs", "plain", function()
-                scanTxt.Text = table.concat(P.questScan(400), "\n")
-            end,
-            "Probe nearest", "plain", function()
-                scanTxt.Text = table.concat(P.questProbe(), "\n")
-            end)
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = scanTxt })
+        actionRow(v, "List the NPCs around me", nil, function()
+            scanTxt.Text = table.concat(P.questScan(400), "\n")
+        end)
+        actionRow(v, "Inspect the nearest one", nil, function()
+            scanTxt.Text = table.concat(P.questProbe(), "\n")
+        end)
     end
 
     -- =====================================================
-    -- TRAVEL
+    -- TELEPORT
     -- =====================================================
     do
-        local page = pages.Travel
-        local chosen = nil
-        local filter = ""
+        local v = makeView("travel")
+        local chosen, filter = nil, ""
 
-        local card = group(page, "teleport")
-        infoLine(card, function()
-            if not chosen then return "Pick somewhere below." end
+        gap(v, 6)
+        readout(v, function()
+            if P.travelling() then return "Going there now." end
+            if not chosen then return "Pick a place below." end
             local _, root = parts()
             local d = P.findDestination(chosen)
             if root and d and d.pos then
-                return string.format("%s  ·  %.0f studs away", chosen,
+                return string.format("%s, %.0f studs away.", chosen,
                     (d.pos - root.Position).Magnitude)
             end
-            return chosen
+            return chosen .. "."
         end)
-        button(card, "Teleport", "primary", function()
+
+        local go = mk("TextButton", {
+            Size = UDim2.new(1, -40, 0, 48), BackgroundColor3 = C.ivory,
+            BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 15,
+            TextColor3 = C.base, Text = "Teleport", AutoButtonColor = false,
+            LayoutOrder = nextOrder(), Parent = v,
+        })
+        corner(go, 13)
+        go.Activated:Connect(function()
             if not chosen then say("pick a destination first") return end
             task.spawn(function() pcall(P.travelTo, chosen) end)
-        end, function(b)
-            b.Text = P.travelling() and "Teleporting..."
-                or (chosen and ("Teleport to " .. chosen) or "Teleport")
-            b.BackgroundColor3 = P.travelling() and C.card2 or C.accent
         end)
-        segmented(card, { { "Auto", "auto" }, { "Fly", "fly" }, { "Respawn", "respawn" } },
-            function() return CFG.TeleportMode end,
-            function(v) CFG.TeleportMode = v end)
-        segmented(card, { { "Instant", "instant" }, { "Stepped", "stepped" } },
-            function() return CFG.TeleportStyle end,
-            function(v) CFG.TeleportStyle = v end)
-        note(card, "Instant is one CFrame write - the same thing the game's own "
-            .. "house button does. If a server snaps you back, it crosses in "
-            .. "small steps instead, on its own. Respawn is the old spawn point "
-            .. "trick, kept only because it still works on some servers.")
-        slider(card, "Countdown", 0, 8, 0.5,
-            function() return CFG.TeleportCountdown end,
-            function(v) CFG.TeleportCountdown = v end, "s")
-        infoLine(card, function() return tostring(P.lastTravel or "") end)
+        addLive(function()
+            go.Text = P.travelling() and "Teleporting" or "Teleport"
+            go.BackgroundColor3 = P.travelling() and C.raised or C.ivory
+            go.TextColor3 = P.travelling() and C.second or C.base
+        end)
 
-        local listCard = group(page, "where to")
-        local sbox = textbox(listCard, "search islands and farm spots", "Clear",
-            function(_, tb) tb.Text = "" filter = "" end)
-        sbox:GetPropertyChangedSignal("Text"):Connect(function()
-            filter = string.lower(sbox.Text)
+        gap(v, 12)
+        local search = textRow(v, "search islands and farm spots", function() end)
+        search:GetPropertyChangedSignal("Text"):Connect(function()
+            filter = string.lower(search.Text)
         end)
-        local list = listView(listCard, 190)
+        local list = picker(v, 200)
 
         local sig = ""
-        local function refreshDest()
+        local function refresh()
             local all = P.destinations()
             local out = {}
             for _, d in ipairs(all) do
@@ -3592,90 +3810,94 @@ local function buildUI()
                 if c:IsA("GuiObject") then c:Destroy() end
             end
             if #out == 0 then
-                listRow(list, (#all == 0) and "world still loading" or "nothing matches",
-                    "", C.faint, function() end, 1)
+                pickerRow(list, 1, (#all == 0) and "World still loading"
+                    or "Nothing matches", "", C.third, function() end)
                 return
             end
             for i, d in ipairs(out) do
-                local tag = (chosen == d.name) and "SELECTED"
-                    or (d.kind == "island" and "island" or (d.label or "farm"))
-                local col = (chosen == d.name) and C.accent or C.faint
-                listRow(list, d.name, tag, col, function()
-                    chosen = d.name
-                    refreshDest()
-                end, i)
+                pickerRow(list, i, d.name,
+                    (chosen == d.name) and "selected"
+                        or (d.kind == "island" and "island" or (d.label or "farm")),
+                    (chosen == d.name) and C.ivory or C.third,
+                    function() chosen = d.name refresh() end)
             end
         end
-        refreshDest()
-        table.insert(live, refreshDest)
+        refresh()
+        addLive(refresh)
 
-        local fl = group(page, "flight")
-        slider(fl, "Hold on arrival", 0.5, 6, 0.5,
+        gap(v, 6)
+        choiceRow(v, "How", { { "Instant", "instant" }, { "Stepped", "stepped" } },
+            function() return CFG.TeleportStyle end,
+            function(x) CFG.TeleportStyle = x end)
+        caption(v, "Instant is one jump, the same thing the game's own house "
+            .. "button does. If a server snaps you back it crosses in steps "
+            .. "instead, on its own.")
+        choiceRow(v, "When it needs a respawn",
+            { { "Auto", "auto" }, { "Never", "fly" }, { "Always", "respawn" } },
+            function() return CFG.TeleportMode end,
+            function(x) CFG.TeleportMode = x end)
+        sliderRow(v, "Countdown", 0, 8, 0.5,
+            function() return CFG.TeleportCountdown end,
+            function(x) CFG.TeleportCountdown = x end, "s")
+        sliderRow(v, "Hold on arrival", 0.5, 6, 0.5,
             function() return CFG.TeleportSettle end,
-            function(v) CFG.TeleportSettle = v end, "s")
-        note(fl, "Arriving before the island has loaded drops you through ground "
-            .. "that does not exist yet. This holds you in place until it does.")
-        slider(fl, "Cruise height", 80, 900, 20,
-            function() return CFG.TravelAltitude end,
-            function(v) CFG.TravelAltitude = v end, " studs")
-        slider(fl, "Step size", 60, 500, 20,
+            function(x) CFG.TeleportSettle = x end, "s")
+        caption(v, "Arriving before the island has loaded drops you through "
+            .. "ground that does not exist yet. This holds you until it does.")
+        sliderRow(v, "Step size", 60, 500, 20,
             function() return CFG.TravelStep end,
-            function(v) CFG.TravelStep = v end, " studs")
-        note(fl, "Smaller steps look more like ordinary movement and stream more "
-            .. "safely. Bigger steps get there faster. 220 is the sane middle.")
-        button(fl, "Force respawn", "plain", function()
-            task.spawn(function() pcall(P.forceRespawn) end)
-        end)
+            function(x) CFG.TravelStep = x end, " studs")
+        sliderRow(v, "Cruise height", 80, 900, 20,
+            function() return CFG.TravelAltitude end,
+            function(x) CFG.TravelAltitude = x end, " studs")
+        readout(v, function() return tostring(P.lastTravel or "") end)
+        actionRow(v, "Force a respawn", nil, function() pcall(P.forceRespawn) end)
 
-        local sea = group(page, "change sea")
-        note(sea, "The three seas are three separate servers, so this leaves the "
-            .. "one you are in and the farm restarts on the other side. The game "
-            .. "still checks whether you are allowed in.")
-        for _, s in ipairs(P.seas()) do
-            button(sea, s.name, "plain", function()
-                task.spawn(function() pcall(P.hopSea, s.id) end)
-            end, function(b)
-                b.TextColor3 = (game.PlaceId == s.id) and C.faint or C.text
-                b.Text = (game.PlaceId == s.id) and (s.name .. "  (you are here)") or s.name
-            end)
+        gap(v, 8)
+        heading2(v, "change sea")
+        caption(v, "Each sea is a separate server, so this leaves the one you "
+            .. "are in and the farm restarts on the other side.")
+        for _, sea in ipairs(P.seas()) do
+            actionRow(v, sea.name, nil, function() pcall(P.hopSea, sea.id) end)
         end
     end
 
     -- =====================================================
-    -- SETUP
+    -- COMBAT
     -- =====================================================
     do
-        local page = pages.Setup
-
-        local atk = group(page, "attack")
-        segmented(atk, { { "Skills", "SKILLS" }, { "M1", "M1" },
-                         { "Both", "BOTH" }, { "Hold", "M1HOLD" } },
+        local v = makeView("combat")
+        gap(v, 6)
+        choiceRow(v, "Attack with", { { "Skills", "SKILLS" }, { "M1", "M1" },
+            { "Both", "BOTH" }, { "Hold", "M1HOLD" } },
             function() return CFG.AttackMode end,
-            function(v)
-                CFG.AttackMode = v
-                if v ~= "M1HOLD" then pcall(P.releaseM1) end
+            function(x)
+                CFG.AttackMode = x
+                if x ~= "M1HOLD" then pcall(P.releaseM1) end
             end)
-        note(atk, "Skills are the only input measured to land on this executor. "
-            .. "M1 is kept because it costs nothing to try on a new one.")
+        caption(v, "Skills are the only input measured to land on this "
+            .. "executor. M1 costs nothing to try on a new one.")
 
+        gap(v, 6)
+        heading2(v, "skill keys you have unlocked")
         local keyRow = mk("Frame", {
-            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
-            LayoutOrder = nextOrder(), Parent = atk,
+            Size = UDim2.new(1, -40, 0, 38), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = v,
         })
-        local ALLK = {
-            { "Z", Enum.KeyCode.Z }, { "X", Enum.KeyCode.X }, { "C", Enum.KeyCode.C },
-            { "V", Enum.KeyCode.V }, { "F", Enum.KeyCode.F },
-        }
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = keyRow })
+        local ALLK = { { "Z", Enum.KeyCode.Z }, { "X", Enum.KeyCode.X },
+            { "C", Enum.KeyCode.C }, { "V", Enum.KeyCode.V }, { "F", Enum.KeyCode.F } }
         local function hasKey(kc)
             for _, k in ipairs(CFG.SkillKeys) do if k == kc then return true end end
             return false
         end
         for i, pair in ipairs(ALLK) do
             local b = mk("TextButton", {
-                Size = UDim2.new(1 / #ALLK, -6, 1, 0),
-                Position = UDim2.new((i - 1) / #ALLK, 3, 0, 0),
-                BackgroundColor3 = C.card2, Font = Enum.Font.GothamBold, TextSize = 13,
-                TextColor3 = C.text, Text = pair[1], AutoButtonColor = false, Parent = keyRow,
+                Size = UDim2.new(1 / #ALLK, -6, 1, -6),
+                Position = UDim2.new((i - 1) / #ALLK, 3, 0, 3),
+                BackgroundColor3 = C.raised, Font = Enum.Font.GothamBold,
+                TextSize = F.body, TextColor3 = C.second, Text = pair[1],
+                AutoButtonColor = false, Parent = keyRow,
             })
             corner(b, 9)
             b.Activated:Connect(function()
@@ -3687,34 +3909,36 @@ local function buildUI()
                     table.insert(CFG.SkillKeys, pair[2])
                 end
             end)
-            table.insert(live, function()
+            addLive(function()
                 local on = hasKey(pair[2])
-                b.BackgroundColor3 = on and C.accent or C.card2
-                b.TextColor3 = on and C.text or C.faint
+                b.BackgroundColor3 = on and C.ivory or C.raised
+                b.TextColor3 = on and C.base or C.second
             end)
         end
-        note(atk, "Only the skill keys you have actually unlocked.")
-        slider(atk, "Swing gap", 0.01, 0.6, 0.01,
-            function() return CFG.AttackGap end,
-            function(v) CFG.AttackGap = v end, "s")
-        slider(atk, "Skill every N swings", 1, 12, 1,
-            function() return CFG.SkillEvery end,
-            function(v) CFG.SkillEvery = v end, "")
-        slider(atk, "Hitbox reach", 20, 400, 10,
-            function() return CFG.HitboxMagnitude end,
-            function(v) CFG.HitboxMagnitude = v end, " studs")
-        note(atk, "Hitbox reach is written straight into the combat controller, "
-            .. "so a hit registers further out than the swing animation shows. "
-            .. "The server still has the last word, so keep it sane.")
 
-        local wep = group(page, "weapon")
+        sliderRow(v, "Swing gap", 0.01, 0.6, 0.01,
+            function() return CFG.AttackGap end,
+            function(x) CFG.AttackGap = x end, "s")
+        sliderRow(v, "Skill every", 1, 12, 1,
+            function() return CFG.SkillEvery end,
+            function(x) CFG.SkillEvery = x end, " swings")
+        sliderRow(v, "Hitbox reach", 20, 400, 10,
+            function() return CFG.HitboxMagnitude end,
+            function(x) CFG.HitboxMagnitude = x end, " studs")
+        readout(v, function()
+            return P.fastOK and "Combat hook attached. Reach is live."
+                or "Combat hook is NOT attached. Reach does nothing."
+        end)
+
+        gap(v, 8)
+        heading2(v, "weapon")
         local tools, tIdx = {}, 1
-        local wlbl = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1,
-            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.dim,
-            TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
-            Text = "", LayoutOrder = nextOrder(), Parent = wep,
-        })
+        readout(v, function()
+            local char = player.Character
+            local held = char and char:FindFirstChildOfClass("Tool")
+            return "Holding " .. (held and held.Name or "nothing")
+                .. ". Picked: " .. tostring(tools[tIdx] or "none") .. "."
+        end)
         local function refreshTools()
             local out = {}
             local char = player.Character
@@ -3731,84 +3955,66 @@ local function buildUI()
             table.sort(out)
             tools = out
             if tIdx > #out then tIdx = 1 end
-            local held = char and char:FindFirstChildOfClass("Tool")
-            wlbl.Text = "Holding " .. (held and held.Name or "nothing")
-                .. "\nPick: " .. tostring(out[tIdx] or "-")
         end
         refreshTools()
-        table.insert(live, refreshTools)
-        buttonPair(wep,
-            "Previous", "plain", function()
-                if #tools > 0 then tIdx = ((tIdx - 2) % #tools) + 1 refreshTools() end
-            end,
-            "Next", "plain", function()
-                if #tools > 0 then tIdx = (tIdx % #tools) + 1 refreshTools() end
-            end)
-        button(wep, "Use this weapon", "plain", function()
-            local n = tools[tIdx]
-            if n then
-                CFG.ForceWeapon = n
-                equipWeapon()
-                refreshTools()
-            end
+        addLive(refreshTools)
+        actionRow(v, "Next weapon", nil, function()
+            if #tools > 0 then tIdx = (tIdx % #tools) + 1 end
         end)
-
-        local pos = group(page, "position")
-        switch(pos, "Anti-gravity hold", "Stops you sinking between swings",
-            function() return CFG.HoldAltitude end,
-            function(v)
-                CFG.HoldAltitude = v
-                if not v then clearHold() end
-            end)
-        slider(pos, "Hover height", 2, 60, 1,
-            function() return CFG.HoverHeight end,
-            function(v) CFG.HoverHeight = v end, " studs")
-        slider(pos, "Extra tilt", -89, 89, 5,
-            function() return CFG.AttackTilt end,
-            function(v) CFG.AttackTilt = v end, "°")
-        note(pos, "Aim down at the pile already pitches you at it. Extra tilt is "
-            .. "on top of that, for weapons whose arc sits high or low.")
-        buttonPair(pos,
-            "Hold here", "plain", function()
-                local _, r = parts()
-                if r then
-                    startStabilizer()
-                    setHold(flatCF(r.CFrame))
-                end
-            end,
-            "Release", "plain", function() clearHold() end)
-
-        local reach = group(page, "reach and limits")
-        slider(reach, "Magnet range", 20, 800, 20,
-            function() return CFG.MagnetRange end,
-            function(v) CFG.MagnetRange = v end, " studs")
-        slider(reach, "Leash radius", 20, 600, 10,
-            function() return CFG.LeashRadius end,
-            function(v) CFG.LeashRadius = v end, " studs")
-        note(reach, "An NPC dragged out of its own area still arrives, but takes "
-            .. "no damage. Leash radius is the cap that prevents that.")
-        slider(reach, "Most enemies held at once", 5, 120, 5,
-            function() return CFG.MagnetMax end,
-            function(v) CFG.MagnetMax = v end, "")
-        slider(reach, "Seconds per target", 5, 120, 5,
-            function() return CFG.TargetTimeout end,
-            function(v) CFG.TargetTimeout = v end, "s")
-        switch(reach, "Use backups while primaries respawn", nil,
-            function() return CFG.UseSecondary end,
-            function(v) CFG.UseSecondary = v end)
-        switch(reach, "Hit anything if nothing selected is loaded", nil,
-            function() return CFG.AnyEnemyFallback end,
-            function(v) CFG.AnyEnemyFallback = v end)
-
-        local sys = group(page, "system")
-        switch(sys, "Print debug to console", nil,
-            function() return CFG.Debug end,
-            function(v) CFG.Debug = v end)
-        button(sys, "Reinstall fast attack", "plain", function()
+        actionRow(v, "Use the picked one", nil, function()
+            local n = tools[tIdx]
+            if n then CFG.ForceWeapon = n equipWeapon() end
+        end)
+        actionRow(v, "Reinstall the combat hook", nil, function()
             installFastAttack()
             equipWeapon()
         end)
-        button(sys, "Stop and close the panel", "bad", function()
+    end
+
+    -- =====================================================
+    -- TUNING
+    -- =====================================================
+    do
+        local v = makeView("setup")
+        gap(v, 6)
+        heading2(v, "position")
+        switchRow(v, "Anti-gravity hold", "Stops you sinking between swings",
+            function() return CFG.HoldAltitude end,
+            function(x)
+                CFG.HoldAltitude = x
+                if not x then clearHold() end
+            end)
+        sliderRow(v, "Hover height", 2, 60, 1,
+            function() return CFG.HoverHeight end,
+            function(x) CFG.HoverHeight = x end, " studs")
+        sliderRow(v, "Extra tilt", -89, 89, 5,
+            function() return CFG.AttackTilt end,
+            function(x) CFG.AttackTilt = x end, "°")
+        caption(v, "Aiming down at the pile already pitches you at it. Extra "
+            .. "tilt is on top of that.")
+        actionRow(v, "Hold me right here", nil, function()
+            local _, r = parts()
+            if r then startStabilizer() setHold(flatCF(r.CFrame)) end
+        end)
+        actionRow(v, "Let go", nil, function() clearHold() end)
+
+        gap(v, 8)
+        heading2(v, "patience")
+        sliderRow(v, "Seconds per target", 5, 120, 5,
+            function() return CFG.TargetTimeout end,
+            function(x) CFG.TargetTimeout = x end, "s")
+        switchRow(v, "Use backups while primaries respawn", nil,
+            function() return CFG.UseSecondary end,
+            function(x) CFG.UseSecondary = x end)
+        switchRow(v, "Hit anything if none of mine are loaded", nil,
+            function() return CFG.AnyEnemyFallback end,
+            function(x) CFG.AnyEnemyFallback = x end)
+        switchRow(v, "Print debug to the console", nil,
+            function() return CFG.Debug end,
+            function(x) CFG.Debug = x end)
+
+        gap(v, 10)
+        actionRow(v, "Stop and close", "danger", function()
             P.stop()
             gui:Destroy()
         end)
@@ -3818,82 +4024,102 @@ local function buildUI()
     -- STATS
     -- =====================================================
     do
-        local page = pages.Stats
-        local card = group(page, "this run")
+        local v = makeView("stats")
+        gap(v, 10)
         local big = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 54), BackgroundTransparency = 1,
+            Size = UDim2.new(1, -40, 0, 44), BackgroundTransparency = 1,
             Font = Enum.Font.GothamBold, TextSize = 34, TextColor3 = C.text,
             TextXAlignment = Enum.TextXAlignment.Left, Text = "0",
-            LayoutOrder = nextOrder(), Parent = card,
+            LayoutOrder = nextOrder(), Parent = v,
         })
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = big })
         local sub = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1,
-            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.dim,
-            TextXAlignment = Enum.TextXAlignment.Left, Text = "kills",
-            LayoutOrder = nextOrder(), Parent = card,
+            Size = UDim2.new(1, -40, 0, 18), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = F.small, TextColor3 = C.second,
+            TextXAlignment = Enum.TextXAlignment.Left, Text = "",
+            LayoutOrder = nextOrder(), Parent = v,
         })
-        table.insert(live, function()
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = sub })
+        addLive(function()
             local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
             big.Text = tostring(stats.kills)
-            sub.Text = string.format("kills  ·  %.1f per minute  ·  %d landed hits",
+            sub.Text = string.format("kills  ·  %.0f per minute  ·  %d landed hits",
                 stats.kills / mins, stats.damaging)
         end)
 
-        local detail = group(page, "detail")
-        local body = mk("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 12,
-            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
-            Text = "", LayoutOrder = nextOrder(), Parent = detail,
+        gap(v, 14)
+        local body2 = mk("TextLabel", {
+            Size = UDim2.new(1, -40, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = F.small,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.second,
+            Text = "", LayoutOrder = nextOrder(), Parent = v,
         })
-        table.insert(live, function()
-            local char = player.Character
-            local held = char and char:FindFirstChildOfClass("Tool")
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 20), Parent = body2 })
+        addLive(function()
             local _, _, hum = parts()
             local prim, back = selectionLists()
-            body.Text = table.concat({
-                "state        " .. state,
-                "working      " .. tostring(P.focusName or "-")
-                                .. "  (" .. typeIdx .. "/" .. math.max(#typeOrder, 1) .. ")",
-                "farming      " .. (#prim > 0 and table.concat(prim, ", ") or "by level"),
-                "backup       " .. (#back > 0 and table.concat(back, ", ") or "-"),
-                "quest        " .. tostring(P.questProgress or "off")
+            body2.Text = table.concat({
+                "state       " .. state,
+                "working     " .. tostring(P.focusName or "-")
+                                .. "  " .. typeIdx .. "/" .. math.max(#typeOrder, 1),
+                "farming     " .. (#prim > 0 and table.concat(prim, ", ") or "by level"),
+                "backup      " .. (#back > 0 and table.concat(back, ", ") or "-"),
+                "quest       " .. tostring(P.questProgress or "off")
                                 .. (P.questEnemy and ("  " .. P.questEnemy) or ""),
                 "",
-                "weapon       " .. (held and held.Name or "none"),
-                "attack       " .. tostring(CFG.AttackMode),
-                "combat hook  " .. (P.fastOK and ("on, reach " .. CFG.HitboxMagnitude)
-                                              or "NOT attached"),
-                "swings       " .. stats.swings,
-                "held         " .. stats.pulled .. "  skipped " .. (stats.outOfLeash or 0),
-                "nearest held " .. (stats.nearestHeld or 0) .. " studs",
-                "level        " .. tostring(playerLevel() or "?"),
-                "health       " .. (hum and math.floor(hum.Health) or "?"),
+                "swings      " .. stats.swings,
+                "held        " .. stats.pulled .. ", nearest " .. (stats.nearestHeld or 0),
+                "skipped     " .. (stats.outOfLeash or 0) .. " outside their area",
+                "level       " .. tostring(playerLevel() or "?"),
+                "health      " .. (hum and math.floor(hum.Health) or "?"),
                 "",
-                "escalations  " .. stats.escalations,
-                "teleports    " .. stats.travels,
-                "retreats     " .. stats.retreats,
-                string.format("progress     %.0fs ago", os.clock() - lastProgressAt),
+                "escalations " .. stats.escalations,
+                "teleports   " .. stats.travels,
+                "retreats    " .. stats.retreats,
+                string.format("progress    %.0fs ago", os.clock() - lastProgressAt),
             }, "\n")
         end)
     end
 
-    showTab("Farm")
-
-    runBtn.Activated:Connect(function()
-        if P.running then P.stop() else startFarm() end
+    -- =====================================================
+    -- FOLD
+    -- =====================================================
+    -- Collapsed, it is a status line and nothing else. Everything the panel
+    -- says at a glance, in the space of one row.
+    -- back to panel scope: the fold readout belongs to no single view
+    buildingView = nil
+    local folded = false
+    foldBtn.Activated:Connect(function()
+        folded = not folded
+        bodyFrame.Visible = not folded
+        foldBtn.Text = folded and "Show" or "Hide"
+        tween(panel, { Size = UDim2.fromOffset(340, folded and 52 or 470) })
+        if folded then
+            heading.Text = "Farm Pro"
+        else
+            heading.Text = TITLES[currentView] or "Farm Pro"
+        end
+    end)
+    addLive(function()
+        if folded then
+            local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
+            heading.Text = P.running
+                and string.format("%s  ·  %.0f/min", tostring(P.focusName or "farming"),
+                    stats.kills / mins)
+                or "Farm Pro"
+        end
     end)
 
-    -- ---------- refresh ----------
+    show("home")
+    heading.Text = "Farm Pro"
+
     task.spawn(function()
         while gui and gui.Parent do
-            runBtn.Text = P.running and "Stop" or "Start farming"
-            runBtn.BackgroundColor3 = P.running and C.red or C.accent
-            dot.BackgroundColor3 = P.running and C.green or C.faint
-            stateLbl.Text = string.lower(state)
-            statusLbl.Text = statusLine
-            for _, fn in ipairs(live) do pcall(fn) end
-            task.wait(0.35)
+            dot.BackgroundColor3 = P.running and C.live or C.third
+            for _, e in ipairs(live) do
+                if not e.v or e.v.Visible then pcall(e.f) end
+            end
+            task.wait(0.3)
         end
     end)
 end
