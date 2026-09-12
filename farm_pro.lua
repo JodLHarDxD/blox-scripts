@@ -140,25 +140,38 @@ local CFG = {
     -- on every weapon. Held every Heartbeat because the server fights it.
     Magnet             = false,
     MagnetRange        = 220,    -- how far out enemies are collected from
-    -- WHERE THE PILE SITS, relative to you. Both are live sliders.
-    --   Distance : how far IN FRONT. This is the gap that stops their melee
-    --              from reaching you, so it is the one that matters most.
-    --   Height   : POSITIVE lifts them above you, NEGATIVE drops them below.
-    --              Below is what you want while hovering: you look down at
-    --              them, they swing at air.
-    --   OnGround : ignore Height and pin them to the ground you are hovering
-    --              over, so they stand where they normally stand and you are
-    --              simply out of reach above them.
-    MagnetDistance     = 14,     -- studs in FRONT of you
-    MagnetHeight       = -8,     -- + above you, - below you
-    MagnetGround       = false,  -- pin to the ground instead of to your body
+    -- WHERE THE PILE SITS. Three axes, like moving a part in Studio.
+    --   X  + right,   - left
+    --   Y  + above,   - below
+    --   Z  + forward, - behind
+    -- With StackLocal on, those axes follow the way you are FACING (Z is
+    -- wherever your nose points). With it off they are the world's axes.
+    -- Yaw only, so pitching your body does not drag the pile around with it.
+    --
+    -- X = 0, Z = 0 puts them on your own vertical line: directly under your
+    -- feet, which is what you want while hovering. The old placement could
+    -- only ever put them in FRONT of you, which is why looking down never
+    -- found them.
+    StackLocal         = true,
+    StackX             = 0,
+    StackY             = -10,
+    StackZ             = 0,
+    MagnetGround       = false,  -- ignore Y and pin them to the ground below
     MagnetMax          = 40,     -- cap the stack so the client does not choke
     MagnetAllTypes     = false,  -- true = drag every enemy, ignoring selection
     MagnetSpread       = 4,      -- how wide the held stack is
-    -- Enemies held in FRONT and BELOW you only get hit if the swing points at
-    -- them, and a standing character swings flat. This pitches the body at the
-    -- stack, which is what puts the hitbox on the ground.
+    -- Enemies below you only get hit if the swing points at them, and a
+    -- standing character swings flat. This pitches the body at the stack.
+    -- Straight down is handled: CFrame.new(pos, target) is undefined when the
+    -- direction is parallel to up, so the pitch is built by hand.
     FaceStack          = true,
+    FaceYaw            = 0,      -- turn the body, degrees, on top of the above
+
+    -- SKILLS LAND WHERE THE CURSOR POINTS, not where the body faces. That is
+    -- why tilting helps M1 and does nothing for Z/X/C/V. So the cursor is put
+    -- on the pile before each cast: the stack is projected to a screen pixel
+    -- and the mouse is moved there.
+    AimCursor          = false,
 
     -- LEASH
     -- Every Blox Fruits NPC belongs to an area and stops being damageable once
@@ -565,16 +578,22 @@ end
 -- the magnet that moves the enemies there, and the hold that aims you at them.
 -- If they disagree by even a little, you aim at empty ground.
 local function stackPointFrom(pos, cf)
-    local flat = pos + yawLook(cf) * CFG.MagnetDistance
-    local y
-    if CFG.MagnetGround then
-        -- the ground we are hovering over: the anchor when there is one, else
-        -- straight down by the hover height
-        y = (holdAnchor and holdAnchor.Y) or (pos.Y - CFG.HoverHeight)
+    local x, y, z = CFG.StackX or 0, CFG.StackY or 0, CFG.StackZ or 0
+    local out
+    if CFG.StackLocal ~= false then
+        -- Roblox convention: Right = Look x Up. With a yaw-only forward of
+        -- (fx, 0, fz) that is (-fz, 0, fx).
+        local fwd = yawLook(cf)
+        local right = Vector3.new(-fwd.Z, 0, fwd.X)
+        out = pos + fwd * z + right * x + Vector3.new(0, y, 0)
     else
-        y = pos.Y + CFG.MagnetHeight
+        out = pos + Vector3.new(x, y, z)
     end
-    return Vector3.new(flat.X, y, flat.Z)
+    if CFG.MagnetGround then
+        local gy = (holdAnchor and holdAnchor.Y) or (pos.Y - CFG.HoverHeight)
+        out = Vector3.new(out.X, gy, out.Z)
+    end
+    return out
 end
 
 local function magnetCentre(root)
@@ -598,14 +617,25 @@ local function holdTarget()
     end
     if not cf then return nil end
 
-    -- A standing character swings flat, straight ahead. The magnet's pile is
-    -- in front AND below, so a flat swing passes over it. Looking at the pile
-    -- pitches the whole body nose-down and drops the hitbox onto the enemies.
+    -- A standing character swings flat, straight ahead. With the pile beneath
+    -- you a flat swing passes clean over it, so the body is pitched at the
+    -- pile instead.
     if CFG.Magnet and CFG.FaceStack then
         local centre = stackPointFrom(cf.Position, cf)
-        if (centre - cf.Position).Magnitude > 0.5 then
-            cf = CFrame.new(cf.Position, centre)
+        local dir = centre - cf.Position
+        if dir.Magnitude > 0.5 then
+            local flat = Vector3.new(dir.X, 0, dir.Z)
+            -- Built from yaw plus an explicit pitch rather than CFrame.new(a,b):
+            -- with the pile directly underfoot the direction is parallel to up
+            -- and that constructor has no defined answer there.
+            local yawDir = (flat.Magnitude > 0.1) and flat.Unit or yawLook(cf)
+            local pitch = math.atan2(dir.Y, flat.Magnitude)
+            cf = CFrame.lookAt(cf.Position, cf.Position + yawDir)
+                * CFrame.Angles(0, math.rad(CFG.FaceYaw or 0), 0)
+                * CFrame.Angles(pitch, 0, 0)
         end
+    elseif (CFG.FaceYaw or 0) ~= 0 then
+        cf = cf * CFrame.Angles(0, math.rad(CFG.FaceYaw), 0)
     end
 
     if CFG.AttackTilt ~= 0 then
@@ -897,7 +927,7 @@ local function magnetStep()
     -- once the body pitched down the pile slid down with it and ended up on
     -- top of the player - which is exactly the "they hit me" complaint.
     local centre = magnetCentre(root)
-    P.stackCentre = centre
+    P.stackCentre, P.aimPoint = centre, centre
     stats.pulled = holdEnemies(centre, CFG.MagnetSpread, CFG.MagnetRange,
         pullFilter(), CFG.MagnetMax)
 end
@@ -1894,7 +1924,31 @@ local function nextSkill()
     pcall(pressKey, keys[keyIndex])
 end
 
+-- Put the cursor on the pile. Skills are cast at the cursor's world ray, so
+-- this is the only thing that actually aims them; the body's facing decides
+-- nothing for Z/X/C/V. WorldToScreenPoint includes the GUI inset, which is the
+-- same space SendMouseMoveEvent expects.
+local lastAimAt = 0
+local function aimCursor()
+    if not CFG.AimCursor then return end
+    -- Swings come every AttackGap, which would be twenty mouse events a second
+    -- fighting whatever else is reading the mouse. The cursor does not need to
+    -- be repositioned that often to stay on a pile that is being held still.
+    if os.clock() - lastAimAt < 0.08 then return end
+    lastAimAt = os.clock()
+    local pos = P.aimPoint
+    local cam = workspace.CurrentCamera
+    if not pos or not cam then return end
+    local ok, v, onScreen = pcall(function()
+        return cam:WorldToScreenPoint(pos)
+    end)
+    if ok and onScreen and v then
+        pcall(function() VIM:SendMouseMoveEvent(v.X, v.Y, game) end)
+    end
+end
+
 local function swing()
+    aimCursor()
     stats.swings += 1
     swingIndex += 1
     local mode = CFG.AttackMode
@@ -2198,6 +2252,9 @@ local function step()
         if d < bestD then target, bestD = e, d end
     end
     if not target then task.wait(0.2) return end
+
+    -- with no magnet the thing to aim at is the target itself
+    if not CFG.Magnet then P.aimPoint = target.root.Position end
 
     local hpStart = target.hum.Health
     say(string.format("%s  %.0f studs  hp %.0f%s",
@@ -3571,8 +3628,10 @@ local function buildUI()
         hairline(v)
         navRow(v, "Magnet", function()
             if not CFG.Magnet then return "off" end
-            return string.format("%d held  ·  %d studs", stats.pulled or 0,
-                stats.nearestHeld or 0)
+            local where = (CFG.StackX == 0 and CFG.StackZ == 0) and "under"
+                or ((CFG.StackY or 0) == 0 and "level" or "ahead")
+            return string.format("%d held  ·  %s  ·  %d studs", stats.pulled or 0,
+                where, stats.nearestHeld or 0)
         end, "magnet")
         hairline(v)
         navRow(v, "Quest", function()
@@ -3722,23 +3781,62 @@ local function buildUI()
 
         gap(v, 8)
         heading2(v, "where the pile sits")
-        sliderRow(v, "Distance in front", 0, 100, 1,
-            function() return CFG.MagnetDistance end,
-            function(x) CFG.MagnetDistance = x end, " studs")
-        sliderRow(v, "Height above me", -80, 80, 1,
-            function() return CFG.MagnetHeight end,
-            function(x) CFG.MagnetHeight = x end, " studs")
-        switchRow(v, "Keep them on the ground",
-            "Ignores height. They stand where they normally stand",
+        local function place(x, y, z)
+            CFG.StackX, CFG.StackY, CFG.StackZ = x, y, z
+            CFG.MagnetGround = false
+        end
+        choiceRow(v, nil, {
+            { "Under me", "under" }, { "In front", "front" }, { "My level", "level" },
+        }, function()
+            local x, y, z = CFG.StackX, CFG.StackY, CFG.StackZ
+            if x == 0 and z == 0 and y < 0 then return "under" end
+            if x == 0 and y == 0 and z > 0 then return "level" end
+            if x == 0 and z > 0 and y < 0 then return "front" end
+            return nil
+        end, function(which)
+            if which == "under" then place(0, -10, 0)
+            elseif which == "front" then place(0, -8, 14)
+            else place(0, 0, 14) end
+        end)
+        caption(v, "Under me puts them on your own vertical line, so looking "
+            .. "down finds them at your feet. My level stands you face to face, "
+            .. "which is what you want when their hits cannot touch you.")
+        sliderRow(v, "Left  /  right", -100, 100, 1,
+            function() return CFG.StackX end,
+            function(x) CFG.StackX = x end, " studs")
+        sliderRow(v, "Below  /  above", -100, 100, 1,
+            function() return CFG.StackY end,
+            function(x) CFG.StackY = x end, " studs")
+        sliderRow(v, "Behind  /  in front", -100, 100, 1,
+            function() return CFG.StackZ end,
+            function(x) CFG.StackZ = x end, " studs")
+        switchRow(v, "Axes follow my facing",
+            "Off means north, up and east instead of your own sides",
+            function() return CFG.StackLocal end,
+            function(x) CFG.StackLocal = x end)
+        switchRow(v, "Pin them to the ground",
+            "Ignores the up and down slider. They stand where they normally do",
             function() return CFG.MagnetGround end,
             function(x) CFG.MagnetGround = x end)
         sliderRow(v, "How spread out", 1, 40, 1,
             function() return CFG.MagnetSpread end,
             function(x) CFG.MagnetSpread = x end, " studs")
-        switchRow(v, "Aim down at the pile",
+
+        gap(v, 8)
+        heading2(v, "how I face them")
+        switchRow(v, "Aim my body at the pile",
             "A standing swing is flat and passes over them",
             function() return CFG.FaceStack end,
             function(x) CFG.FaceStack = x end)
+        sliderRow(v, "Turn", -180, 180, 5,
+            function() return CFG.FaceYaw end,
+            function(x) CFG.FaceYaw = x end, "°")
+        sliderRow(v, "Tilt", -89, 89, 5,
+            function() return CFG.AttackTilt end,
+            function(x) CFG.AttackTilt = x end, "°")
+        caption(v, "Body facing decides where M1 lands and nothing else. "
+            .. "Skills go to the cursor, so for those use Point the cursor at "
+            .. "them, over in Combat.")
 
         gap(v, 8)
         readout(v, function()
@@ -4029,6 +4127,13 @@ local function buildUI()
             end)
         caption(v, "Skills are the only input measured to land on this "
             .. "executor. M1 costs nothing to try on a new one.")
+        switchRow(v, "Point the cursor at them",
+            "Skills land where the cursor is, not where you face",
+            function() return CFG.AimCursor end,
+            function(x) CFG.AimCursor = x end)
+        caption(v, "This moves your real mouse onto the pile before every "
+            .. "cast. It is the only thing that aims a skill. Turn it off if "
+            .. "you want the mouse back while it farms.")
 
         gap(v, 6)
         heading2(v, "skill keys you have unlocked")
@@ -4139,11 +4244,6 @@ local function buildUI()
         sliderRow(v, "Hover height", 2, 60, 1,
             function() return CFG.HoverHeight end,
             function(x) CFG.HoverHeight = x end, " studs")
-        sliderRow(v, "Extra tilt", -89, 89, 5,
-            function() return CFG.AttackTilt end,
-            function(x) CFG.AttackTilt = x end, "°")
-        caption(v, "Aiming down at the pile already pitches you at it. Extra "
-            .. "tilt is on top of that.")
         actionRow(v, "Hold me right here", nil, function()
             local _, r = parts()
             if r then startStabilizer() setHold(flatCF(r.CFrame)) end
