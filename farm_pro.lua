@@ -86,6 +86,9 @@ local CFG = {
     QuestName          = nil,    -- exact server quest name; nil = look it up
     QuestTier          = nil,    -- 1..3; nil = the tier matching the enemy
     QuestGiverClosest  = true,   -- no name set -> use the nearest "?" NPC
+    QuestGiverRange    = 1200,   -- how far it will travel to reach a giver
+    QuestStallSeconds  = 240,    -- a count that has not moved in this long is
+                                 -- a quest for something we are not fighting
     QuestLock          = true,   -- repeat the quest that worked, not a new one
     QuestHopToGiver    = true,   -- stand at the giver before asking
     QuestReturnToFarm  = true,   -- fly back to the farm spot afterwards
@@ -111,6 +114,15 @@ local CFG = {
     TravelAltitude     = 350,    -- cruise height for the stepped fallback
     TravelStep         = 220,    -- studs per frame while crossing, stepped only
     FlyMaxDistance     = 6000,   -- further than this, auto tries respawn first
+    -- One enormous CFrame jump is what stalls the server and leaves you stuck
+    -- in the air. The game's own house button was measured at 1590 studs, so
+    -- that is the size of jump this game is known to accept.
+    InstantMaxDistance = 2500,   -- further than this, cross in steps instead
+    -- The FARM may not wander. It flies to a spot this far away and no more;
+    -- anything beyond is your call, through Teleport. Without this it will
+    -- happily cross the map to the Underwater City because a level table row
+    -- said so.
+    MaxAutoTravel      = 1500,
 
 
     -- ENEMY PULL
@@ -298,6 +310,8 @@ local activeFilter   = nil         -- what the magnet may drag THIS cycle
 local secondaryNames = nil         -- backup set, farmed while primaries respawn
 local questTakenAt   = 0
 local questBaseKills = 0
+local questLastHave  = 0
+local questMovedAt   = 0
 local questBlind     = false       -- accepted, but this island has no readable tracker
 local lastQuestAt    = 0
 local anyEnemyMode   = false
@@ -1384,7 +1398,13 @@ local QUESTS = {
     ["Desert Officer"]        = { "DesertQuest", 2 },
     ["Snow Bandit"]           = { "SnowQuest", 1 },
     ["Snowman"]               = { "SnowQuest", 2 },
-    ["Chief Petty Officer"]   = { "MarineQuest", 1 },
+    -- MEASURED: asking for MarineQuest tier 1 while farming Chief Petty
+    -- Officer handed back "Defeat 5 Trainees", so tier 1 is the Trainee quest
+    -- and the Officer is tier 2. Anything still wrong here corrects itself:
+    -- every accept is checked against the tracker and the tier that actually
+    -- matches is remembered in P.learnedQuests.
+    ["Trainee"]               = { "MarineQuest", 1 },
+    ["Chief Petty Officer"]   = { "MarineQuest", 2 },
     ["Sky Bandit"]            = { "SkyQuest", 1 },
     ["Dark Master"]           = { "SkyQuest", 2 },
     ["Prisoner"]              = { "PrisonerQuest", 1 },
@@ -1494,6 +1514,9 @@ local function questForNames()
         end
     end
     for _, n in ipairs(names) do
+        -- what the tracker confirmed beats what the table guessed
+        local learned = P.learnedQuests[n]
+        if learned then return learned.name, learned.tier, n end
         local q = QUESTS[n]
         if q then return q[1], q[2], n end
     end
@@ -1510,12 +1533,23 @@ P.questForNames = questForNames
 -- against the enemy being farmed, and every later accept goes straight there.
 P.learnedGivers = {}     -- enemy name -> NPC name that worked
 P.giverSpots    = {}     -- enemy name -> exact position that worked
+P.learnedQuests = {}     -- enemy name -> { name, tier } that the tracker agreed with
 
+-- WHAT IS BEING FARMED RIGHT NOW.
+-- P.questEnemy is the last quest that was taken, and it used to win here. It
+-- outlives a change of targets, which is why the panel offered to save a giver
+-- "for Chief Petty Officer" while you were standing in front of the Desert
+-- Adventurer. The current selection wins; the old quest is only a fallback.
 local function currentEnemy()
-    if P.questEnemy then return P.questEnemy end
     if P.focusName then return P.focusName end
-    if activeNames then for n in pairs(activeNames) do return n end end
-    return nil
+    if activeNames then
+        local best
+        for n in pairs(activeNames) do
+            if not best or n < best then best = n end
+        end
+        if best then return best end
+    end
+    return P.questEnemy
 end
 P.currentEnemy = currentEnemy
 
@@ -1600,16 +1634,19 @@ function P.acceptQuest(opts)
 
         local dest = (enemy and P.giverSpots[enemy]) or P.giverPos
         if not dest then
+            -- Bounded on purpose. An unbounded search finds an NPC with the
+            -- right name on a DIFFERENT island and flies you to it.
+            local far = CFG.QuestGiverRange or 1200
             local giver
             if want then
-                giver = findQuestGiver(500, want) or findQuestGiver(3000, want)
+                giver = findQuestGiver(500, want) or findQuestGiver(far, want)
             end
             -- closest-with-marker, which is what you want when nothing is set
             if not giver and CFG.QuestGiverClosest ~= false then
-                giver = findQuestGiver(500, nil, true) or findQuestGiver(3000, nil, true)
+                giver = findQuestGiver(500, nil, true) or findQuestGiver(far, nil, true)
                 if giver then say("using the closest quest giver: " .. giver.name) end
             end
-            giver = giver or findQuestGiver(3000, want)
+            giver = giver or findQuestGiver(far, want)
             if giver then
                 dest = giver.part.Position
                 P.giverName = giver.name
@@ -1628,38 +1665,84 @@ function P.acceptQuest(opts)
         end
     end
 
-    local ok, res = pcall(function()
-        return commF:InvokeServer("StartQuest", qname, tier)
-    end)
-    task.wait(0.45)
-    local q = P.readQuest(true)
-
-    if not q and atGiver then
-        say("remote refused - talking to the NPC")
-        for _ = 1, 3 do
-            pcall(function()
-                VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                task.wait(0.07)
-                VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-            end)
-            task.wait(0.3)
-        end
-        pcall(clickQuestDialog, enemy)
-        task.wait(0.5)
-        q = P.readQuest(true)
+    -- ASK, THEN CHECK WHAT ARRIVED.
+    -- A quest name and tier can simply be wrong, and the tracker is the only
+    -- thing that knows: it names the enemy the quest actually wants. Measured
+    -- case: MarineQuest tier 1, asked for while farming Chief Petty Officer,
+    -- came back as "Defeat 5 Trainees". So the tier is tried, read back, and
+    -- corrected, and whatever turns out to be right is remembered.
+    local function wanted(trackerEnemy)
+        if not trackerEnemy or not enemy then return true end
+        local a, b = string.lower(trackerEnemy), string.lower(enemy)
+        return string.find(a, b, 1, true) ~= nil
+            or string.find(b, a, 1, true) ~= nil
     end
 
+    local tiers
+    if CFG.QuestTier then
+        tiers = { CFG.QuestTier }              -- you chose it, it is not ours to change
+    elseif locked then
+        tiers = { tier }                       -- already proven for this enemy
+    else
+        tiers = { tier }
+        for _, t in ipairs({ 1, 2, 3 }) do
+            if t ~= tier then table.insert(tiers, t) end
+        end
+    end
+
+    local q, ok, res
+    for i, t in ipairs(tiers) do
+        ok, res = pcall(function()
+            return commF:InvokeServer("StartQuest", qname, t)
+        end)
+        task.wait(0.45)
+        q = P.readQuest(true)
+
+        if not q and atGiver and i == 1 then
+            say("remote refused - talking to the NPC")
+            for _ = 1, 3 do
+                pcall(function()
+                    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                    task.wait(0.07)
+                    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                end)
+                task.wait(0.3)
+            end
+            pcall(clickQuestDialog, enemy)
+            task.wait(0.5)
+            q = P.readQuest(true)
+        end
+
+        tier = t
+        if not q then break end                -- nothing to check it against
+        if wanted(q.enemy) then break end      -- it asks for what we fight
+        if i == #tiers then
+            say(string.format("no tier of %s asks for %s", tostring(qname),
+                tostring(enemy)))
+            break
+        end
+        -- Re-asking resets a count, which is harmless here: the count belongs
+        -- to a quest for the wrong enemy and it is still at zero.
+        say(string.format("tier %d wants %s - trying tier %d", t,
+            tostring(q.enemy), tiers[i + 1]))
+    end
+
+    local matched = (q ~= nil) and wanted(q.enemy)
+    P.questMatched = matched
     questTakenAt   = os.clock()
     questBaseKills = stats.kills
+    questLastHave  = q and q.have or 0
+    questMovedAt   = os.clock()
     P.questEnemy   = enemy
 
-    -- Learn from what worked. This is how the giver list builds itself instead
-    -- of being guessed: the NPC and the spot are only remembered on success.
-    if q and enemy then
+    -- Only a quest that matches gets remembered. Learning a wrong pairing is
+    -- worse than learning nothing, because it would be reused forever.
+    if q and enemy and matched then
         if P.giverName then P.learnedGivers[enemy] = P.giverName end
         local _, r = parts()
         if atGiver and r then P.giverSpots[enemy] = P.giverSpots[enemy] or r.Position end
-        P.lockedQuest = { name = qname, tier = tier, enemy = enemy }
+        P.lockedQuest   = { name = qname, tier = tier, enemy = enemy }
+        P.learnedQuests[enemy] = { name = qname, tier = tier }
     end
     -- No tracker after a clean invoke means this island's tracker cannot be
     -- read, NOT that the accept failed. Re-asking would zero a running count,
@@ -1667,7 +1750,9 @@ function P.acceptQuest(opts)
     questBlind = (q == nil) and ok or false
     P.quest = q
     P.lastQuestResult = string.format("%s t%d -> %s", tostring(qname), tier,
-        q and string.format("ACTIVE  %d/%d", q.have, q.need)
+        q and string.format("%s  %d/%d%s", matched and "ACTIVE" or "WRONG ENEMY",
+                q.have, q.need,
+                matched and "" or (", it wants " .. tostring(q.enemy)))
           or ("sent, tracker unreadable (" .. tostring(res) .. ")"))
     say(P.lastQuestResult)
 
@@ -1703,9 +1788,23 @@ function P.questCycle()
     if q then
         questBlind = false
         P.questProgress = q.have .. "/" .. q.need
-        if q.have < q.need then return end                 -- still working it
-        if os.clock() - questTakenAt < 2 then return end   -- accepted a moment ago
-        say("quest complete - taking the next one")
+        if q.have ~= questLastHave then
+            questLastHave, questMovedAt = q.have, os.clock()
+        end
+        if q.have < q.need then
+            -- A count that never moves is a count for an enemy we are not
+            -- fighting. Sitting on it forever is the one failure mode the
+            -- never-re-take rule can produce, so it has a way out.
+            if os.clock() - questMovedAt > (CFG.QuestStallSeconds or 240) then
+                say("quest has not moved in a while - taking a fresh one")
+            else
+                return
+            end
+        elseif os.clock() - questTakenAt < 2 then
+            return                                          -- accepted a moment ago
+        else
+            say("quest complete - taking the next one")
+        end
     elseif questBlind then
         -- unreadable tracker: count our own kills against the assumed quota
         local done = stats.kills - questBaseKills
@@ -1723,7 +1822,7 @@ function P.questCycle()
     -- refuse itself as a duplicate and the loop would stall there forever.
     -- Overriding is safe in exactly this case: the count is already done, so
     -- there is no progress left to reset.
-    P.acceptQuest({ force = (q ~= nil and q.have >= q.need) })
+    P.acceptQuest({ force = (q ~= nil) })
 end
 
 -- =========================================================
@@ -2045,9 +2144,17 @@ local function step()
                 setState("TRAVEL")
                 stats.travels += 1
             end
+            local far = (travelGoal - root.Position).Magnitude
+            if far > (CFG.MaxAutoTravel or 1500) then
+                -- The farm does not cross the map on its own. A level-table row
+                -- pointing at another island is how it ended up at the
+                -- Underwater City while farming the desert.
+                say(string.format("farm spot is %.0f studs away - teleport there yourself", far))
+                setState("RESOLVE")
+                task.wait(2)
+                return
+            end
             say("no targets loaded - flying to the farm spot")
-            -- Stepped flight, not a tween: a tween across open water outruns
-            -- the streaming system and drops you into unloaded space.
             P.flyTo(travelGoal)
             task.wait(0.3)
             if os.clock() - stateEnteredAt > CFG.TravelTimeout then
@@ -2486,7 +2593,12 @@ local function instantTravel(target, overlay)
         if travelCancel then break end
         local _, r = parts()
         if r then
-            r.CFrame = CFrame.new(land)
+            -- Only correct real drift. Rewriting the CFrame every single frame
+            -- is a hundred replicated moves for one teleport, and that is what
+            -- the server chokes on.
+            if (r.Position - land).Magnitude > 4 then
+                r.CFrame = CFrame.new(land)
+            end
             killVelocity(r)
         end
         if overlay then
@@ -2538,6 +2650,13 @@ end
 -- Instant first, stepped as the fallback. Nothing here needs the user to pick.
 local function flyTravel(target, overlay)
     if (CFG.TeleportStyle or "instant") == "stepped" then
+        return steppedTravel(target, overlay)
+    end
+    -- A jump far bigger than anything the game does itself is what makes the
+    -- server stall and leaves you hanging. Long crossings go in steps.
+    local _, me = parts()
+    if me and (target - me.Position).Magnitude > (CFG.InstantMaxDistance or 2500) then
+        if overlay then overlay.phase("...", "long way, crossing in steps", 0.2) end
         return steppedTravel(target, overlay)
     end
     local ok, detail = instantTravel(target, overlay)
@@ -2712,6 +2831,13 @@ function P.travelTo(name, opts)
         progress()
         task.spawn(mainLoop)
         task.spawn(watchdog)
+    else
+        -- NOT farming: hand the character back. The hold is a CFrame written
+        -- every Heartbeat, so leaving it on after a manual teleport pins you in
+        -- the air with no way to move. That was the "stuck up high" glitch.
+        clearHold()
+        cancelMove()
+        stopStabilizer()
     end
     return arrived
 end
@@ -2733,7 +2859,12 @@ function P.flyTo(position)
     else
         ok = hopTo(position + Vector3.new(0, CFG.HoverHeight, 0), nil, nil, nil, nil)
     end
-    setAnchor(position, nil)
+    if P.running then
+        setAnchor(position, nil)
+    else
+        clearHold()
+        stopStabilizer()      -- never leave a stopped farm holding the body
+    end
     say(ok and "arrived" or "could not reach that point")
     return ok
 end
@@ -3664,11 +3795,14 @@ local function buildUI()
 
         readout(v, function()
             local q = P.readQuest()
-            if q then
-                return string.format("On a quest. %d of %d %s.", q.have, q.need,
-                    q.enemy or "kills")
+            if not q then return "No quest running." end
+            local line = string.format("On a quest. %d of %d %s.", q.have, q.need,
+                q.enemy or "kills")
+            if P.questMatched == false then
+                line = line .. "  This is NOT what you are farming, so the count "
+                    .. "will not move. It retakes on its own shortly."
             end
-            return "No quest running."
+            return line
         end)
         readout(v, function() return tostring(P.lastQuestResult or "") end)
         actionRow(v, "Take one now", nil, function() pcall(P.acceptQuest) end)
@@ -3729,6 +3863,19 @@ local function buildUI()
             pcall(P.setGiverHere)
         end)
         actionRow(v, "Forget that spot", nil, function() pcall(P.clearGiver) end)
+        actionRow(v, "Forget everything it learned", "danger", function()
+            P.learnedGivers, P.giverSpots, P.learnedQuests = {}, {}, {}
+            P.giverPos, P.lockedQuest, P.questEnemy = nil, nil, nil
+            say("cleared every learned giver and quest")
+        end)
+        sliderRow(v, "Giver search range", 200, 3000, 100,
+            function() return CFG.QuestGiverRange end,
+            function(x) CFG.QuestGiverRange = x end, " studs")
+        caption(v, "It will not travel further than this to reach a giver. A "
+            .. "wide search finds an NPC with the right name on another island.")
+        sliderRow(v, "Retake a stuck quest after", 60, 900, 30,
+            function() return CFG.QuestStallSeconds end,
+            function(x) CFG.QuestStallSeconds = x end, "s")
         caption(v, "Every giver name from the wiki is built in. Whichever NPC "
             .. "an accept actually works at is remembered and used from then on.")
 
@@ -3844,6 +3991,11 @@ local function buildUI()
             function(x) CFG.TeleportSettle = x end, "s")
         caption(v, "Arriving before the island has loaded drops you through "
             .. "ground that does not exist yet. This holds you until it does.")
+        sliderRow(v, "Longest instant jump", 500, 20000, 500,
+            function() return CFG.InstantMaxDistance end,
+            function(x) CFG.InstantMaxDistance = x end, " studs")
+        caption(v, "Beyond this it crosses in steps instead. One enormous jump "
+            .. "is what stalls the server and leaves you hanging in the air.")
         sliderRow(v, "Step size", 60, 500, 20,
             function() return CFG.TravelStep end,
             function(x) CFG.TravelStep = x end, " studs")
@@ -3999,6 +4151,14 @@ local function buildUI()
         actionRow(v, "Let go", nil, function() clearHold() end)
 
         gap(v, 8)
+        heading2(v, "how far it may wander")
+        sliderRow(v, "Farm travel limit", 200, 6000, 100,
+            function() return CFG.MaxAutoTravel end,
+            function(x) CFG.MaxAutoTravel = x end, " studs")
+        caption(v, "The farm flies this far to reach its spot and no further. "
+            .. "Anything beyond is your call, through Teleport.")
+
+        gap(v, 8)
         heading2(v, "patience")
         sliderRow(v, "Seconds per target", 5, 120, 5,
             function() return CFG.TargetTimeout end,
@@ -4144,6 +4304,10 @@ function P.start(names, opts)
     for k in pairs(stats) do stats[k] = 0 end
     stats.startedAt = os.clock()
     activeNames = nil
+    -- A new run is a new subject. Carrying the previous quest and its giver
+    -- across is what bound "Chief Petty Officer" to a desert island.
+    P.lockedQuest = nil
+    P.questMatched = nil
     pcall(P.armQuest)
     escalation = 0
     blacklist = {}
