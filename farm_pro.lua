@@ -75,11 +75,42 @@ local CFG = {
     RetreatHeight      = 200,
     RegenWait          = 5,
 
-    AutoQuest          = false,  -- DANGER: re-invoking StartQuest resets
-                                 -- an active quest's kill count to zero.
-                                 -- Accept quests by hand.
-    QuestRetrySeconds  = 45,
+    -- QUEST
+    -- Re-taking a quest that is already running restarts its counter at zero.
+    -- That is the only real danger, so every accept is gated on the in-game
+    -- tracker reading EMPTY. With that gate the cycle is safe to leave on:
+    --   accept -> kill the required count -> tracker clears -> accept again.
+    AutoQuest          = false,
+    QuestRetrySeconds  = 10,     -- gap between accept attempts
     QuestGiverName     = nil,    -- exact NPC name, e.g. "Adventurer"
+    QuestName          = nil,    -- exact server quest name; nil = look it up
+    QuestTier          = nil,    -- 1..3; nil = the tier matching the enemy
+    QuestGiverClosest  = true,   -- no name set -> use the nearest "?" NPC
+    QuestLock          = true,   -- repeat the quest that worked, not a new one
+    QuestHopToGiver    = true,   -- stand at the giver before asking
+    QuestReturnToFarm  = true,   -- fly back to the farm spot afterwards
+    QuestKillsFallback = 10,     -- assumed count when the tracker is unreadable
+
+    -- SECONDARY TARGETS
+    -- Quest enemies respawn on a timer. Instead of hovering over empty ground
+    -- the farm switches to a second set of names until the primaries are back.
+    UseSecondary       = true,
+
+    -- TELEPORT
+    -- "auto"    : fly, and only respawn for a long haul to a real spawn point
+    -- "fly"     : always fly there in steps (never destroys the character)
+    -- "respawn" : always use the spawn point trick
+    TeleportMode       = "auto",
+    -- "instant" : one CFrame write, which is what the game's OWN house button
+    --             was measured doing - 1590 studs, body never replaced
+    -- "stepped" : cross in small steps; the fallback if instant is refused
+    TeleportStyle      = "instant",
+    TeleportSettle     = 2.0,    -- hold on arrival while the world streams in
+    TeleportOverlay    = true,   -- the full-screen countdown card
+    TeleportCountdown  = 3.0,    -- visible countdown before the hop
+    TravelAltitude     = 350,    -- cruise height for the stepped fallback
+    TravelStep         = 220,    -- studs per frame while crossing, stepped only
+    FlyMaxDistance     = 6000,   -- further than this, auto tries respawn first
 
 
     -- ENEMY PULL
@@ -97,10 +128,25 @@ local CFG = {
     -- on every weapon. Held every Heartbeat because the server fights it.
     Magnet             = false,
     MagnetRange        = 220,    -- how far out enemies are collected from
-    MagnetDistance     = 6,      -- studs in FRONT of you they are stacked
-    MagnetDrop         = 2,      -- studs below your root
+    -- WHERE THE PILE SITS, relative to you. Both are live sliders.
+    --   Distance : how far IN FRONT. This is the gap that stops their melee
+    --              from reaching you, so it is the one that matters most.
+    --   Height   : POSITIVE lifts them above you, NEGATIVE drops them below.
+    --              Below is what you want while hovering: you look down at
+    --              them, they swing at air.
+    --   OnGround : ignore Height and pin them to the ground you are hovering
+    --              over, so they stand where they normally stand and you are
+    --              simply out of reach above them.
+    MagnetDistance     = 14,     -- studs in FRONT of you
+    MagnetHeight       = -8,     -- + above you, - below you
+    MagnetGround       = false,  -- pin to the ground instead of to your body
     MagnetMax          = 40,     -- cap the stack so the client does not choke
     MagnetAllTypes     = false,  -- true = drag every enemy, ignoring selection
+    MagnetSpread       = 4,      -- how wide the held stack is
+    -- Enemies held in FRONT and BELOW you only get hit if the swing points at
+    -- them, and a standing character swings flat. This pitches the body at the
+    -- stack, which is what puts the hitbox on the ground.
+    FaceStack          = true,
 
     -- LEASH
     -- Every Blox Fruits NPC belongs to an area and stops being damageable once
@@ -229,7 +275,7 @@ local LEVELS = {
 local stats = {
     kills = 0, swings = 0, reanchors = 0, retreats = 0,
     escalations = 0, travels = 0, damaging = 0, pulled = 0, startedAt = 0,
-    outOfLeash = 0,
+    outOfLeash = 0, nearestHeld = 0,
 }
 
 local conns = {}
@@ -240,8 +286,6 @@ local stateEnteredAt = 0
 local statusLine     = "starting"
 local escalation     = 0
 local lastProgressAt = 0
-local lastClusterHP  = nil
-local anchor         = nil
 local blacklist      = {}          -- model -> expiry clock
 local countedDead    = {}          -- model -> clock, so a corpse counts once
 local targetNames    = nil         -- set of names, or nil = any
@@ -250,6 +294,11 @@ local typeOrder      = {}          -- the selected names, in rotation order
 local typeIdx        = 1
 local typeSince      = 0
 local focusSet       = nil         -- {name = true} for the type being worked now
+local activeFilter   = nil         -- what the magnet may drag THIS cycle
+local secondaryNames = nil         -- backup set, farmed while primaries respawn
+local questTakenAt   = 0
+local questBaseKills = 0
+local questBlind     = false       -- accepted, but this island has no readable tracker
 local lastQuestAt    = 0
 local anyEnemyMode   = false
 local travelGoal     = nil
@@ -361,6 +410,7 @@ local fastOn, fastConn, ctrlRef = false, nil, nil
 local function installFastAttack()
     if fastConn then pcall(function() fastConn:Disconnect() end) fastConn = nil end
     fastOn, ctrlRef = false, nil
+    P.fastOK = false
 
     local env      = (getgenv and getgenv()) or {}
     local getreg_  = getreg or env.getreg
@@ -413,6 +463,7 @@ local function installFastAttack()
 
     ctrlRef = found
     local NEG = -(math.huge ^ math.huge ^ math.huge)
+    P.fastOK = true
     fastConn = track(RunService.RenderStepped:Connect(function()
         if not fastOn then return end
         pcall(function()
@@ -476,21 +527,77 @@ end
 -- The hold is stored as a GROUND anchor, not a finished CFrame, so hover
 -- height and tilt are read fresh every frame. That is what makes the sliders
 -- take effect while you are mid-fight instead of on the next target.
+-- Yaw-only forward vector. Geometry built from the full LookVector feeds back
+-- on itself: the stack sits where you are pointing, so pitching down to face it
+-- moves it further down, and the body spirals. Stripping the pitch converges in
+-- one frame and stays put.
+local function yawLook(cf)
+    local lv = cf.LookVector
+    local flat = Vector3.new(lv.X, 0, lv.Z)
+    if flat.Magnitude < 1e-3 then return Vector3.new(0, 0, -1) end
+    return flat.Unit
+end
+
+-- A yaw-only snapshot of a pose. Capturing the CURRENT CFrame to hold it
+-- captures the pitch that aiming already applied, and then the tilt is applied
+-- to it again on the next frame. Do that once per target and the character
+-- slowly rolls nose-over. Storing it flat makes every re-capture identical.
+local function flatCF(cf)
+    return CFrame.new(cf.Position, cf.Position + yawLook(cf))
+end
+
+-- Where the magnet parks the pile, measured from a position and a facing.
+-- Taken apart into its own function because two callers need the SAME answer:
+-- the magnet that moves the enemies there, and the hold that aims you at them.
+-- If they disagree by even a little, you aim at empty ground.
+local function stackPointFrom(pos, cf)
+    local flat = pos + yawLook(cf) * CFG.MagnetDistance
+    local y
+    if CFG.MagnetGround then
+        -- the ground we are hovering over: the anchor when there is one, else
+        -- straight down by the hover height
+        y = (holdAnchor and holdAnchor.Y) or (pos.Y - CFG.HoverHeight)
+    else
+        y = pos.Y + CFG.MagnetHeight
+    end
+    return Vector3.new(flat.X, y, flat.Z)
+end
+
+local function magnetCentre(root)
+    return stackPointFrom(root.Position, root.CFrame)
+end
+
+-- The held pose. Tilt used to be applied on the anchored branch ONLY, so the
+-- slider did nothing whenever the magnet was on (the magnet holds an absolute
+-- CFrame). Both branches now end in the same aim-and-tilt code.
 local function holdTarget()
+    local cf
     if holdAnchor then
         local pos = holdAnchor + Vector3.new(0, CFG.HoverHeight, 0)
-        local cf
         if holdLook and (holdLook - pos).Magnitude > 0.1 then
             cf = CFrame.new(pos, holdLook)
         else
             cf = CFrame.new(pos)
         end
-        if CFG.AttackTilt ~= 0 then
-            cf = cf * CFrame.Angles(math.rad(CFG.AttackTilt), 0, 0)
-        end
-        return cf
+    else
+        cf = holdCF
     end
-    return holdCF
+    if not cf then return nil end
+
+    -- A standing character swings flat, straight ahead. The magnet's pile is
+    -- in front AND below, so a flat swing passes over it. Looking at the pile
+    -- pitches the whole body nose-down and drops the hitbox onto the enemies.
+    if CFG.Magnet and CFG.FaceStack then
+        local centre = stackPointFrom(cf.Position, cf)
+        if (centre - cf.Position).Magnitude > 0.5 then
+            cf = CFrame.new(cf.Position, centre)
+        end
+    end
+
+    if CFG.AttackTilt ~= 0 then
+        cf = cf * CFrame.Angles(math.rad(CFG.AttackTilt), 0, 0)
+    end
+    return cf
 end
 
 local function holdStep()
@@ -544,6 +651,11 @@ end
 -- the server follows it; a raw CFrame write teleports and makes the streaming
 -- system drop the NPCs you were about to hit.
 local MOVE_SPEED = 180
+-- Movement used to abort the moment P.running went false, which meant every
+-- manual button (take a quest, fly to a spot) walked half a stud and gave up
+-- whenever the farm was not already running. STOP now cancels in-flight moves
+-- through a short pulse instead, and manual moves work either way.
+local moveEnabled = true
 local function moveTo(position, speed)
     local _, root = parts()
     if not root then return false end
@@ -562,7 +674,7 @@ local function moveTo(position, speed)
     tween:Play()
 
     local deadline = os.clock() + duration + 1.5
-    while os.clock() < deadline and P.running do
+    while os.clock() < deadline and moveEnabled do
         local _, r = parts()
         if not r then return false end
         if (r.Position - position).Magnitude < 8 then return true end
@@ -634,46 +746,11 @@ local function liveEnemies(names)
     return out
 end
 
--- Seeds on the nearest enemy, then averages everything within ClusterRange.
-local function cluster(list, from)
-    if #list == 0 then return nil end
-    local seed, best = nil, math.huge
-    for _, e in ipairs(list) do
-        local d = (e.root.Position - from).Magnitude
-        if d < best then seed, best = e, d end
-    end
-    if not seed then return nil end
-
-    local sum, n, hp, boss = Vector3.zero, 0, 0, false
-    local members = {}
-    for _, e in ipairs(list) do
-        if (e.root.Position - seed.root.Position).Magnitude <= CFG.ClusterRange then
-            sum += e.root.Position
-            n += 1
-            hp += e.hum.Health
-            if e.hum.MaxHealth > 5000 then boss = true end
-            table.insert(members, e)
-        end
-    end
-    if n == 0 then return nil end
-    return { pos = sum / n, count = n, hp = hp, boss = boss, seed = seed, members = members }
-end
-
 -- =========================================================
 -- QUEST
 -- =========================================================
 local remotes = RS:FindFirstChild("Remotes")
 local commF = remotes and remotes:FindFirstChild("CommF_")
-local questFor, questAt = nil, 0
-
-local function tryQuest(name)
-    if not CFG.AutoQuest or not commF or not name then return end
-    if questFor == name and os.clock() - questAt < CFG.QuestRetrySeconds then return end
-    questFor, questAt = name, os.clock()
-    pcall(function() commF:InvokeServer("StartQuest", name .. "Quest", 1) end)
-end
-
-
 
 -- =========================================================
 -- ENEMY PULL
@@ -701,6 +778,9 @@ end
 -- outside their own area and cannot be damaged.
 local function pullFilter()
     if CFG.MagnetAllTypes then return nil end
+    -- activeFilter is what the farm actually decided to fight this cycle, so
+    -- when it falls back to the backup enemies the magnet follows it there.
+    if activeFilter then return activeFilter end
     if CFG.RotateTypes and focusSet then return focusSet end
     return activeNames
 end
@@ -737,8 +817,11 @@ local function holdEnemies(centre, radius, range, names, cap)
     local n, skipped = 0, 0
     for i, e in ipairs(list) do
         if n >= cap then break end
-        local a = (n / 8) * math.pi * 2
-        local dest = centre + Vector3.new(math.cos(a) * radius, 0, math.sin(a) * radius)
+        -- concentric rings of 8: one ring of forty enemies is a single point
+        local ring = math.floor(n / 8)
+        local a    = (n % 8) / 8 * math.pi * 2
+        local rad  = radius * (1 + ring * 0.55)
+        local dest = centre + Vector3.new(math.cos(a) * rad, 0, math.sin(a) * rad)
         -- THE LEASH CHECK. Moving it here would take it out of its own area,
         -- where it arrives but takes no damage, so it is left where it is.
         if (dest - e.home).Magnitude > CFG.LeashRadius then
@@ -754,6 +837,21 @@ local function holdEnemies(centre, radius, range, names, cap)
         end
     end
     stats.outOfLeash = skipped
+
+    -- The number that answers "are they close enough to hit me": the real
+    -- distance from your body to the nearest enemy actually being held.
+    local _, me = parts()
+    if me then
+        local nearest
+        for _, m in ipairs(pulled) do
+            local r = m:FindFirstChild("HumanoidRootPart")
+            if r then
+                local d = (r.Position - me.Position).Magnitude
+                if not nearest or d < nearest then nearest = d end
+            end
+        end
+        stats.nearestHeld = nearest and math.floor(nearest) or 0
+    end
     return n
 end
 
@@ -781,8 +879,12 @@ P.packCentre = packCentre
 local function magnetStep()
     local _, root = parts()
     if not root then return end
-    local centre = (root.CFrame * CFrame.new(0, -CFG.MagnetDrop, -CFG.MagnetDistance)).Position
-    stats.pulled = holdEnemies(centre, 3, CFG.MagnetRange,
+    -- Built from the YAW only. The old version multiplied the full CFrame, so
+    -- once the body pitched down the pile slid down with it and ended up on
+    -- top of the player - which is exactly the "they hit me" complaint.
+    local centre = magnetCentre(root)
+    P.stackCentre = centre
+    stats.pulled = holdEnemies(centre, CFG.MagnetSpread, CFG.MagnetRange,
         pullFilter(), CFG.MagnetMax)
 end
 
@@ -866,7 +968,10 @@ local function questMarker(model)
     return ok and hit or false
 end
 
-local function findQuestGiver(maxRange, wantName)
+-- markerOnly = accept ONLY an NPC carrying the "?" QUEST billboard. That is
+-- the closest-quest-giver mode: it needs no name and works on every island,
+-- because the billboard is what the game itself shows the player.
+local function findQuestGiver(maxRange, wantName, markerOnly)
     local _, root = parts()
     if not root then return nil end
     maxRange = maxRange or 300
@@ -893,8 +998,10 @@ local function findQuestGiver(maxRange, wantName)
                             - (exact and 50000 or 0)
                             - (marker and 5000 or 0)
                             - (named and 1000 or 0)
-                        if exact or marker or named
-                            or m:FindFirstChildOfClass("Humanoid") then
+                        local accept = exact or marker or named
+                            or m:FindFirstChildOfClass("Humanoid")
+                        if markerOnly then accept = (exact or marker) and true or false end
+                        if accept then
                             table.insert(cands, {
                                 model = m, part = part, dist = d, name = m.Name,
                                 score = score,
@@ -973,26 +1080,78 @@ function P.questProbe()
     return out
 end
 
--- Detects an active quest so we never re-take one (re-taking zeroes its count).
-function P.questActive()
+-- ---------------------------------------------------------
+-- READING THE TRACKER
+-- ---------------------------------------------------------
+-- The old check was "a GUI called Quest contains some text", which is equally
+-- true of the quest BOARD standing in front of you. It therefore reported a
+-- quest as active whenever the board was on screen, the accept was skipped as
+-- a duplicate, and the farm never took anything. That is the whole bug.
+--
+-- The tracker has one thing nothing else has: a live have/need counter sitting
+-- next to the word Defeat. That pair is what is read here.
+local function shownOnScreen(g)
+    local o = g
+    while o and o:IsA("GuiObject") do
+        if not o.Visible then return false end
+        o = o.Parent
+    end
+    return true
+end
+
+local function blockText(frame)
+    local acc = {}
+    for _, d in ipairs(frame:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and type(d.Text) == "string" then
+            table.insert(acc, d.Text)
+        end
+    end
+    return string.lower(table.concat(acc, " "))
+end
+
+-- nil when no quest is running, else { have, need, enemy, text }
+-- The scan walks every descendant of PlayerGui, and the panel asks three times
+-- a second, so the answer is cached for half a second. Pass true to force it.
+local questCache, questCacheAt = nil, 0
+function P.readQuest(force)
+    if not force and (os.clock() - questCacheAt) < 0.5 then return questCache end
+    questCacheAt = os.clock()
     local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    local ok, found = pcall(function()
+    if not pg then questCache = nil return nil end
+    local found
+    pcall(function()
         for _, d in ipairs(pg:GetDescendants()) do
-            if d:IsA("GuiObject") and d.Visible and d.Name == "Quest"
-                and not d:FindFirstAncestor("BFPHUD") then
-                -- the tracker frame carries the objective text when active
-                for _, t in ipairs(d:GetDescendants()) do
-                    if t:IsA("TextLabel") and t.Visible
-                        and type(t.Text) == "string" and #t.Text > 3 then
-                        return true
+            if d:IsA("TextLabel") and type(d.Text) == "string" and #d.Text > 0
+                and not d:FindFirstAncestor("BFPHUD") and shownOnScreen(d) then
+                local have, need = string.match(d.Text, "(%d+)%s*/%s*(%d+)")
+                if have and need then
+                    local parent = d.Parent
+                    local blob = parent and blockText(parent) or string.lower(d.Text)
+                    -- always beside the quest counter, never beside a mastery
+                    -- or ammo counter
+                    if string.find(blob, "defeat", 1, true)
+                        or string.find(blob, "eliminate", 1, true)
+                        or string.find(blob, "kill", 1, true) then
+                        local enemy = string.match(blob, "defeat%s+%d+%s+([%a%s'%-]+)")
+                        if enemy then enemy = (enemy:gsub("%s+$", "")) end
+                        found = {
+                            have  = tonumber(have) or 0,
+                            need  = tonumber(need) or 0,
+                            enemy = enemy,
+                            text  = d.Text,
+                        }
+                        return
                     end
                 end
             end
         end
-        return false
     end)
-    return ok and found or false
+    questCache = (found and found.need > 0) and found or nil
+    return questCache
+end
+
+function P.questActive()
+    return P.readQuest() ~= nil
 end
 
 -- After the giver is clicked a dialog appears with one button per quest tier.
@@ -1189,87 +1348,258 @@ function P.startQuestForTarget()
     return false
 end
 
-function P.takeQuest()
-    if P.questActive() then
-        P.lastQuestResult = "a quest is already active - not re-taking (would reset it)"
-        say(P.lastQuestResult)
-        return false
+-- ---------------------------------------------------------
+-- ACCEPTING, AND THE LOOP
+-- ---------------------------------------------------------
+-- Which quest belongs to what we are farming right now. The type being worked
+-- wins, so a two-type rotation asks for the quest of the type in hand.
+local function questForNames()
+    local names = {}
+    if P.focusName then table.insert(names, P.focusName) end
+    if activeNames then
+        for n in pairs(activeNames) do
+            if n ~= P.focusName then table.insert(names, n) end
+        end
     end
-
-    -- Prefer a named giver: whatever you typed, else the one known for the
-    -- enemy being farmed, else fall back to the QUEST billboard scan.
-    local want = CFG.QuestGiverName
-    if not want or want == "" then
-        for n in pairs(activeNames or {}) do want = GIVER_NAMES[n] or want end
-    end
-    local giver = findQuestGiver(300, want) or findQuestGiver(2500, want)
-    if not giver then
-        P.lastQuestResult = "no NPC found - try START QUEST instead"
-        say(P.lastQuestResult)
-        return false
-    end
-
-    say(string.format("giver: %s  %.0f studs  [%s]",
-        tostring(giver.name), giver.dist or 0, tostring(giver.signal)))
-
-    -- Stand BESIDE it at its own height, not above it. Blox Fruits' proximity
-    -- check is a radius around the NPC, and hovering overhead can sit outside
-    -- it even when the horizontal distance looks fine.
-    clearHold()
-    local gp = giver.part.Position
-    moveTo(gp + Vector3.new(0, 2, 4), MOVE_SPEED)
-    task.wait(0.4)
-    setHold(CFrame.new(gp + Vector3.new(0, 2, 4), gp))
-
-    -- Fire everything that could open it, cheapest first.
-    local inst = giver.interact
-    if inst then
-        if inst:IsA("ClickDetector") and fireclickdetector then
-            pcall(fireclickdetector, inst, 0)
-        elseif inst:IsA("ProximityPrompt") then
-            if fireproximityprompt then
-                pcall(fireproximityprompt, inst)
-            else
-                pcall(function()
-                    inst:InputHoldBegin()
-                    task.wait((inst.HoldDuration or 0) + 0.1)
-                    inst:InputHoldEnd()
-                end)
+    if #names == 0 then
+        local lv = playerLevel()
+        if lv then
+            for _, row in ipairs(LEVELS) do
+                if lv >= row[1] and lv <= row[2] then table.insert(names, row[3]) end
             end
         end
     end
-
-    -- E is the interact key, and key events are the ONE input path measured to
-    -- reach this game on this executor. Mouse clicks never arrive; keys do.
-    for _ = 1, 3 do
-        pcall(function()
-            VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-            task.wait(0.08)
-            VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-        end)
-        task.wait(0.35)
+    for _, n in ipairs(names) do
+        local q = QUESTS[n]
+        if q then return q[1], q[2], n end
     end
+    return nil, nil, names[1]
+end
+P.questForNames = questForNames
 
-    local wanted
-    if activeNames then for n in pairs(activeNames) do wanted = n break end end
-    local clicked, what = clickQuestDialog(wanted)
+-- GIVER MEMORY, PER ENEMY.
+-- Every island's quest giver is an ordinary NPC with its own name - Adventurer
+-- in the Jungle, Villager in the Snow Village, and so on for every island.
+-- Hard-coding that list means guessing, and a wrong guess sends the farm to
+-- the wrong NPC. So the list is LEARNED instead: whenever an accept actually
+-- works, the NPC that worked and the spot it was standing on are remembered
+-- against the enemy being farmed, and every later accept goes straight there.
+P.learnedGivers = {}     -- enemy name -> NPC name that worked
+P.giverSpots    = {}     -- enemy name -> exact position that worked
 
-    if clicked then
-        P.lastQuestResult = "accepted: " .. tostring(what)
-    else
-        -- Nothing in the dialog: ask the server outright.
-        P.lastQuestResult = "no dialog button - falling back to StartQuest"
+local function currentEnemy()
+    if P.questEnemy then return P.questEnemy end
+    if P.focusName then return P.focusName end
+    if activeNames then for n in pairs(activeNames) do return n end end
+    return nil
+end
+P.currentEnemy = currentEnemy
+
+function P.setGiverHere()
+    local _, root = parts()
+    if not root then return false end
+    local e = currentEnemy()
+    P.giverPos = root.Position
+    if e then P.giverSpots[e] = root.Position end
+    say("quest giver point saved" .. (e and (" for " .. e) or ""))
+    return true
+end
+
+function P.clearGiver()
+    local e = currentEnemy()
+    P.giverPos = nil
+    if e then
+        P.giverSpots[e] = nil
+        P.learnedGivers[e] = nil
+    end
+    say("quest giver point cleared")
+end
+
+-- What the panel shows for the enemy in hand.
+function P.giverFor(enemy)
+    enemy = enemy or currentEnemy()
+    if not enemy then return nil, nil end
+    return (CFG.QuestGiverName ~= "" and CFG.QuestGiverName)
+        or P.learnedGivers[enemy] or GIVER_NAMES[enemy],
+        P.giverSpots[enemy] or P.giverPos
+end
+
+-- ONE accept attempt.
+--   * the remote is the path the dialog itself uses, so it is what is fired
+--   * the NPC is used only for POSITION: some islands refuse the remote unless
+--     you are standing at the giver
+--   * if the remote leaves no tracker, the player's own path is tried: press E
+--     at the giver, then click the dialog option naming our enemy
+function P.acceptQuest(opts)
+    opts = opts or {}
+    if not commF then
+        P.lastQuestResult = "no CommF_ remote"
+        return false
+    end
+    if P.readQuest(true) and not opts.force then
+        P.lastQuestResult = "already on a quest - not re-taking (that would reset it)"
         say(P.lastQuestResult)
-        clicked = P.startQuestForTarget()
+        return false
     end
+
+    local qname, tier, enemy = questForNames()
+    -- Once a quest has been taken successfully, the loop repeats THAT one. You
+    -- choose once; it does not drift onto a different quest because the type
+    -- rotation moved on or a different enemy happened to be loaded.
+    local locked = P.lockedQuest
+    if locked and CFG.QuestLock ~= false then
+        qname, tier, enemy = locked.name, locked.tier, locked.enemy
+    end
+    if CFG.QuestName and #tostring(CFG.QuestName) > 0 then qname = CFG.QuestName end
+    if CFG.QuestTier then tier = CFG.QuestTier end
+    tier = tier or 1
+    if not qname then
+        P.lastQuestResult = "no quest name known for " .. tostring(enemy or "this enemy")
+        say(P.lastQuestResult)
+        return false
+    end
+
+    local _, root = parts()
+    local home = root and root.Position
+    local atGiver = false
+
+    if CFG.QuestHopToGiver then
+        -- who to look for, best information first:
+        --   1. the name you typed
+        --   2. the name that WORKED here before
+        --   3. the few names known up front
+        --   4. nobody - just take the closest NPC wearing the "?" marker
+        local want = CFG.QuestGiverName
+        if (not want or want == "") and enemy then
+            want = P.learnedGivers[enemy] or GIVER_NAMES[enemy]
+        end
+
+        local dest = (enemy and P.giverSpots[enemy]) or P.giverPos
+        if not dest then
+            local giver
+            if want then
+                giver = findQuestGiver(500, want) or findQuestGiver(3000, want)
+            end
+            -- closest-with-marker, which is what you want when nothing is set
+            if not giver and CFG.QuestGiverClosest ~= false then
+                giver = findQuestGiver(500, nil, true) or findQuestGiver(3000, nil, true)
+                if giver then say("using the closest quest giver: " .. giver.name) end
+            end
+            giver = giver or findQuestGiver(3000, want)
+            if giver then
+                dest = giver.part.Position
+                P.giverName = giver.name
+            end
+        end
+        if dest then
+            atGiver = true
+            say("flying to the quest giver")
+            clearHold()
+            -- BESIDE it at its own height. The proximity check is a sphere
+            -- around the NPC, and hovering overhead sits outside it.
+            local stand = dest + Vector3.new(0, 3, 5)
+            moveTo(stand, MOVE_SPEED)
+            setHold(CFrame.new(stand, dest))
+            task.wait(0.35)
+        end
+    end
+
+    local ok, res = pcall(function()
+        return commF:InvokeServer("StartQuest", qname, tier)
+    end)
+    task.wait(0.45)
+    local q = P.readQuest(true)
+
+    if not q and atGiver then
+        say("remote refused - talking to the NPC")
+        for _ = 1, 3 do
+            pcall(function()
+                VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                task.wait(0.07)
+                VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            end)
+            task.wait(0.3)
+        end
+        pcall(clickQuestDialog, enemy)
+        task.wait(0.5)
+        q = P.readQuest(true)
+    end
+
+    questTakenAt   = os.clock()
+    questBaseKills = stats.kills
+    P.questEnemy   = enemy
+
+    -- Learn from what worked. This is how the giver list builds itself instead
+    -- of being guessed: the NPC and the spot are only remembered on success.
+    if q and enemy then
+        if P.giverName then P.learnedGivers[enemy] = P.giverName end
+        local _, r = parts()
+        if atGiver and r then P.giverSpots[enemy] = P.giverSpots[enemy] or r.Position end
+        P.lockedQuest = { name = qname, tier = tier, enemy = enemy }
+    end
+    -- No tracker after a clean invoke means this island's tracker cannot be
+    -- read, NOT that the accept failed. Re-asking would zero a running count,
+    -- so from here the kills are counted locally instead.
+    questBlind = (q == nil) and ok or false
+    P.quest = q
+    P.lastQuestResult = string.format("%s t%d -> %s", tostring(qname), tier,
+        q and string.format("ACTIVE  %d/%d", q.have, q.need)
+          or ("sent, tracker unreadable (" .. tostring(res) .. ")"))
     say(P.lastQuestResult)
 
+    if atGiver and CFG.QuestReturnToFarm and home then
+        clearHold()
+        moveTo(home, MOVE_SPEED)
+    end
     clearHold()
-    anchor = nil
-    -- straight back to fighting; re-resolving would restart the type rotation
-    setState("ENGAGE")
-    progress()
-    return clicked
+    if P.running then
+        setState("ENGAGE")
+        progress()
+    end
+    return q ~= nil or questBlind
+end
+
+-- Old name, same thing. The QUEST button still calls this.
+function P.takeQuest() return P.acceptQuest() end
+
+-- Clears the accept timer so the next pass takes a quest immediately. Called
+-- when the loop is switched on and whenever a run starts.
+function P.armQuest()
+    lastQuestAt  = 0
+    questBlind   = false
+    P.questEnemy = nil
+end
+
+-- The loop: exactly one quest running at all times, and never two accepts for
+-- one count. Called every pass of the main loop while AUTO QUEST is on.
+function P.questCycle()
+    local q = P.readQuest(true)
+    P.quest = q
+
+    if q then
+        questBlind = false
+        P.questProgress = q.have .. "/" .. q.need
+        if q.have < q.need then return end                 -- still working it
+        if os.clock() - questTakenAt < 2 then return end   -- accepted a moment ago
+        say("quest complete - taking the next one")
+    elseif questBlind then
+        -- unreadable tracker: count our own kills against the assumed quota
+        local done = stats.kills - questBaseKills
+        P.questProgress = done .. "/" .. CFG.QuestKillsFallback .. " (counted here)"
+        if done < CFG.QuestKillsFallback and os.clock() - questTakenAt < 900 then
+            return
+        end
+    else
+        P.questProgress = "none"
+    end
+
+    if os.clock() - lastQuestAt < CFG.QuestRetrySeconds then return end
+    lastQuestAt = os.clock()
+    -- A tracker still showing a FINISHED count would make the next accept
+    -- refuse itself as a duplicate and the loop would stall there forever.
+    -- Overriding is safe in exactly this case: the count is already done, so
+    -- there is no progress left to reset.
+    P.acceptQuest({ force = (q ~= nil and q.have >= q.need) })
 end
 
 -- =========================================================
@@ -1369,19 +1699,24 @@ local function escalate(currentCluster)
     lastProgressAt = os.clock()   -- give each rung a fresh window
 
     if escalation == 1 then
-        say("stuck: re-anchoring")
-        anchor = nil
+        -- This rung used to assign to a variable nothing ever read, so the
+        -- first rung of the ladder did nothing at all and the farm spent
+        -- StuckSeconds achieving it. Dropping the hold is the real version:
+        -- the next pass re-seats on the target from scratch.
+        say("stuck: releasing the hold and re-seating")
+        clearHold()
+        cancelMove()
 
     elseif escalation == 2 then
         say("stuck: re-equipping weapon")
         equipWeapon()
-        anchor = nil
+        clearHold()
 
     elseif escalation == 3 then
         say("stuck: reinstalling fast attack")
         installFastAttack()
         equipWeapon()
-        anchor = nil
+        clearHold()
 
     elseif escalation == 4 then
         say("stuck: blacklisting target, moving on")
@@ -1390,7 +1725,7 @@ local function escalate(currentCluster)
                 blacklist[e.model] = os.clock() + 60
             end
         end
-        anchor = nil
+        clearHold()
         setState("RESOLVE")
     end
 end
@@ -1425,7 +1760,6 @@ local function rotateType()
     if #typeOrder < 2 then return end
     typeIdx = (typeIdx % #typeOrder) + 1
     setFocus(typeIdx)
-    anchor = nil
 end
 P.nextType = rotateType
 
@@ -1499,7 +1833,6 @@ local function retreat()
         if healthPct() > 0.9 then break end
         task.wait(0.2)
     end
-    anchor = nil
     progress()
 end
 
@@ -1507,7 +1840,6 @@ local function step()
     local _, root = parts()
     if not root then
         say("waiting for character")
-        anchor = nil
         task.wait(0.4)
         return
     end
@@ -1536,31 +1868,50 @@ local function step()
         return
     end
 
-    -- ---------- AUTO QUEST ----------
-    -- Only when asked. With AUTO off nothing is ever taken, which is the
-    -- correct behaviour for farming a spot that has no quest.
-    if CFG.AutoQuest and not anyEnemyMode
-        and os.clock() - lastQuestAt > CFG.QuestRetrySeconds
-        and not P.questActive() then
-        lastQuestAt = os.clock()
-        pcall(P.takeQuest)
-        return
+    -- ---------- QUEST CYCLE ----------
+    -- accept -> fight -> the tracker clears itself -> accept the next one.
+    -- Nothing here needs a button press, and nothing is re-taken mid-count.
+    if CFG.AutoQuest and not anyEnemyMode then
+        pcall(P.questCycle)
     end
 
     -- ---------- find work ----------
     -- While rotating, only the focused type counts as work.
     local wantNames = (CFG.RotateTypes and focusSet) or activeNames
+    activeFilter = wantNames
     local list = liveEnemies(wantNames)
+
+    -- A quest counts kills of ONE species, so while the quest loop is running
+    -- that species outranks the rotation: killing anything else moves nothing.
+    if CFG.AutoQuest and P.questEnemy then
+        local qset = { [P.questEnemy] = true }
+        local qlist = liveEnemies(qset)
+        if #qlist > 0 then
+            activeFilter, list = qset, qlist
+        end
+    end
 
     -- this type is finished here: move on to the next selected type
     if #list == 0 and CFG.RotateTypes and #typeOrder > 1 then
         rotateType()
+        activeFilter = focusSet
         list = liveEnemies(focusSet)
     end
 
+    -- Primaries are all dead and on a respawn timer. Instead of hovering over
+    -- empty ground, work the BACKUP names until they come back.
+    if #list == 0 and CFG.UseSecondary and secondaryNames and next(secondaryNames) then
+        list = liveEnemies(secondaryNames)
+        if #list > 0 then
+            activeFilter = secondaryNames
+            say("primary respawning - on backup targets")
+        end
+    end
+
     if #list == 0 and CFG.AnyEnemyFallback and activeNames then
-        list = liveEnemies(nil)      -- nothing of the quest type loaded: take EXP
-        if #list > 0 then say("quest enemies absent - hitting loaded enemies") end
+        activeFilter = nil           -- nothing selected is loaded: take any EXP
+        list = liveEnemies(nil)
+        if #list > 0 then say("selected enemies absent - hitting what is loaded") end
     end
 
     if #list == 0 then
@@ -1570,9 +1921,11 @@ local function step()
                 setState("TRAVEL")
                 stats.travels += 1
             end
-            say("no targets loaded - moving to farm spot")
-            moveTo(travelGoal + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
-            task.wait(0.4)
+            say("no targets loaded - flying to the farm spot")
+            -- Stepped flight, not a tween: a tween across open water outruns
+            -- the streaming system and drops you into unloaded space.
+            P.flyTo(travelGoal)
+            task.wait(0.3)
             if os.clock() - stateEnteredAt > CFG.TravelTimeout then
                 say("travel timeout - re-resolving")
                 setState("RESOLVE")
@@ -1623,7 +1976,7 @@ local function step()
     -- With MAGNET on the enemy comes to us, so travelling to it is wasted
     -- motion, and moving would drag the whole stack across the island.
     if CFG.Magnet then
-        setHold(root.CFrame)
+        setHold(flatCF(root.CFrame))
     else
         -- Go to it, slightly above so melee AI cannot path to us.
         local goal = target.root.Position + Vector3.new(0, CFG.HoverHeight, 0)
@@ -1653,7 +2006,7 @@ local function step()
         -- setHold is what stops the slow sink between swings: without it the
         -- position is written once and gravity undoes it before the next one.
         if CFG.Magnet then
-            if not holdCF then setHold(r.CFrame) end
+            if not holdCF then setHold(flatCF(r.CFrame)) end
         else
             -- follow it: the anchor is the ground point, so hover height and
             -- tilt stay live while the hold loop does the actual pinning
@@ -1700,8 +2053,15 @@ local function step()
     end
 end
 
+-- Generation token. Every restart (teleport, respawn, START) spawns a fresh
+-- loop, and without this the old one kept running beside it - two loops
+-- fighting over one character is what produced the random re-targeting.
+local mainGen, dogGen = 0, 0
+
 local function mainLoop()
-    while P.running do
+    mainGen += 1
+    local gen = mainGen
+    while P.running and gen == mainGen do
         local ok, err = pcall(step)
         if not ok then
             say("recovered from error")
@@ -1713,16 +2073,17 @@ end
 
 -- Independent watchdog: catches a total freeze of the main loop.
 local function watchdog()
+    dogGen += 1
+    local gen = dogGen
     local lastSeen = os.clock()
     local lastSwings = stats.swings
-    while P.running do
+    while P.running and gen == dogGen do
         task.wait(5)
         if stats.swings ~= lastSwings then
             lastSwings = stats.swings
             lastSeen = os.clock()
         elseif os.clock() - lastSeen > 20 and state == "ENGAGE" then
             say("watchdog: no swings in 20s - forcing re-resolve")
-            anchor = nil
             escalation = 0
             setState("RESOLVE")
             lastSeen = os.clock()
@@ -1731,18 +2092,44 @@ local function watchdog()
 end
 
 -- =========================================================
--- FAST TRAVEL
+-- TELEPORT
 -- =========================================================
--- Lifted from teliport.txt, which works: name a spawn point, then destroy the
--- character so the server rebuilds it there. The head is destroyed first
--- because the character does not reliably tear down otherwise.
-local worldOrigin  = workspace:FindFirstChild("_WorldOrigin")
-local PlayerSpawns = worldOrigin and worldOrigin:FindFirstChild("PlayerSpawns")
+-- THE SPAWN-POINT TRICK IS DEAD.
+-- teliport.txt did this: SetLastSpawnPoint -> destroy the character -> the
+-- server rebuilds the body at the new point. It worked for years. It does not
+-- work now: the body is destroyed and you come back exactly where you were,
+-- which is precisely the "teleport only deletes me" symptom.
+--
+-- So the primary engine here is not a respawn at all. It is what the working
+-- script hubs do now: FLY there, in small CFrame steps, at altitude.
+--   * one giant CFrame write is what trips the anti-cheat and outruns the
+--     streaming system, so you arrive inside unloaded space and fall
+--   * a chain of small writes reads as fast movement, which the game allows,
+--     and it is the same mechanism that already puts this farm on every enemy
+-- Rise to cruise height, cross in steps, descend, hold. Nothing is destroyed,
+-- no respawn is involved, and there is no state where you end up dead.
+--
+-- The respawn path is kept as a SECOND engine with a ladder of four ways to
+-- force the respawn, because when a server does honour it, it is the only way
+-- to cross water the client cannot stream through.
+local TeleportService = game:GetService("TeleportService")
+
+local function spawnsFolder()
+    local wo = workspace:FindFirstChild("_WorldOrigin")
+    return wo and wo:FindFirstChild("PlayerSpawns") or nil
+end
+
+local function teamSpawnFolder()
+    local ps = spawnsFolder()
+    if not ps then return nil end
+    local team = (player.Team and player.Team.Name) or "Pirates"
+    return ps:FindFirstChild(team)
+        or ps:FindFirstChild("Pirates")
+        or ps:GetChildren()[1]
+end
 
 function P.spawnList()
-    local team = (player.Team and player.Team.Name) or "Pirates"
-    local folder = PlayerSpawns and (PlayerSpawns:FindFirstChild(team)
-                                  or PlayerSpawns:FindFirstChild("Pirates"))
+    local folder = teamSpawnFolder()
     local names = {}
     if folder then
         for _, sp in ipairs(folder:GetChildren()) do table.insert(names, sp.Name) end
@@ -1751,18 +2138,17 @@ function P.spawnList()
     return names
 end
 
-function P.forceRespawn()
-    if not commF then return false end
-    local team = (player.Team and player.Team.Name) or "Pirates"
-    pcall(function() commF:InvokeServer("SetTeam2", team) end)
-    say("force respawn: " .. team)
-    return true
+function P.spawnPos(name)
+    local folder = teamSpawnFolder()
+    local sp = folder and folder:FindFirstChild(name)
+    if not sp then return nil end
+    if sp:IsA("BasePart") then return sp.Position end
+    local part = sp:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
 end
 
--- Spawn names are exact and case sensitive. "middle town" is not "Middle
--- Town", and the server silently ignores a name it does not know, which looks
--- exactly like the teleport failing: you respawn at your previous spawn point.
 function P.resolveSpawn(name)
+    if not name or name == "" then return nil end
     local list = P.spawnList()
     for _, n in ipairs(list) do if n == name then return n end end
     local low = string.lower(name)
@@ -1773,77 +2159,509 @@ function P.resolveSpawn(name)
     return nil
 end
 
-function P.travelTo(name)
-    if not commF then
-        P.lastTravel = "no CommF_ remote"
-        say(P.lastTravel)
+-- Every farm spot the level table knows about, built once.
+function P.farmSpots()
+    if P._spots then return P._spots end
+    local out, seen = {}, {}
+    for _, row in ipairs(LEVELS) do
+        if not seen[row[3]] then
+            seen[row[3]] = true
+            table.insert(out, { name = row[3], pos = row[4], min = row[1], max = row[2] })
+        end
+    end
+    P._spots = out
+    return out
+end
+
+-- One list for the panel: server spawn points first (they can be reached both
+-- ways), then the farm spots, which can only be flown to.
+function P.destinations()
+    local out = {}
+    for _, n in ipairs(P.spawnList()) do
+        table.insert(out, { name = n, pos = P.spawnPos(n), kind = "island", spawn = n })
+    end
+    for _, s in ipairs(P.farmSpots()) do
+        table.insert(out, { name = s.name, pos = s.pos, kind = "farm",
+                            label = "lv " .. s.min .. "-" .. s.max })
+    end
+    return out
+end
+
+function P.findDestination(name)
+    if not name or name == "" then return nil end
+    local low = string.lower(name)
+    local all = P.destinations()
+    for _, d in ipairs(all) do if d.name == name then return d end end
+    for _, d in ipairs(all) do if string.lower(d.name) == low then return d end end
+    for _, d in ipairs(all) do
+        if string.find(string.lower(d.name), low, 1, true) then return d end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------
+-- COUNTDOWN OVERLAY
+-- ---------------------------------------------------------
+-- The countdown is REAL, not decoration: nothing moves until it reaches zero,
+-- so the hop can still be called off. That is how the game's own fast travel
+-- behaves, and it is why a mis-click costs nothing.
+local travelBusy   = false
+local travelCancel = false
+
+local function makeOverlay(destination)
+    local host = (gethui and gethui()) or player:FindFirstChild("PlayerGui")
+    if not host then return nil end
+    local old = host:FindFirstChild("BFPTeleport")
+    if old then pcall(function() old:Destroy() end) end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "BFPTeleport"
+    sg.IgnoreGuiInset = true
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 999
+    sg.Parent = host
+
+    local dim = Instance.new("TextButton")
+    dim.Size = UDim2.fromScale(1, 1)
+    dim.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    dim.BackgroundTransparency = 0.45
+    dim.BorderSizePixel = 0
+    dim.AutoButtonColor = false
+    dim.Text = ""
+    dim.Parent = sg
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.fromOffset(300, 188)
+    card.AnchorPoint = Vector2.new(0.5, 0.5)
+    card.Position = UDim2.fromScale(0.5, 0.5)
+    card.BackgroundColor3 = Color3.fromRGB(24, 24, 27)
+    card.BorderSizePixel = 0
+    card.Parent = sg
+    local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 20) cc.Parent = card
+    local cs = Instance.new("UIStroke")
+    cs.Color = Color3.fromRGB(70, 70, 78)
+    cs.Transparency = 0.5
+    cs.Parent = card
+
+    local function text(y, h, size, font, colour)
+        local t = Instance.new("TextLabel")
+        t.Size = UDim2.new(1, -32, 0, h)
+        t.Position = UDim2.fromOffset(16, y)
+        t.BackgroundTransparency = 1
+        t.Font = font
+        t.TextSize = size
+        t.TextColor3 = colour
+        t.TextTruncate = Enum.TextTruncate.AtEnd
+        t.Parent = card
+        return t
+    end
+
+    local head = text(20, 16, 13, Enum.Font.GothamMedium, Color3.fromRGB(142, 142, 147))
+    head.Text = "TELEPORTING TO"
+    local dest = text(38, 24, 19, Enum.Font.GothamBold, Color3.fromRGB(245, 245, 247))
+    dest.Text = destination
+    local clock = text(68, 44, 40, Enum.Font.GothamBold, Color3.fromRGB(10, 132, 255))
+    clock.Text = "3.0"
+    local note = text(150, 16, 12, Enum.Font.Gotham, Color3.fromRGB(120, 120, 128))
+    note.Text = "click anywhere to cancel"
+
+    local barBG = Instance.new("Frame")
+    barBG.Size = UDim2.new(1, -32, 0, 4)
+    barBG.Position = UDim2.fromOffset(16, 128)
+    barBG.BackgroundColor3 = Color3.fromRGB(58, 58, 62)
+    barBG.BorderSizePixel = 0
+    barBG.Parent = card
+    local bbc = Instance.new("UICorner") bbc.CornerRadius = UDim.new(1, 0) bbc.Parent = barBG
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.fromScale(0, 1)
+    bar.BackgroundColor3 = Color3.fromRGB(10, 132, 255)
+    bar.BorderSizePixel = 0
+    bar.Parent = barBG
+    local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(1, 0) bc.Parent = bar
+
+    dim.Activated:Connect(function() travelCancel = true end)
+
+    return {
+        tick = function(secondsLeft, total)
+            clock.Text = string.format("%.1f", math.max(secondsLeft, 0))
+            bar.Size = UDim2.fromScale(
+                math.clamp(1 - (secondsLeft / math.max(total, 0.01)), 0, 1), 1)
+        end,
+        phase = function(big, small, progress)
+            clock.Text = big
+            clock.TextSize = (#big > 4) and 20 or 40
+            note.Text = small or ""
+            if progress then bar.Size = UDim2.fromScale(math.clamp(progress, 0, 1), 1) end
+        end,
+        kill = function() pcall(function() sg:Destroy() end) end,
+    }
+end
+
+function P.cancelTravel() travelCancel = true end
+function P.travelling() return travelBusy end
+
+-- ---------------------------------------------------------
+-- ENGINE 1: FLY
+-- ---------------------------------------------------------
+-- Small steps, every Heartbeat, velocity killed each one. The step size is the
+-- whole trick: big enough to cross an ocean in a couple of seconds, small
+-- enough that the server sees movement rather than a jump.
+local function hopTo(pos, overlay, phaseName, totalDistance, doneSoFar)
+    local step = math.max(CFG.TravelStep or 220, 20)
+    local guard = 0
+    while true do
+        if travelCancel then return false end
+        local _, r = parts()
+        if not r then return false end
+        local delta = pos - r.Position
+        local d = delta.Magnitude
+        if d < 8 then return true end
+        r.CFrame = CFrame.new(r.Position + delta.Unit * math.min(step, d))
+        killVelocity(r)
+        if overlay and totalDistance and totalDistance > 0 then
+            overlay.phase(phaseName, string.format("%.0f studs to go", d),
+                ((doneSoFar or 0) + (totalDistance - d)) / totalDistance)
+        end
+        guard += 1
+        if guard > 4000 then return false end
+        RunService.Heartbeat:Wait()
+    end
+end
+
+-- MEASURED, not assumed. The game's own house button was watched doing this:
+--   CLICK  Main.HUDButtonBar.HomeButton
+--   MOVED  1590 studs -> -1196.9, 10.1, 1873.7      5.7s after the press
+--   body was NOT replaced
+-- No respawn, no spawn point, and the 5.7s was the game's own countdown, not
+-- travel time. The travel itself was one jump. So a direct CFrame write is not
+-- something the game merely tolerates - it is the game's own mechanism, and it
+-- is the default here.
+--
+-- The only real hazard is arriving before the world streams in and dropping
+-- through ground that does not exist yet, which is what the settle hold is for.
+local function instantTravel(target, overlay)
+    local _, root = parts()
+    if not root then return false, "no character" end
+    local land = target + Vector3.new(0, CFG.HoverHeight, 0)
+
+    clearHold()
+    cancelMove()
+    startStabilizer()
+    if overlay then overlay.phase("GO", "arriving", 0.5) end
+
+    root.CFrame = CFrame.new(land)
+    killVelocity(root)
+    setHold(CFrame.new(land))
+
+    -- Re-assert every frame while the chunks load. One write is undone by
+    -- physics within a frame, exactly like the hover hold.
+    local settle = math.max(CFG.TeleportSettle or 2, 0.2)
+    local deadline = os.clock() + settle
+    while os.clock() < deadline do
+        if travelCancel then break end
+        local _, r = parts()
+        if r then
+            r.CFrame = CFrame.new(land)
+            killVelocity(r)
+        end
+        if overlay then
+            overlay.phase("...", "letting the island load",
+                0.5 + 0.5 * (1 - (deadline - os.clock()) / settle))
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    setAnchor(target, nil)
+    local _, r2 = parts()
+    local off = r2 and (r2.Position - land).Magnitude or 9999
+    -- A server that refuses the write snaps you back, and the distance says so.
+    return off < 120, string.format("%.0f studs off", off)
+end
+
+local function steppedTravel(target, overlay)
+    local _, root = parts()
+    if not root then return false, "no character" end
+
+    -- Cruise above everything between here and there. Mountains, island walls
+    -- and the Sky islands all sit below this.
+    local cruiseY = math.max(root.Position.Y, target.Y) + (CFG.TravelAltitude or 350)
+    local start   = root.Position
+    local up      = Vector3.new(start.X, cruiseY, start.Z)
+    local over    = Vector3.new(target.X, cruiseY, target.Z)
+    local land    = target + Vector3.new(0, CFG.HoverHeight, 0)
+    local total   = (up - start).Magnitude + (over - up).Magnitude + (land - over).Magnitude
+
+    clearHold()
+    cancelMove()
+    startStabilizer()          -- collisions off, velocity killed every frame
+
+    if not hopTo(up, overlay, "UP", total, 0) then return false, "cancelled on the climb" end
+    if not hopTo(over, overlay, "CROSS", total, (up - start).Magnitude) then
+        return false, "cancelled mid-crossing"
+    end
+    if not hopTo(land, overlay, "DOWN", total,
+        (up - start).Magnitude + (over - up).Magnitude) then
+        return false, "cancelled on the descent"
+    end
+
+    setAnchor(target, nil)
+    local _, r = parts()
+    local off = r and (r.Position - land).Magnitude or 9999
+    return off < 60, string.format("%.0f studs off the mark", off)
+end
+
+-- Instant first, stepped as the fallback. Nothing here needs the user to pick.
+local function flyTravel(target, overlay)
+    if (CFG.TeleportStyle or "instant") == "stepped" then
+        return steppedTravel(target, overlay)
+    end
+    local ok, detail = instantTravel(target, overlay)
+    if ok then return true, "instant, " .. tostring(detail) end
+    if travelCancel then return false, "cancelled" end
+    if overlay then overlay.phase("...", "snapped back - crossing in steps") end
+    local ok2, d2 = steppedTravel(target, overlay)
+    return ok2, "instant refused (" .. tostring(detail) .. ") then stepped, " .. tostring(d2)
+end
+
+-- ---------------------------------------------------------
+-- ENGINE 2: RESPAWN
+-- ---------------------------------------------------------
+-- Kept because it is the only way through water the client will not stream.
+-- Four ways to force the respawn, cheapest first, because which of them a
+-- given server honours changes with every Blox Fruits update - and a single
+-- hard-coded one silently doing nothing is exactly how this broke before.
+local function waitForNewBody(oldChar, seconds)
+    local deadline = os.clock() + seconds
+    while os.clock() < deadline do
+        local c, r = parts()
+        if c and r and c ~= oldChar then return true end
+        task.wait(0.15)
+    end
+    return false
+end
+
+local function respawnTravel(spawnName, overlay)
+    if not commF then return false, "no CommF_ remote" end
+
+    local ok, res = pcall(function()
+        return commF:InvokeServer("SetLastSpawnPoint", spawnName)
+    end)
+    local detail = ok and tostring(res) or ("ERROR " .. tostring(res))
+    task.wait((player:GetNetworkPing() * 2) + 0.05)
+
+    local oldChar = player.Character
+    local hum = oldChar and oldChar:FindFirstChildOfClass("Humanoid")
+    local rungs = {
+        { "asking the humanoid to die", function()
+            if hum then hum.Health = 0 end
+        end },
+        { "breaking the joints", function()
+            if oldChar then oldChar:BreakJoints() end
+        end },
+        { "re-joining the team", function()
+            local team = (player.Team and player.Team.Name) or "Pirates"
+            commF:InvokeServer("SetTeam2", team)
+        end },
+        { "destroying the character", function()
+            local head = oldChar and oldChar:FindFirstChild("Head")
+            if head then head:Destroy() end
+            task.wait()
+            if oldChar then oldChar:Destroy() end
+        end },
+    }
+
+    for i, rung in ipairs(rungs) do
+        if travelCancel then return false, "cancelled" end
+        if overlay then overlay.phase("...", rung[1], i / #rungs) end
+        pcall(rung[2])
+        if waitForNewBody(oldChar, 4) then
+            task.wait(0.8)
+            return true, detail .. " | respawned via " .. rung[1]
+        end
+    end
+    return false, detail .. " | the server refused every respawn"
+end
+
+-- ---------------------------------------------------------
+-- THE HOP
+-- ---------------------------------------------------------
+function P.travelTo(name, opts)
+    opts = opts or {}
+    if travelBusy then
+        P.lastTravel = "already teleporting"
         return false
     end
-    local exact = P.resolveSpawn(name or "")
-    if not exact then
-        P.lastTravel = string.format("'%s' is not a spawn point for your team", tostring(name))
+
+    local dest = P.findDestination(name)
+    if not dest or not dest.pos then
+        P.lastTravel = (#P.spawnList() == 0)
+            and "world has not streamed in yet - try again in a moment"
+            or  ("no destination called " .. tostring(name))
         say(P.lastTravel)
         return false
     end
 
-    local char = player.Character
-    local hum  = char and char:FindFirstChildOfClass("Humanoid")
-    local head = char and char:FindFirstChild("Head")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not (char and hum and head and root) or hum.Health <= 0 then
+    local _, root = parts()
+    if not root then
         P.lastTravel = "no living character"
         say(P.lastTravel)
         return false
     end
-    local before = root.Position
 
-    -- Stop driving the body during the respawn, or the tween writes to a
-    -- destroyed root and the loop spins on errors.
+    travelBusy, travelCancel = true, false
+    local before  = root.Position
+    local overlay = (CFG.TeleportOverlay ~= false) and makeOverlay(dest.name) or nil
+
+    -- Freeze the farm for the duration. A tween or a held CFrame fighting the
+    -- teleport is what used to leave the loop spinning on errors.
     local wasRunning = P.running
     P.running = false
-    clearHold()
     cancelMove()
-    say("fast travel -> " .. exact)
+    clearHold()
+    stopPuller()
+    stats.travels += 1
+    say("teleporting to " .. dest.name)
 
-    -- The return value is the whole diagnosis. A rejected spawn point respawns
-    -- you where you already were, which is indistinguishable from "it did
-    -- nothing" unless the server's answer is actually read.
-    local ok, res = pcall(function()
-        return commF:InvokeServer("SetLastSpawnPoint", exact)
+    local arrived, detail = false, ""
+    local mode = opts.mode or CFG.TeleportMode or "auto"
+    local distance = (dest.pos - before).Magnitude
+
+    local ranOk = pcall(function()
+        -- countdown, cancellable
+        local total = math.max(CFG.TeleportCountdown or 3, 0)
+        local left = total
+        while left > 0 do
+            if travelCancel then return end
+            if overlay then overlay.tick(left, total) end
+            task.wait(0.1)
+            left -= 0.1
+        end
+        if travelCancel then return end
+
+        -- AUTO: fly unless it is a long haul to a real spawn point, where the
+        -- respawn is both instant and immune to anything in between. If the
+        -- respawn is refused, the flight still runs - so auto never dead-ends.
+        local useRespawn = (mode == "respawn")
+            or (mode == "auto" and dest.spawn ~= nil
+                and distance > (CFG.FlyMaxDistance or 6000))
+
+        if useRespawn then
+            arrived, detail = respawnTravel(dest.spawn, overlay)
+            if arrived then
+                local _, r = parts()
+                local off = r and (r.Position - dest.pos).Magnitude or 9999
+                if off > 800 then
+                    -- server sent us somewhere else: fly the rest
+                    if overlay then overlay.phase("...", "finishing on foot") end
+                    arrived, detail = flyTravel(dest.pos, overlay)
+                end
+            elseif mode == "auto" then
+                if overlay then overlay.phase("...", "respawn refused - flying instead") end
+                arrived, detail = flyTravel(dest.pos, overlay)
+            end
+        else
+            arrived, detail = flyTravel(dest.pos, overlay)
+        end
     end)
-    local said = (ok and tostring(res)) or ("ERROR " .. tostring(res))
-
-    task.wait((player:GetNetworkPing() * 2) + (1 / 60))
-    pcall(function() head:Destroy() end)
-    task.wait()
-    pcall(function() char:Destroy() end)
-
-    player.CharacterAdded:Wait()
-    task.wait(2.5)
 
     local _, nr = parts()
     local moved = nr and (nr.Position - before).Magnitude or 0
-    P.lastTravel = string.format("%s | SetLastSpawnPoint -> %s | moved %.0f studs%s",
-        exact, said, moved,
-        moved < 250 and "  << DID NOT MOVE" or "")
+    if travelCancel then
+        P.lastTravel = "cancelled"
+    else
+        P.lastTravel = string.format("%s -> %s  (%s, moved %.0f)", dest.name,
+            arrived and "ARRIVED" or "FAILED", tostring(detail), moved)
+    end
+    if not ranOk then P.lastTravel = P.lastTravel .. "  [recovered from an error]" end
     say(P.lastTravel)
+
+    if overlay then overlay.kill() end
+    travelBusy, travelCancel = false, false
 
     if wasRunning then
         P.running = true
         equipWeapon()
         startStabilizer()
-        anchor = nil
+        syncPuller()
         setState("RESOLVE")
         progress()
         task.spawn(mainLoop)
         task.spawn(watchdog)
     end
-    return moved > 250
+    return arrived
+end
+
+-- Hop without the ceremony: no countdown, no overlay. Used by the farm-spot
+-- rows and by the farm itself when its targets are not loaded here.
+-- Anything beyond line of sight goes up and over, because a flat crossing at
+-- ground level walks you into an island wall or the sea floor.
+function P.flyTo(position)
+    if not position then return false end
+    local _, root = parts()
+    if not root then return false end
+    travelCancel = false        -- a cancelled teleport must not poison this
+    clearHold()
+    startStabilizer()
+    local ok
+    if (position - root.Position).Magnitude > 120 then
+        ok = flyTravel(position, nil)      -- instant, with the stepped fallback
+    else
+        ok = hopTo(position + Vector3.new(0, CFG.HoverHeight, 0), nil, nil, nil, nil)
+    end
+    setAnchor(position, nil)
+    say(ok and "arrived" or "could not reach that point")
+    return ok
+end
+
+function P.forceRespawn()
+    local oldChar = player.Character
+    local hum = oldChar and oldChar:FindFirstChildOfClass("Humanoid")
+    if hum then pcall(function() hum.Health = 0 end) end
+    if not waitForNewBody(oldChar, 3) and commF then
+        local team = (player.Team and player.Team.Name) or "Pirates"
+        pcall(function() commF:InvokeServer("SetTeam2", team) end)
+    end
+    say("forced a respawn")
+    return true
+end
+
+-- ---------------------------------------------------------
+-- SEAS
+-- ---------------------------------------------------------
+-- The three seas are three separate Roblox places, so crossing them is a
+-- server hop, not a teleport: this session ends and the farm restarts on the
+-- other side. The game still enforces its own level and item requirements, so
+-- a server you are not allowed into will simply send you back.
+local SEAS = {
+    { name = "First Sea",  id = 2753915549 },
+    { name = "Second Sea", id = 4442272183 },
+    { name = "Third Sea",  id = 7449423635 },
+}
+function P.seas() return SEAS end
+
+function P.hopSea(placeId)
+    if game.PlaceId == placeId then
+        say("already in that sea")
+        return false
+    end
+    say("leaving this server")
+    local ok = pcall(function() TeleportService:Teleport(placeId, player) end)
+    if not ok then say("the server refused the sea hop") end
+    return ok
 end
 
 -- =========================================================
 -- UI
 -- =========================================================
+-- One rule decided this rewrite: a control you have to think about is a broken
+-- control. So there is exactly ONE primary button, every toggle looks like a
+-- toggle and nothing else does, every number you might want to feel your way
+-- to is a slider you drag, and the status line under the title always says in
+-- plain words what the farm is doing right now.
+--
+-- Things deliberately NOT here: duplicate paths to the same action, warning
+-- paragraphs in orange, and any control whose label needs a manual.
 local gui
 local function buildUI()
     local pg = player:WaitForChild("PlayerGui", 10)
@@ -1851,410 +2669,926 @@ local function buildUI()
     local old = pg:FindFirstChild("BFPHUD")
     if old then old:Destroy() end
 
-    gui = Instance.new("ScreenGui")
-    gui.Name = "BFPHUD"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 45
-    gui.Parent = pg
+    local UIS = game:GetService("UserInputService")
+
+    -- iOS system palette. One accent, one positive, one negative; everything
+    -- else is a grey. Colour carries meaning here, it is not decoration.
+    local C = {
+        bg     = Color3.fromRGB(20, 20, 22),
+        card   = Color3.fromRGB(30, 30, 34),
+        card2  = Color3.fromRGB(44, 44, 49),
+        line   = Color3.fromRGB(62, 62, 68),
+        text   = Color3.fromRGB(245, 245, 247),
+        dim    = Color3.fromRGB(142, 142, 147),
+        faint  = Color3.fromRGB(99, 99, 105),
+        accent = Color3.fromRGB(10, 132, 255),
+        green  = Color3.fromRGB(48, 209, 88),
+        red    = Color3.fromRGB(255, 69, 58),
+        amber  = Color3.fromRGB(255, 159, 10),
+    }
+
+    local function mk(class, props)
+        local o = Instance.new(class)
+        local parent = props.Parent
+        props.Parent = nil
+        for k, v in pairs(props) do o[k] = v end
+        if parent then o.Parent = parent end
+        return o
+    end
+
+    local function corner(o, r)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, r)
+        c.Parent = o
+        return c
+    end
+
+    gui = mk("ScreenGui", {
+        Name = "BFPHUD", ResetOnSpawn = false, IgnoreGuiInset = true,
+        DisplayOrder = 45, Parent = pg,
+    })
 
     -- ---------- shell ----------
-    local panel = Instance.new("Frame")
-    panel.Size = UDim2.fromOffset(430, 524)
-    panel.Position = UDim2.new(1, -442, 0, 12)
-    panel.BackgroundColor3 = Color3.fromRGB(13, 16, 22)
-    panel.BorderSizePixel = 0
-    panel.Active = true
-    panel.Draggable = true
-    panel.Parent = gui
-    local pc = Instance.new("UICorner") pc.CornerRadius = UDim.new(0, 8) pc.Parent = panel
+    local panel = mk("Frame", {
+        Size = UDim2.fromOffset(372, 548),
+        Position = UDim2.new(1, -388, 0, 16),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0,
+        Active = true, Draggable = true, Parent = gui,
+    })
+    corner(panel, 18)
+    mk("UIStroke", { Color = C.line, Transparency = 0.55, Parent = panel })
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -60, 0, 22)
-    title.Position = UDim2.fromOffset(10, 5)
-    title.BackgroundTransparency = 1
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 12
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(235, 242, 250)
-    title.Parent = panel
+    local title = mk("TextLabel", {
+        Size = UDim2.fromOffset(160, 22), Position = UDim2.fromOffset(18, 14),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 17,
+        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
+        Text = "Farm Pro", Parent = panel,
+    })
 
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.fromOffset(44, 18)
-    closeBtn.Position = UDim2.new(1, -52, 0, 6)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(62, 30, 34)
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.TextSize = 10
-    closeBtn.TextColor3 = Color3.fromRGB(255, 200, 200)
-    closeBtn.Text = "CLOSE"
-    closeBtn.Parent = panel
-    local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 4) cc.Parent = closeBtn
-    closeBtn.Activated:Connect(function()
-        P.stop()
-        gui:Destroy()
+    local dot = mk("Frame", {
+        Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(252, 21),
+        BackgroundColor3 = C.faint, BorderSizePixel = 0, Parent = panel,
+    })
+    corner(dot, 4)
+
+    local stateLbl = mk("TextLabel", {
+        Size = UDim2.fromOffset(60, 16), Position = UDim2.fromOffset(264, 17),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
+        Text = "idle", Parent = panel,
+    })
+
+    local hideBtn = mk("TextButton", {
+        Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, -40, 0, 13),
+        BackgroundColor3 = C.card, Font = Enum.Font.GothamBold, TextSize = 14,
+        TextColor3 = C.dim, Text = "×", AutoButtonColor = false, Parent = panel,
+    })
+    corner(hideBtn, 13)
+
+    -- Hidden, not destroyed. Closing a panel should never end the run, and a
+    -- run with no way back to its controls is worse than no panel at all.
+    local restore = mk("TextButton", {
+        Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -60, 0, 16),
+        BackgroundColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 16,
+        TextColor3 = C.text, Text = "BF", Visible = false, Parent = gui,
+    })
+    corner(restore, 22)
+    hideBtn.Activated:Connect(function()
+        panel.Visible = false
+        restore.Visible = true
+    end)
+    restore.Activated:Connect(function()
+        panel.Visible = true
+        restore.Visible = false
     end)
 
-    local statusLbl = Instance.new("TextLabel")
-    statusLbl.Size = UDim2.new(1, -20, 0, 15)
-    statusLbl.Position = UDim2.fromOffset(10, 26)
-    statusLbl.BackgroundTransparency = 1
-    statusLbl.Font = Enum.Font.Code
-    statusLbl.TextSize = 10
-    statusLbl.TextXAlignment = Enum.TextXAlignment.Left
-    statusLbl.TextColor3 = Color3.fromRGB(150, 170, 190)
-    statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    statusLbl.Parent = panel
+    -- ---------- primary action ----------
+    local runBtn = mk("TextButton", {
+        Size = UDim2.new(1, -36, 0, 44), Position = UDim2.fromOffset(18, 48),
+        BackgroundColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 15,
+        TextColor3 = C.text, Text = "Start farming", AutoButtonColor = false,
+        Parent = panel,
+    })
+    corner(runBtn, 13)
+
+    local statusLbl = mk("TextLabel", {
+        Size = UDim2.new(1, -36, 0, 14), Position = UDim2.fromOffset(18, 98),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
+        TextTruncate = Enum.TextTruncate.AtEnd, Text = "", Parent = panel,
+    })
 
     -- ---------- tabs ----------
-    local TABS = { "FARM", "COMBAT", "MOVE", "QUEST", "TRAVEL", "INFO" }
-    local pages, tabBtns = {}, {}
-    local current = "FARM"
+    local TABS = { "Farm", "Quest", "Travel", "Setup", "Stats" }
+    local pages, segs = {}, {}
+    local current = "Farm"
+
+    local segBG = mk("Frame", {
+        Size = UDim2.new(1, -36, 0, 30), Position = UDim2.fromOffset(18, 118),
+        BackgroundColor3 = C.card, BorderSizePixel = 0, Parent = panel,
+    })
+    corner(segBG, 9)
 
     local function showTab(name)
         current = name
-        for n, page in pairs(pages) do
-            page.Visible = (n == name)
-        end
-        for n, b in pairs(tabBtns) do
-            b.BackgroundColor3 = (n == name)
-                and Color3.fromRGB(44, 58, 82) or Color3.fromRGB(24, 29, 38)
+        for n, page in pairs(pages) do page.Visible = (n == name) end
+        for n, b in pairs(segs) do
+            b.BackgroundColor3 = (n == name) and C.card2 or C.card
+            b.TextColor3 = (n == name) and C.text or C.dim
         end
     end
 
     for i, name in ipairs(TABS) do
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(66, 22)
-        b.Position = UDim2.fromOffset(8 + (i - 1) * 69, 45)
-        b.BackgroundColor3 = Color3.fromRGB(24, 29, 38)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 10
-        b.TextColor3 = Color3.fromRGB(215, 228, 240)
-        b.Text = name
-        b.Parent = panel
-        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 4) bc.Parent = b
+        local b = mk("TextButton", {
+            Size = UDim2.new(1 / #TABS, -4, 1, -6),
+            Position = UDim2.new((i - 1) / #TABS, 2, 0, 3),
+            BackgroundColor3 = C.card, Font = Enum.Font.GothamMedium, TextSize = 11,
+            TextColor3 = C.dim, Text = name, AutoButtonColor = false, Parent = segBG,
+        })
+        corner(b, 7)
         b.Activated:Connect(function() showTab(name) end)
-        tabBtns[name] = b
+        segs[name] = b
 
-        local page = Instance.new("ScrollingFrame")
-        page.Size = UDim2.new(1, -16, 1, -78)
-        page.Position = UDim2.fromOffset(8, 72)
-        page.BackgroundTransparency = 1
-        page.BorderSizePixel = 0
-        page.ScrollBarThickness = 6
-        page.CanvasSize = UDim2.new(0, 0, 0, 0)
-        page.Visible = false
-        page.Parent = panel
-        local l = Instance.new("UIListLayout")
-        l.SortOrder = Enum.SortOrder.LayoutOrder
-        l.Padding = UDim.new(0, 4)
-        l.Parent = page
-        -- grow the canvas with the content so nothing is ever unreachable
+        local page = mk("ScrollingFrame", {
+            Size = UDim2.new(1, -24, 1, -166), Position = UDim2.fromOffset(12, 158),
+            BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+            ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(),
+            Visible = false, Parent = panel,
+        })
+        local l = mk("UIListLayout", {
+            SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), Parent = page,
+        })
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = page })
         l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-            page.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 12)
+            page.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 16)
         end)
         pages[name] = page
     end
 
-    -- ---------- widget helpers ----------
+    -- =====================================================
+    -- WIDGETS
+    -- =====================================================
+    local live = {}
     local order = 0
-    local function nextOrder() order = order + 1 return order end
+    local function nextOrder() order += 1 return order end
 
-    local function row(parent, height)
-        local f = Instance.new("Frame")
-        f.Size = UDim2.new(1, 0, 0, height or 24)
-        f.BackgroundTransparency = 1
-        f.LayoutOrder = nextOrder()
-        f.Parent = parent
-        return f
+    -- One shared drag handler for every slider. Per-slider connections leak
+    -- and fight each other; one pointer to the slider being dragged does not.
+    local dragTarget = nil
+    UIS.InputChanged:Connect(function(i)
+        if dragTarget and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            dragTarget(i.Position.X)
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragTarget = nil
+        end
+    end)
+
+    local function group(page, heading)
+        if heading then
+            mk("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+                Font = Enum.Font.GothamBold, TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
+                Text = string.upper(heading), LayoutOrder = nextOrder(), Parent = page,
+            })
+        end
+        local card = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = C.card, BorderSizePixel = 0,
+            LayoutOrder = nextOrder(), Parent = page,
+        })
+        corner(card, 14)
+        mk("UIListLayout", {
+            SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2), Parent = card,
+        })
+        mk("UIPadding", {
+            PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+            PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = card,
+        })
+        return card
     end
 
-    local function label(parent, text, size, colour)
-        local t = Instance.new("TextLabel")
-        t.Size = UDim2.new(1, 0, 0, 16)
-        t.BackgroundTransparency = 1
-        t.Font = Enum.Font.GothamBold
-        t.TextSize = size or 10
-        t.TextXAlignment = Enum.TextXAlignment.Left
-        t.TextColor3 = colour or Color3.fromRGB(130, 148, 168)
-        t.Text = text
-        t.LayoutOrder = nextOrder()
-        t.Parent = parent
+    local function note(parent, text)
+        return mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
+            TextWrapped = true, Text = text, LayoutOrder = nextOrder(), Parent = parent,
+        })
+    end
+
+    local function infoLine(parent, get)
+        local t = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
+            TextWrapped = true, Text = "", LayoutOrder = nextOrder(), Parent = parent,
+        })
+        table.insert(live, function() t.Text = get() end)
         return t
     end
 
-    -- a button that reports its own state through a refresh function
-    local live = {}
-    local function button(parent, x, w, text, colour, cb, refresh)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(w, 22)
-        b.Position = UDim2.fromOffset(x, 0)
-        b.BackgroundColor3 = colour
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 10
-        b.TextColor3 = Color3.fromRGB(238, 244, 250)
-        b.Text = text
-        b.Parent = parent
-        local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 4) bc.Parent = b
+    local function switch(parent, titleText, sub, get, set)
+        local h = sub and 46 or 34
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = parent,
+        })
+        mk("TextLabel", {
+            Size = UDim2.new(1, -60, 0, 18), Position = UDim2.fromOffset(0, sub and 5 or 8),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
+            Text = titleText, Parent = f,
+        })
+        if sub then
+            mk("TextLabel", {
+                Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(0, 24),
+                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.faint,
+                Text = sub, Parent = f,
+            })
+        end
+        local pill = mk("TextButton", {
+            Size = UDim2.fromOffset(44, 25), Position = UDim2.new(1, -44, 0, (h - 25) / 2),
+            BackgroundColor3 = C.line, Text = "", AutoButtonColor = false, Parent = f,
+        })
+        corner(pill, 13)
+        local knob = mk("Frame", {
+            Size = UDim2.fromOffset(21, 21), Position = UDim2.fromOffset(2, 2),
+            BackgroundColor3 = C.text, BorderSizePixel = 0, Parent = pill,
+        })
+        corner(knob, 11)
+        local function redraw()
+            local on = get() and true or false
+            pill.BackgroundColor3 = on and C.green or C.line
+            knob.Position = UDim2.fromOffset(on and 21 or 2, 2)
+        end
+        pill.Activated:Connect(function() set(not get()) redraw() end)
+        table.insert(live, redraw)
+        redraw()
+        return f
+    end
+
+    local function slider(parent, titleText, minV, maxV, stepV, get, set, unit)
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 50), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = parent,
+        })
+        mk("TextLabel", {
+            Size = UDim2.new(1, -80, 0, 16), Position = UDim2.fromOffset(0, 6),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.text,
+            Text = titleText, Parent = f,
+        })
+        local val = mk("TextLabel", {
+            Size = UDim2.fromOffset(80, 16), Position = UDim2.new(1, -80, 0, 6),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = C.accent,
+            Text = "", Parent = f,
+        })
+        local track = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 6), Position = UDim2.fromOffset(0, 32),
+            BackgroundColor3 = C.card2, BorderSizePixel = 0, Parent = f,
+        })
+        corner(track, 3)
+        local fill = mk("Frame", {
+            Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.accent,
+            BorderSizePixel = 0, Parent = track,
+        })
+        corner(fill, 3)
+        local knob = mk("Frame", {
+            Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = C.text,
+            BorderSizePixel = 0, ZIndex = 2, Parent = track,
+        })
+        corner(knob, 8)
+
+        local function redraw()
+            local v = tonumber(get()) or minV
+            local a = math.clamp((v - minV) / math.max(maxV - minV, 0.001), 0, 1)
+            fill.Size = UDim2.fromScale(a, 1)
+            knob.Position = UDim2.new(a, 0, 0.5, 0)
+            val.Text = ((stepV < 1) and string.format("%.2f", v) or tostring(math.floor(v)))
+                .. (unit or "")
+        end
+        local function apply(x)
+            local a = math.clamp((x - track.AbsolutePosition.X)
+                / math.max(track.AbsoluteSize.X, 1), 0, 1)
+            local v = minV + a * (maxV - minV)
+            v = math.floor(v / stepV + 0.5) * stepV
+            v = math.clamp(v, minV, maxV)
+            if stepV < 1 then v = tonumber(string.format("%.2f", v)) end
+            set(v)
+            redraw()
+        end
+        track.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1
+                or i.UserInputType == Enum.UserInputType.Touch then
+                dragTarget = apply
+                apply(i.Position.X)
+            end
+        end)
+        table.insert(live, redraw)
+        redraw()
+        return f
+    end
+
+    local function button(parent, text, kind, cb, refresh)
+        local fills = { primary = C.accent, good = C.green, bad = C.red, plain = C.card2 }
+        local b = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = fills[kind] or C.card2,
+            Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.text,
+            Text = text, AutoButtonColor = false, LayoutOrder = nextOrder(), Parent = parent,
+        })
+        corner(b, 10)
         b.Activated:Connect(function() pcall(cb, b) end)
         if refresh then table.insert(live, function() pcall(refresh, b) end) end
         return b
     end
 
-    -- numeric stepper:  label  [-] value [+]
-    local function stepper(parent, name, get, set, step, minV, maxV)
-        local f = row(parent, 24)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.fromOffset(150, 22)
-        lbl.BackgroundTransparency = 1
-        lbl.Font = Enum.Font.Code
-        lbl.TextSize = 11
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.TextColor3 = Color3.fromRGB(180, 198, 216)
-        lbl.Parent = f
-        local function redraw() lbl.Text = name .. ": " .. tostring(get()) end
-        redraw()
-        table.insert(live, redraw)
+    -- two buttons on one line
+    local function buttonPair(parent, aText, aKind, aCb, bText, bKind, bCb)
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = parent,
+        })
+        local fills = { primary = C.accent, good = C.green, bad = C.red, plain = C.card2 }
+        local function half(text, kind, cb, x)
+            local b = mk("TextButton", {
+                Size = UDim2.new(0.5, -4, 1, 0), Position = UDim2.new(x, x == 0 and 0 or 4, 0, 0),
+                BackgroundColor3 = fills[kind] or C.card2, Font = Enum.Font.GothamMedium,
+                TextSize = 13, TextColor3 = C.text, Text = text,
+                AutoButtonColor = false, Parent = f,
+            })
+            corner(b, 10)
+            b.Activated:Connect(function() pcall(cb, b) end)
+            return b
+        end
+        return half(aText, aKind, aCb, 0), half(bText, bKind, bCb, 0.5)
+    end
 
-        button(f, 158, 28, "-", Color3.fromRGB(44, 34, 38), function()
-            set(math.max(minV, get() - step)) redraw()
-        end)
-        button(f, 190, 28, "+", Color3.fromRGB(32, 48, 40), function()
-            set(math.min(maxV, get() + step)) redraw()
-        end)
+    local function textbox(parent, placeholder, actionText, cb)
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = parent,
+        })
+        local tb = mk("TextBox", {
+            Size = UDim2.new(1, -92, 1, 0), BackgroundColor3 = C.card2,
+            BorderSizePixel = 0, ClearTextOnFocus = false, Font = Enum.Font.Gotham,
+            TextSize = 12, TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
+            PlaceholderText = placeholder, PlaceholderColor3 = C.faint, Text = "",
+            Parent = f,
+        })
+        corner(tb, 10)
+        mk("UIPadding", { PaddingLeft = UDim.new(0, 10), Parent = tb })
+        local b = mk("TextButton", {
+            Size = UDim2.fromOffset(86, 36), Position = UDim2.new(1, -86, 0, 0),
+            BackgroundColor3 = C.card2, Font = Enum.Font.GothamMedium, TextSize = 12,
+            TextColor3 = C.text, Text = actionText, AutoButtonColor = false, Parent = f,
+        })
+        corner(b, 10)
+        local function fire()
+            local v = (tb.Text:gsub("^%s+", ""):gsub("%s+$", ""))
+            pcall(cb, v, tb)
+        end
+        b.Activated:Connect(fire)
+        tb.FocusLost:Connect(function(enter) if enter then fire() end end)
+        return tb
+    end
+
+    local function segmented(parent, items, get, set)
+        local f = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.card2,
+            BorderSizePixel = 0, LayoutOrder = nextOrder(), Parent = parent,
+        })
+        corner(f, 9)
+        for i, it in ipairs(items) do
+            local b = mk("TextButton", {
+                Size = UDim2.new(1 / #items, -4, 1, -6),
+                Position = UDim2.new((i - 1) / #items, 2, 0, 3),
+                BackgroundColor3 = C.card2, Font = Enum.Font.GothamMedium, TextSize = 12,
+                TextColor3 = C.dim, Text = it[1], AutoButtonColor = false, Parent = f,
+            })
+            corner(b, 7)
+            b.Activated:Connect(function() set(it[2]) end)
+            table.insert(live, function()
+                local on = (get() == it[2])
+                b.BackgroundColor3 = on and C.accent or C.card2
+                b.TextColor3 = on and C.text or C.dim
+            end)
+        end
         return f
     end
 
-    local ON  = Color3.fromRGB(34, 74, 46)
-    local OFF = Color3.fromRGB(46, 34, 38)
-    local NEU = Color3.fromRGB(32, 42, 58)
+    -- A scrolling list of tappable rows, rebuilt only when its contents change.
+    local function listView(parent, height)
+        local box = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, height), BackgroundColor3 = C.card,
+            BorderSizePixel = 0, LayoutOrder = nextOrder(), Parent = parent,
+        })
+        corner(box, 14)
+        local sf = mk("ScrollingFrame", {
+            Size = UDim2.new(1, -12, 1, -12), Position = UDim2.fromOffset(6, 6),
+            BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+            ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(), Parent = box,
+        })
+        local l = mk("UIListLayout", { Padding = UDim.new(0, 2), Parent = sf })
+        l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            sf.CanvasSize = UDim2.new(0, 0, 0, l.AbsoluteContentSize.Y + 4)
+        end)
+        return sf
+    end
+
+    local function listRow(sf, text, tagText, tagColour, cb, i)
+        local b = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card2,
+            BackgroundTransparency = 0.45, Font = Enum.Font.Gotham, TextSize = 12,
+            TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "  " .. text, AutoButtonColor = false, LayoutOrder = i, Parent = sf,
+        })
+        corner(b, 8)
+        if tagText and tagText ~= "" then
+            mk("TextLabel", {
+                Size = UDim2.fromOffset(84, 30), Position = UDim2.new(1, -92, 0, 0),
+                BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                TextColor3 = tagColour or C.dim, Text = tagText, Parent = b,
+            })
+        end
+        b.Activated:Connect(function() pcall(cb) end)
+        return b
+    end
 
     -- =====================================================
-    -- FARM TAB
+    -- FARM
     -- =====================================================
+    -- selection[name] = "farm" | "backup" | nil
+    local selection = {}
+    local function selectionLists()
+        local prim, back = {}, {}
+        for n, kind in pairs(selection) do
+            if kind == "farm" then table.insert(prim, n)
+            elseif kind == "backup" then table.insert(back, n) end
+        end
+        table.sort(prim) table.sort(back)
+        return prim, back
+    end
+
+    local function startFarm()
+        local prim, back = selectionLists()
+        P.setSecondary(back)
+        task.spawn(function()
+            if #prim > 0 then P.start(prim, {}) else P.start(nil, {}) end
+        end)
+    end
+
     do
-        local page = pages.FARM
-        label(page, "RUN")
-        local r1 = row(page)
-        button(r1, 0, 110, "START", ON, function()
-            if P.running then P.stop()
-            else task.spawn(function() P.start(P.lastNames, P.lastOpts) end) end
-        end, function(b)
-            b.Text = P.running and "STOP" or "START"
-            b.BackgroundColor3 = P.running and OFF or ON
-        end)
-        button(r1, 118, 120, "ANY ENEMY", NEU, function()
-            task.spawn(function() P.start(nil, { anyEnemy = true }) end)
-        end)
-        button(r1, 246, 110, "BY LEVEL", NEU, function()
-            task.spawn(function() P.start(nil, {}) end)
-        end)
+        local page = pages.Farm
 
-        label(page, "TARGET")
-        local tgt = Instance.new("TextLabel")
-        tgt.Size = UDim2.new(1, 0, 0, 32)
-        tgt.BackgroundTransparency = 1
-        tgt.Font = Enum.Font.Code
-        tgt.TextSize = 11
-        tgt.TextXAlignment = Enum.TextXAlignment.Left
-        tgt.TextYAlignment = Enum.TextYAlignment.Top
-        tgt.TextColor3 = Color3.fromRGB(180, 198, 216)
-        tgt.TextWrapped = true
-        tgt.LayoutOrder = nextOrder()
-        tgt.Parent = page
-        table.insert(live, function()
-            local names = {}
-            if activeNames then
-                for n in pairs(activeNames) do table.insert(names, n) end
-                table.sort(names)
-            end
-            tgt.Text = #names > 0 and table.concat(names, ", ") or "any enemy"
-        end)
+        local card = group(page, "targets")
+        local list = listView(card, 154)
+        note(card, "Tap once to farm it. Tap again to keep it as a backup for when "
+            .. "the first lot are respawning. Tap a third time to drop it.")
 
-        label(page, "ONE TYPE AT A TIME")
-        local rrot = row(page)
-        button(rrot, 0, 200, "ROTATE", NEU, function()
-            CFG.RotateTypes = not CFG.RotateTypes
-        end, function(b)
-            b.Text = CFG.RotateTypes and "ROTATE: ONE TYPE" or "ROTATE: ALL AT ONCE"
-            b.BackgroundColor3 = CFG.RotateTypes and ON or NEU
-        end)
-        button(rrot, 208, 100, "NEXT TYPE", Color3.fromRGB(40, 56, 74), function()
-            pcall(P.nextType)
-        end)
-        button(rrot, 314, 100, "CENTRE", NEU, function()
-            CFG.TypeCentre = not CFG.TypeCentre
-        end, function(b)
-            b.Text = CFG.TypeCentre and "CENTRE: ON" or "CENTRE: OFF"
-            b.BackgroundColor3 = CFG.TypeCentre and ON or NEU
-        end)
-        local focusLbl = label(page, "", 11, Color3.fromRGB(210, 226, 240))
-        table.insert(live, function()
-            focusLbl.Text = "working: " .. tostring(P.focusName or "-")
-        end)
-        stepper(page, "secs per type",
-            function() return CFG.TypeDwell end,
-            function(v) CFG.TypeDwell = v end, 15, 15, 600)
-
-        -- pick a specific enemy from whatever is loaded right now
-        label(page, "PICK A LOADED ENEMY")
-        local pick = Instance.new("TextLabel")
-        pick.Size = UDim2.new(1, 0, 0, 16)
-        pick.BackgroundTransparency = 1
-        pick.Font = Enum.Font.Code
-        pick.TextSize = 11
-        pick.TextXAlignment = Enum.TextXAlignment.Left
-        pick.TextColor3 = Color3.fromRGB(210, 226, 240)
-        pick.LayoutOrder = nextOrder()
-        pick.Parent = page
-
-        local loadedNames, pickIdx = {}, 1
-        local function refreshLoaded()
+        local signature = ""
+        local function refreshList()
             local seen, out = {}, {}
             local folder = workspace:FindFirstChild("Enemies")
             if folder then
                 for _, m in ipairs(folder:GetChildren()) do
                     if m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
                         local n = cleanName(m)
-                        if not seen[n] then seen[n] = true table.insert(out, n) end
+                        if not seen[n] then
+                            seen[n] = true
+                            table.insert(out, n)
+                        end
                     end
                 end
             end
+            -- anything selected but not currently streamed in stays on the list
+            for n in pairs(selection) do
+                if not seen[n] then seen[n] = true table.insert(out, n) end
+            end
             table.sort(out)
-            loadedNames = out
-            if pickIdx > #out then pickIdx = 1 end
-            pick.Text = (#out > 0)
-                and ("> " .. tostring(out[pickIdx]) .. "   (" .. #out .. " types loaded)")
-                or "> nothing loaded"
+
+            local sig = table.concat(out, "|")
+            for n, k in pairs(selection) do sig = sig .. "#" .. n .. k end
+            if sig == signature then return end
+            signature = sig
+
+            for _, c in ipairs(list:GetChildren()) do
+                if c:IsA("GuiObject") then c:Destroy() end
+            end
+            if #out == 0 then
+                listRow(list, "nothing loaded here yet", "", C.faint, function() end, 1)
+                return
+            end
+            for i, n in ipairs(out) do
+                local kind = selection[n]
+                local tag = (kind == "farm" and "FARM")
+                    or (kind == "backup" and "BACKUP") or ""
+                local col = (kind == "farm" and C.accent)
+                    or (kind == "backup" and C.dim) or C.faint
+                listRow(list, n, tag, col, function()
+                    if selection[n] == nil then selection[n] = "farm"
+                    elseif selection[n] == "farm" then selection[n] = "backup"
+                    else selection[n] = nil end
+                    refreshList()
+                end, i)
+            end
         end
-        refreshLoaded()
-        table.insert(live, refreshLoaded)
+        refreshList()
+        table.insert(live, refreshList)
 
-        -- Multi-select. ADD keeps stacking names onto one target set, so a
-        -- single run can cover several enemy types on the same island.
-        local selected = {}
-        local function selList()
-            local out = {}
-            for n in pairs(selected) do table.insert(out, n) end
-            table.sort(out)
-            return out
-        end
+        buttonPair(page,
+            "Farm by level", "plain", function()
+                table.clear(selection)
+                P.setSecondary(nil)
+                task.spawn(function() P.start(nil, {}) end)
+            end,
+            "Farm anything", "plain", function()
+                table.clear(selection)
+                P.setSecondary(nil)
+                task.spawn(function() P.start(nil, { anyEnemy = true }) end)
+            end)
 
-        local r2 = row(page)
-        button(r2, 0, 96, "< PREV", NEU, function()
-            if #loadedNames > 0 then
-                pickIdx = ((pickIdx - 2) % #loadedNames) + 1
-                refreshLoaded()
-            end
-        end)
-        button(r2, 100, 96, "NEXT >", NEU, function()
-            if #loadedNames > 0 then
-                pickIdx = (pickIdx % #loadedNames) + 1
-                refreshLoaded()
-            end
-        end)
-        button(r2, 200, 96, "ADD", Color3.fromRGB(40, 56, 74), function()
-            local n = loadedNames[pickIdx]
-            if n then selected[n] = true end
-        end)
-        button(r2, 302, 112, "ONLY THIS", Color3.fromRGB(44, 62, 40), function()
-            local n = loadedNames[pickIdx]
-            if n then
-                table.clear(selected)
-                selected[n] = true
-                task.spawn(function() P.start({ n }, {}) end)
-            end
-        end)
-
-        label(page, "SELECTED")
-        local sel = Instance.new("TextLabel")
-        sel.Size = UDim2.new(1, 0, 0, 30)
-        sel.BackgroundTransparency = 1
-        sel.Font = Enum.Font.Code
-        sel.TextSize = 11
-        sel.TextXAlignment = Enum.TextXAlignment.Left
-        sel.TextYAlignment = Enum.TextYAlignment.Top
-        sel.TextColor3 = Color3.fromRGB(210, 226, 240)
-        sel.TextWrapped = true
-        sel.LayoutOrder = nextOrder()
-        sel.Parent = page
-        table.insert(live, function()
-            local l = selList()
-            sel.Text = #l > 0 and table.concat(l, ", ") or "(none - ADD some, or type below)"
-        end)
-
-        local r3 = row(page)
-        button(r3, 0, 200, "FARM SELECTED", Color3.fromRGB(44, 62, 40), function()
-            local l = selList()
-            if #l > 0 then task.spawn(function() P.start(l, {}) end) end
-        end)
-        button(r3, 208, 110, "CLEAR", Color3.fromRGB(46, 34, 38), function()
-            table.clear(selected)
-        end)
-
-        -- Type any name, even one not currently streamed in.
-        label(page, "OR TYPE NAMES  (comma separated)")
-        local boxRow = row(page, 24)
-        local tb = Instance.new("TextBox")
-        tb.Size = UDim2.fromOffset(300, 22)
-        tb.BackgroundColor3 = Color3.fromRGB(22, 27, 35)
-        tb.BorderSizePixel = 0
-        tb.ClearTextOnFocus = false
-        tb.Font = Enum.Font.Code
-        tb.TextSize = 11
-        tb.TextXAlignment = Enum.TextXAlignment.Left
-        tb.TextColor3 = Color3.fromRGB(225, 236, 246)
-        tb.PlaceholderText = "Swan Pirate, Marine Commodore"
-        tb.Text = ""
-        tb.Parent = boxRow
-        local tc = Instance.new("UICorner") tc.CornerRadius = UDim.new(0, 4) tc.Parent = tb
-
-        button(boxRow, 308, 106, "FARM TYPED", Color3.fromRGB(44, 62, 40), function()
-            local names = {}
-            for word in string.gmatch(tb.Text, "[^,]+") do
+        textbox(page, "or type names: Swan Pirate, Raider", "Use", function(v)
+            if #v == 0 then return end
+            table.clear(selection)
+            for word in string.gmatch(v, "[^,]+") do
                 word = (word:gsub("^%s+", ""):gsub("%s+$", ""))
-                if #word > 0 then table.insert(names, word) end
+                if #word > 0 then selection[word] = "farm" end
             end
-            if #names > 0 then
-                table.clear(selected)
-                for _, n in ipairs(names) do selected[n] = true end
-                task.spawn(function() P.start(names, {}) end)
-            end
+            startFarm()
+        end)
+
+        local rot = group(page, "rotation")
+        switch(rot, "One type at a time",
+            "Each species has its own patch of ground and its own leash",
+            function() return CFG.RotateTypes end,
+            function(v) CFG.RotateTypes = v end)
+        switch(rot, "Stand in the middle of them", nil,
+            function() return CFG.TypeCentre end,
+            function(v) CFG.TypeCentre = v end)
+        slider(rot, "Minutes per type", 0.5, 10, 0.5,
+            function() return CFG.TypeDwell / 60 end,
+            function(v) CFG.TypeDwell = math.floor(v * 60) end, " min")
+        button(rot, "Switch type now", "plain", function() pcall(P.nextType) end)
+
+        local mag = group(page, "magnet")
+        switch(mag, "Pull enemies to me",
+            "Drags them into weapon range instead of you chasing them",
+            function() return CFG.Magnet end,
+            function(v)
+                CFG.Magnet = v
+                syncPuller()
+                if v then startStabilizer() end
+            end)
+        slider(mag, "Distance in front", 0, 100, 1,
+            function() return CFG.MagnetDistance end,
+            function(v) CFG.MagnetDistance = v end, " studs")
+        slider(mag, "Height  (+ up  /  - down)", -80, 80, 1,
+            function() return CFG.MagnetHeight end,
+            function(v) CFG.MagnetHeight = v end, " studs")
+        switch(mag, "Keep them on the ground",
+            "Ignores height - they stand where they normally stand",
+            function() return CFG.MagnetGround end,
+            function(v) CFG.MagnetGround = v end)
+        slider(mag, "How spread out", 1, 40, 1,
+            function() return CFG.MagnetSpread end,
+            function(v) CFG.MagnetSpread = v end, " studs")
+        switch(mag, "Aim down at the pile",
+            "A standing swing is flat and passes over them",
+            function() return CFG.FaceStack end,
+            function(v) CFG.FaceStack = v end)
+        switch(mag, "Pull every enemy", "Off = only what you selected",
+            function() return CFG.MagnetAllTypes end,
+            function(v) CFG.MagnetAllTypes = v end)
+        infoLine(mag, function()
+            return string.format(
+                "holding %d  ·  nearest one is %d studs from you  ·  %d left alone",
+                stats.pulled or 0, stats.nearestHeld or 0, stats.outOfLeash or 0)
+        end)
+        note(mag, "If anything is still landing on you, raise Distance in front "
+            .. "until the nearest-one number is past their reach. Their melee is "
+            .. "shorter than yours.")
+        button(mag, "Move me to the biggest group", "plain", function()
+            task.spawn(function()
+                local c, n = P.packCentre()
+                if c then
+                    clearHold()
+                    moveTo(c + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
+                    setAnchor(c, nil)
+                    say(string.format("moved to the group (%d reachable)", n))
+                else
+                    say("no enemies to gather")
+                end
+            end)
         end)
     end
 
     -- =====================================================
-    -- COMBAT TAB
+    -- QUEST
     -- =====================================================
     do
-        local page = pages.COMBAT
-        label(page, "ATTACK MODE")
-        local r1 = row(page)
-        local MODES = { "SKILLS", "M1", "BOTH", "M1HOLD" }
-        for i, m in ipairs(MODES) do
-            button(r1, (i - 1) * 104, 100, m, NEU, function()
-                CFG.AttackMode = m
-                if m ~= "M1HOLD" then pcall(P.releaseM1) end
+        local page = pages.Quest
+
+        local card = group(page, "quest loop")
+        switch(card, "Run quests automatically",
+            "Take it, kill the count, take the next one",
+            function() return CFG.AutoQuest end,
+            function(v)
+                CFG.AutoQuest = v
+                if v then
+                    pcall(P.armQuest)
+                    say("quest loop on")
+                end
+            end)
+        infoLine(card, function()
+            local q = P.readQuest and P.readQuest() or nil
+            if q then
+                return string.format("On a quest  ·  %d of %d  ·  %s",
+                    q.have, q.need, q.enemy or "target")
+            end
+            return "No quest running right now"
+        end)
+        infoLine(card, function() return tostring(P.lastQuestResult or "") end)
+        button(card, "Take a quest now", "primary", function()
+            task.spawn(function() pcall(P.acceptQuest) end)
+        end)
+
+        local giver = group(page, "quest giver")
+        infoLine(giver, function()
+            local e = P.currentEnemy()
+            local name, spot = P.giverFor(e)
+            return string.format("For %s: %s%s", tostring(e or "-"),
+                name and ("\"" .. name .. "\"") or "nearest ? marker",
+                spot and "  ·  exact spot saved" or "")
+        end)
+        switch(giver, "Use the closest ? giver",
+            "When no name is set, take the nearest NPC with the quest marker",
+            function() return CFG.QuestGiverClosest end,
+            function(v) CFG.QuestGiverClosest = v end)
+        note(giver, "Each island's giver has its own name - Adventurer, Villager, "
+            .. "and so on. Nothing is guessed: whichever NPC an accept actually "
+            .. "works at is remembered against that enemy and reused from then on.")
+        buttonPair(giver,
+            "Save this spot", "plain", function() pcall(P.setGiverHere) end,
+            "Forget spot", "plain", function() pcall(P.clearGiver) end)
+        switch(giver, "Walk to the giver first", "Some islands refuse it from range",
+            function() return CFG.QuestHopToGiver end,
+            function(v) CFG.QuestHopToGiver = v end)
+        switch(giver, "Return to the farm after", nil,
+            function() return CFG.QuestReturnToFarm end,
+            function(v) CFG.QuestReturnToFarm = v end)
+        textbox(giver, "giver name, e.g. Adventurer", "Set", function(v)
+            CFG.QuestGiverName = (#v > 0) and v or nil
+            say("giver name: " .. tostring(CFG.QuestGiverName or "any"))
+        end)
+
+        local adv = group(page, "which quest")
+        infoLine(adv, function()
+            local lk = P.lockedQuest
+            if lk and CFG.QuestLock ~= false then
+                return string.format("LOCKED on %s tier %d  ·  for %s",
+                    tostring(lk.name), lk.tier or 1, tostring(lk.enemy or "-"))
+            end
+            local qn, tier, enemy = P.questForNames()
+            if CFG.QuestName then qn = CFG.QuestName end
+            if CFG.QuestTier then tier = CFG.QuestTier end
+            return string.format("%s  tier %s  ·  for %s",
+                tostring(qn or "unknown"), tostring(tier or 1), tostring(enemy or "-"))
+        end)
+        switch(adv, "Keep repeating this quest",
+            "Chosen once, then the loop stays on it",
+            function() return CFG.QuestLock end,
+            function(v) CFG.QuestLock = v end)
+        button(adv, "Forget the locked quest", "plain", function()
+            P.lockedQuest = nil
+            say("quest unlocked - the next accept picks from your targets")
+        end)
+        segmented(adv, { { "Tier 1", 1 }, { "Tier 2", 2 }, { "Tier 3", 3 }, { "Auto", false } },
+            function() return CFG.QuestTier or false end,
+            function(v) CFG.QuestTier = v or nil end)
+        textbox(adv, "override quest name, e.g. JungleQuest", "Set", function(v)
+            CFG.QuestName = (#v > 0) and v or nil
+            say("quest name: " .. tostring(CFG.QuestName or "auto"))
+        end)
+        note(adv, "A quest is never re-taken while its count is running: asking "
+            .. "again would reset it to zero.")
+
+        local dbg = group(page, "if it cannot find the giver")
+        local scanTxt = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
+            Text = "Scan lists the NPCs around you and what marked them.",
+            LayoutOrder = nextOrder(), Parent = dbg,
+        })
+        buttonPair(dbg,
+            "Scan for NPCs", "plain", function()
+                scanTxt.Text = table.concat(P.questScan(400), "\n")
+            end,
+            "Probe nearest", "plain", function()
+                scanTxt.Text = table.concat(P.questProbe(), "\n")
+            end)
+    end
+
+    -- =====================================================
+    -- TRAVEL
+    -- =====================================================
+    do
+        local page = pages.Travel
+        local chosen = nil
+        local filter = ""
+
+        local card = group(page, "teleport")
+        infoLine(card, function()
+            if not chosen then return "Pick somewhere below." end
+            local _, root = parts()
+            local d = P.findDestination(chosen)
+            if root and d and d.pos then
+                return string.format("%s  ·  %.0f studs away", chosen,
+                    (d.pos - root.Position).Magnitude)
+            end
+            return chosen
+        end)
+        button(card, "Teleport", "primary", function()
+            if not chosen then say("pick a destination first") return end
+            task.spawn(function() pcall(P.travelTo, chosen) end)
+        end, function(b)
+            b.Text = P.travelling() and "Teleporting..."
+                or (chosen and ("Teleport to " .. chosen) or "Teleport")
+            b.BackgroundColor3 = P.travelling() and C.card2 or C.accent
+        end)
+        segmented(card, { { "Auto", "auto" }, { "Fly", "fly" }, { "Respawn", "respawn" } },
+            function() return CFG.TeleportMode end,
+            function(v) CFG.TeleportMode = v end)
+        segmented(card, { { "Instant", "instant" }, { "Stepped", "stepped" } },
+            function() return CFG.TeleportStyle end,
+            function(v) CFG.TeleportStyle = v end)
+        note(card, "Instant is one CFrame write - the same thing the game's own "
+            .. "house button does. If a server snaps you back, it crosses in "
+            .. "small steps instead, on its own. Respawn is the old spawn point "
+            .. "trick, kept only because it still works on some servers.")
+        slider(card, "Countdown", 0, 8, 0.5,
+            function() return CFG.TeleportCountdown end,
+            function(v) CFG.TeleportCountdown = v end, "s")
+        infoLine(card, function() return tostring(P.lastTravel or "") end)
+
+        local listCard = group(page, "where to")
+        local sbox = textbox(listCard, "search islands and farm spots", "Clear",
+            function(_, tb) tb.Text = "" filter = "" end)
+        sbox:GetPropertyChangedSignal("Text"):Connect(function()
+            filter = string.lower(sbox.Text)
+        end)
+        local list = listView(listCard, 190)
+
+        local sig = ""
+        local function refreshDest()
+            local all = P.destinations()
+            local out = {}
+            for _, d in ipairs(all) do
+                if filter == "" or string.find(string.lower(d.name), filter, 1, true) then
+                    table.insert(out, d)
+                end
+            end
+            local s = tostring(#all) .. "@" .. tostring(chosen) .. "@" .. filter
+            for _, d in ipairs(out) do s = s .. d.name end
+            if s == sig then return end
+            sig = s
+            for _, c in ipairs(list:GetChildren()) do
+                if c:IsA("GuiObject") then c:Destroy() end
+            end
+            if #out == 0 then
+                listRow(list, (#all == 0) and "world still loading" or "nothing matches",
+                    "", C.faint, function() end, 1)
+                return
+            end
+            for i, d in ipairs(out) do
+                local tag = (chosen == d.name) and "SELECTED"
+                    or (d.kind == "island" and "island" or (d.label or "farm"))
+                local col = (chosen == d.name) and C.accent or C.faint
+                listRow(list, d.name, tag, col, function()
+                    chosen = d.name
+                    refreshDest()
+                end, i)
+            end
+        end
+        refreshDest()
+        table.insert(live, refreshDest)
+
+        local fl = group(page, "flight")
+        slider(fl, "Hold on arrival", 0.5, 6, 0.5,
+            function() return CFG.TeleportSettle end,
+            function(v) CFG.TeleportSettle = v end, "s")
+        note(fl, "Arriving before the island has loaded drops you through ground "
+            .. "that does not exist yet. This holds you in place until it does.")
+        slider(fl, "Cruise height", 80, 900, 20,
+            function() return CFG.TravelAltitude end,
+            function(v) CFG.TravelAltitude = v end, " studs")
+        slider(fl, "Step size", 60, 500, 20,
+            function() return CFG.TravelStep end,
+            function(v) CFG.TravelStep = v end, " studs")
+        note(fl, "Smaller steps look more like ordinary movement and stream more "
+            .. "safely. Bigger steps get there faster. 220 is the sane middle.")
+        button(fl, "Force respawn", "plain", function()
+            task.spawn(function() pcall(P.forceRespawn) end)
+        end)
+
+        local sea = group(page, "change sea")
+        note(sea, "The three seas are three separate servers, so this leaves the "
+            .. "one you are in and the farm restarts on the other side. The game "
+            .. "still checks whether you are allowed in.")
+        for _, s in ipairs(P.seas()) do
+            button(sea, s.name, "plain", function()
+                task.spawn(function() pcall(P.hopSea, s.id) end)
             end, function(b)
-                b.BackgroundColor3 = (CFG.AttackMode == m) and ON or NEU
+                b.TextColor3 = (game.PlaceId == s.id) and C.faint or C.text
+                b.Text = (game.PlaceId == s.id) and (s.name .. "  (you are here)") or s.name
             end)
         end
-        label(page, "M1 click measured ZERO damage here - the input never reaches",
-            10, Color3.fromRGB(196, 150, 110))
-        label(page, "combat. M1HOLD is an untested variant. Use MAGNET for reach.",
-            10, Color3.fromRGB(196, 150, 110))
+    end
 
-        label(page, "WEAPON")
-        local wpn = Instance.new("TextLabel")
-        wpn.Size = UDim2.new(1, 0, 0, 16)
-        wpn.BackgroundTransparency = 1
-        wpn.Font = Enum.Font.Code
-        wpn.TextSize = 11
-        wpn.TextXAlignment = Enum.TextXAlignment.Left
-        wpn.TextColor3 = Color3.fromRGB(210, 226, 240)
-        wpn.LayoutOrder = nextOrder()
-        wpn.Parent = page
+    -- =====================================================
+    -- SETUP
+    -- =====================================================
+    do
+        local page = pages.Setup
 
+        local atk = group(page, "attack")
+        segmented(atk, { { "Skills", "SKILLS" }, { "M1", "M1" },
+                         { "Both", "BOTH" }, { "Hold", "M1HOLD" } },
+            function() return CFG.AttackMode end,
+            function(v)
+                CFG.AttackMode = v
+                if v ~= "M1HOLD" then pcall(P.releaseM1) end
+            end)
+        note(atk, "Skills are the only input measured to land on this executor. "
+            .. "M1 is kept because it costs nothing to try on a new one.")
+
+        local keyRow = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1,
+            LayoutOrder = nextOrder(), Parent = atk,
+        })
+        local ALLK = {
+            { "Z", Enum.KeyCode.Z }, { "X", Enum.KeyCode.X }, { "C", Enum.KeyCode.C },
+            { "V", Enum.KeyCode.V }, { "F", Enum.KeyCode.F },
+        }
+        local function hasKey(kc)
+            for _, k in ipairs(CFG.SkillKeys) do if k == kc then return true end end
+            return false
+        end
+        for i, pair in ipairs(ALLK) do
+            local b = mk("TextButton", {
+                Size = UDim2.new(1 / #ALLK, -6, 1, 0),
+                Position = UDim2.new((i - 1) / #ALLK, 3, 0, 0),
+                BackgroundColor3 = C.card2, Font = Enum.Font.GothamBold, TextSize = 13,
+                TextColor3 = C.text, Text = pair[1], AutoButtonColor = false, Parent = keyRow,
+            })
+            corner(b, 9)
+            b.Activated:Connect(function()
+                if hasKey(pair[2]) then
+                    for idx, k in ipairs(CFG.SkillKeys) do
+                        if k == pair[2] then table.remove(CFG.SkillKeys, idx) break end
+                    end
+                else
+                    table.insert(CFG.SkillKeys, pair[2])
+                end
+            end)
+            table.insert(live, function()
+                local on = hasKey(pair[2])
+                b.BackgroundColor3 = on and C.accent or C.card2
+                b.TextColor3 = on and C.text or C.faint
+            end)
+        end
+        note(atk, "Only the skill keys you have actually unlocked.")
+        slider(atk, "Swing gap", 0.01, 0.6, 0.01,
+            function() return CFG.AttackGap end,
+            function(v) CFG.AttackGap = v end, "s")
+        slider(atk, "Skill every N swings", 1, 12, 1,
+            function() return CFG.SkillEvery end,
+            function(v) CFG.SkillEvery = v end, "")
+        slider(atk, "Hitbox reach", 20, 400, 10,
+            function() return CFG.HitboxMagnitude end,
+            function(v) CFG.HitboxMagnitude = v end, " studs")
+        note(atk, "Hitbox reach is written straight into the combat controller, "
+            .. "so a hit registers further out than the swing animation shows. "
+            .. "The server still has the last word, so keep it sane.")
+
+        local wep = group(page, "weapon")
         local tools, tIdx = {}, 1
+        local wlbl = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.dim,
+            TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+            Text = "", LayoutOrder = nextOrder(), Parent = wep,
+        })
         local function refreshTools()
             local out = {}
             local char = player.Character
@@ -2272,20 +3606,19 @@ local function buildUI()
             tools = out
             if tIdx > #out then tIdx = 1 end
             local held = char and char:FindFirstChildOfClass("Tool")
-            wpn.Text = "holding: " .. (held and held.Name or "NONE")
-                .. "   |   pick: " .. tostring(out[tIdx] or "-")
+            wlbl.Text = "Holding " .. (held and held.Name or "nothing")
+                .. "\nPick: " .. tostring(out[tIdx] or "-")
         end
         refreshTools()
         table.insert(live, refreshTools)
-
-        local r2 = row(page)
-        button(r2, 0, 110, "< PREV", NEU, function()
-            if #tools > 0 then tIdx = ((tIdx - 2) % #tools) + 1 refreshTools() end
-        end)
-        button(r2, 118, 110, "NEXT >", NEU, function()
-            if #tools > 0 then tIdx = (tIdx % #tools) + 1 refreshTools() end
-        end)
-        button(r2, 236, 120, "USE THIS", Color3.fromRGB(44, 62, 40), function()
+        buttonPair(wep,
+            "Previous", "plain", function()
+                if #tools > 0 then tIdx = ((tIdx - 2) % #tools) + 1 refreshTools() end
+            end,
+            "Next", "plain", function()
+                if #tools > 0 then tIdx = (tIdx % #tools) + 1 refreshTools() end
+            end)
+        button(wep, "Use this weapon", "plain", function()
             local n = tools[tIdx]
             if n then
                 CFG.ForceWeapon = n
@@ -2294,428 +3627,146 @@ local function buildUI()
             end
         end)
 
-        label(page, "SKILL KEYS  (only ones you have unlocked)")
-        local r3 = row(page)
-        local ALLK = {
-            { "Z", Enum.KeyCode.Z }, { "X", Enum.KeyCode.X },
-            { "C", Enum.KeyCode.C }, { "V", Enum.KeyCode.V },
-            { "F", Enum.KeyCode.F },
-        }
-        local function hasKey(kc)
-            for _, k in ipairs(CFG.SkillKeys) do if k == kc then return true end end
-            return false
-        end
-        for i, pair in ipairs(ALLK) do
-            button(r3, (i - 1) * 60, 54, pair[1], NEU, function()
-                if hasKey(pair[2]) then
-                    for idx, k in ipairs(CFG.SkillKeys) do
-                        if k == pair[2] then table.remove(CFG.SkillKeys, idx) break end
-                    end
-                else
-                    table.insert(CFG.SkillKeys, pair[2])
-                end
-            end, function(b)
-                b.BackgroundColor3 = hasKey(pair[2]) and ON or OFF
+        local pos = group(page, "position")
+        switch(pos, "Anti-gravity hold", "Stops you sinking between swings",
+            function() return CFG.HoldAltitude end,
+            function(v)
+                CFG.HoldAltitude = v
+                if not v then clearHold() end
             end)
-        end
-
-        stepper(page, "swing gap",
-            function() return string.format("%.2f", CFG.AttackGap) end,
-            function(v) CFG.AttackGap = v end, 0.01, 0.01, 1)
-        stepper(page, "skill every N",
-            function() return CFG.SkillEvery end,
-            function(v) CFG.SkillEvery = v end, 1, 1, 12)
-    end
-
-    -- =====================================================
-    -- MOVE TAB
-    -- =====================================================
-    do
-        local page = pages.MOVE
-        label(page, "ALTITUDE")
-        local rg = row(page)
-        button(rg, 0, 200, "ANTI-GRAVITY", NEU, function()
-            CFG.HoldAltitude = not CFG.HoldAltitude
-            if not CFG.HoldAltitude then clearHold() end
-        end, function(b)
-            b.Text = CFG.HoldAltitude and "ANTI-GRAVITY: ON" or "GRAVITY: ON (will sink)"
-            b.BackgroundColor3 = CFG.HoldAltitude and ON or OFF
-        end)
-        button(rg, 208, 110, "HOLD HERE", Color3.fromRGB(40, 56, 74), function()
-            local _, r = parts()
-            if r then
-                startStabilizer()   -- the hold runs from the stabilizer loop
-                setHold(r.CFrame)
-            end
-        end)
-        button(rg, 322, 92, "RELEASE", NEU, function() clearHold() end)
-
-        label(page, "POSITION")
-        stepper(page, "hover height",
+        slider(pos, "Hover height", 2, 60, 1,
             function() return CFG.HoverHeight end,
-            function(v) CFG.HoverHeight = v end, 2, 2, 60)
-        stepper(page, "boss hover",
-            function() return CFG.BossHoverHeight end,
-            function(v) CFG.BossHoverHeight = v end, 2, 2, 80)
-        stepper(page, "secs per target",
-            function() return CFG.TargetTimeout end,
-            function(v) CFG.TargetTimeout = v end, 5, 5, 120)
-        -- straight down puts the enemy behind the swing arc; tilt aims into it
-        stepper(page, "attack tilt",
+            function(v) CFG.HoverHeight = v end, " studs")
+        slider(pos, "Extra tilt", -89, 89, 5,
             function() return CFG.AttackTilt end,
-            function(v) CFG.AttackTilt = v end, 5, -89, 89)
-
-        label(page, "MAGNET  (drags enemies into weapon range)")
-        local rm = row(page)
-        button(rm, 0, 200, "MAGNET", NEU, function()
-            CFG.Magnet = not CFG.Magnet
-            syncPuller()
-            -- collisions off, or forty stacked NPCs push you off the island
-            if CFG.Magnet then startStabilizer() end
-        end, function(b)
-            b.Text = CFG.Magnet and ("MAGNET ON  (" .. stats.pulled .. ")") or "MAGNET OFF"
-            b.BackgroundColor3 = CFG.Magnet and ON or OFF
-        end)
-        button(rm, 208, 206, "ALL TYPES", NEU, function()
-            CFG.MagnetAllTypes = not CFG.MagnetAllTypes
-        end, function(b)
-            b.Text = CFG.MagnetAllTypes and "PULLING: EVERY ENEMY" or "PULLING: SELECTED ONLY"
-            b.BackgroundColor3 = CFG.MagnetAllTypes and ON or NEU
-        end)
-        stepper(page, "magnet range",
-            function() return CFG.MagnetRange end,
-            function(v) CFG.MagnetRange = v end, 20, 20, 2000)
-        -- the cap that keeps a pulled enemy damageable
-        stepper(page, "leash radius",
-            function() return CFG.LeashRadius end,
-            function(v) CFG.LeashRadius = v end, 10, 20, 600)
-        stepper(page, "magnet distance",
-            function() return CFG.MagnetDistance end,
-            function(v) CFG.MagnetDistance = v end, 1, 2, 40)
-        stepper(page, "magnet max",
-            function() return CFG.MagnetMax end,
-            function(v) CFG.MagnetMax = v end, 5, 5, 120)
-
-        local rp = row(page)
-        button(rp, 0, 200, "GO TO PACK", Color3.fromRGB(40, 56, 74), function()
-            task.spawn(function()
-                local c, n = P.packCentre()
-                if c then
-                    clearHold()
-                    moveTo(c + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
-                    setAnchor(c, nil)
-                    say(string.format("moved to pack centre (%d in leash)", n))
-                else
-                    say("no enemies to gather")
+            function(v) CFG.AttackTilt = v end, "°")
+        note(pos, "Aim down at the pile already pitches you at it. Extra tilt is "
+            .. "on top of that, for weapons whose arc sits high or low.")
+        buttonPair(pos,
+            "Hold here", "plain", function()
+                local _, r = parts()
+                if r then
+                    startStabilizer()
+                    setHold(flatCF(r.CFrame))
                 end
-            end)
-        end)
-        local leashLbl = label(page, "")
-        table.insert(live, function()
-            leashLbl.Text = string.format(
-                "held %d   |   left alone (outside their area) %d",
-                stats.pulled, stats.outOfLeash or 0)
-        end)
-        label(page, "An NPC dragged out of its own area still arrives but takes",
-            10, Color3.fromRGB(196, 150, 110))
-        label(page, "no damage. Leash radius is the cap that prevents that.",
-            10, Color3.fromRGB(196, 150, 110))
+            end,
+            "Release", "plain", function() clearHold() end)
 
-        label(page, "ENEMY PULL  (stacks them under you instead)")
-        local r1 = row(page)
-        button(r1, 0, 170, "PULL", NEU, function()
-            CFG.PullEnemies = not CFG.PullEnemies
-            syncPuller()
-        end, function(b)
-            b.Text = CFG.PullEnemies and ("PULL ON  (" .. stats.pulled .. ")") or "PULL OFF"
-            b.BackgroundColor3 = CFG.PullEnemies and ON or OFF
+        local reach = group(page, "reach and limits")
+        slider(reach, "Magnet range", 20, 800, 20,
+            function() return CFG.MagnetRange end,
+            function(v) CFG.MagnetRange = v end, " studs")
+        slider(reach, "Leash radius", 20, 600, 10,
+            function() return CFG.LeashRadius end,
+            function(v) CFG.LeashRadius = v end, " studs")
+        note(reach, "An NPC dragged out of its own area still arrives, but takes "
+            .. "no damage. Leash radius is the cap that prevents that.")
+        slider(reach, "Most enemies held at once", 5, 120, 5,
+            function() return CFG.MagnetMax end,
+            function(v) CFG.MagnetMax = v end, "")
+        slider(reach, "Seconds per target", 5, 120, 5,
+            function() return CFG.TargetTimeout end,
+            function(v) CFG.TargetTimeout = v end, "s")
+        switch(reach, "Use backups while primaries respawn", nil,
+            function() return CFG.UseSecondary end,
+            function(v) CFG.UseSecondary = v end)
+        switch(reach, "Hit anything if nothing selected is loaded", nil,
+            function() return CFG.AnyEnemyFallback end,
+            function(v) CFG.AnyEnemyFallback = v end)
+
+        local sys = group(page, "system")
+        switch(sys, "Print debug to console", nil,
+            function() return CFG.Debug end,
+            function(v) CFG.Debug = v end)
+        button(sys, "Reinstall fast attack", "plain", function()
+            installFastAttack()
+            equipWeapon()
         end)
-
-        stepper(page, "pull range",
-            function() return CFG.PullRange end,
-            function(v) CFG.PullRange = v end, 10, 20, 500)
-        stepper(page, "pull radius",
-            function() return CFG.PullRadius end,
-            function(v) CFG.PullRadius = v end, 1, 1, 40)
-        stepper(page, "pull drop",
-            function() return CFG.PullDrop end,
-            function(v) CFG.PullDrop = v end, 1, 0, 40)
-
-        label(page, "Pulling writes NPC positions from the client.",
-            10, Color3.fromRGB(196, 150, 110))
-    end
-
-    -- =====================================================
-    -- QUEST TAB
-    -- =====================================================
-    do
-        local page = pages.QUEST
-        label(page, "QUEST")
-        local r1 = row(page)
-        button(r1, 0, 170, "TAKE QUEST NOW", Color3.fromRGB(58, 48, 24), function()
-            task.spawn(function() pcall(P.takeQuest) end)
-        end)
-        button(r1, 178, 130, "AUTO QUEST", NEU, function()
-            CFG.AutoQuest = not CFG.AutoQuest
-        end, function(b)
-            b.Text = CFG.AutoQuest and "AUTO: ON" or "AUTO: OFF"
-            b.BackgroundColor3 = CFG.AutoQuest and ON or OFF
-        end)
-
-        local scanTxt
-        button(r1, 314, 100, "SCAN", Color3.fromRGB(40, 56, 74), function()
-            local rows = P.questScan(400)
-            if scanTxt then
-                scanTxt.Text = "nearest interactables:\n" .. table.concat(rows, "\n")
-            end
-        end)
-
-        label(page, "SCAN RESULT")
-        scanTxt = Instance.new("TextLabel")
-        scanTxt.Size = UDim2.new(1, 0, 0, 96)
-        scanTxt.BackgroundTransparency = 1
-        scanTxt.Font = Enum.Font.Code
-        scanTxt.TextSize = 10
-        scanTxt.TextXAlignment = Enum.TextXAlignment.Left
-        scanTxt.TextYAlignment = Enum.TextYAlignment.Top
-        scanTxt.TextColor3 = Color3.fromRGB(190, 208, 226)
-        scanTxt.Text = "press SCAN while standing near a quest giver"
-        scanTxt.LayoutOrder = nextOrder()
-        scanTxt.Parent = page
-
-        label(page, "QUEST GIVER NAME  (exact, e.g. Adventurer)")
-        local grow = row(page, 24)
-        local gbox = Instance.new("TextBox")
-        gbox.Size = UDim2.fromOffset(300, 22)
-        gbox.BackgroundColor3 = Color3.fromRGB(22, 27, 35)
-        gbox.BorderSizePixel = 0
-        gbox.ClearTextOnFocus = false
-        gbox.Font = Enum.Font.Code
-        gbox.TextSize = 11
-        gbox.TextXAlignment = Enum.TextXAlignment.Left
-        gbox.TextColor3 = Color3.fromRGB(225, 236, 246)
-        gbox.PlaceholderText = "blank = use the QUEST marker"
-        gbox.Text = ""
-        gbox.Parent = grow
-        local gc = Instance.new("UICorner") gc.CornerRadius = UDim.new(0, 4) gc.Parent = gbox
-        button(grow, 308, 106, "USE NAME", Color3.fromRGB(40, 56, 74), function()
-            local n = (gbox.Text:gsub("^%s+", ""):gsub("%s+$", ""))
-            CFG.QuestGiverName = (#n > 0) and n or nil
-        end)
-        table.insert(live, function()
-            if not gbox:IsFocused() and CFG.QuestGiverName and gbox.Text == "" then
-                gbox.Text = CFG.QuestGiverName
-            end
-        end)
-
-        label(page, "START QUEST DIRECTLY  (no NPC, no dialog)")
-        local qtier = 1
-        local qrow = row(page, 24)
-        local qbox = Instance.new("TextBox")
-        qbox.Size = UDim2.fromOffset(190, 22)
-        qbox.BackgroundColor3 = Color3.fromRGB(22, 27, 35)
-        qbox.BorderSizePixel = 0
-        qbox.ClearTextOnFocus = false
-        qbox.Font = Enum.Font.Code
-        qbox.TextSize = 11
-        qbox.TextXAlignment = Enum.TextXAlignment.Left
-        qbox.TextColor3 = Color3.fromRGB(225, 236, 246)
-        qbox.PlaceholderText = "JungleQuest"
-        qbox.Text = ""
-        qbox.Parent = qrow
-        local qc = Instance.new("UICorner") qc.CornerRadius = UDim.new(0, 4) qc.Parent = qbox
-        for i = 1, 3 do
-            button(qrow, 196 + (i - 1) * 38, 34, tostring(i), NEU, function()
-                qtier = i
-            end, function(b)
-                b.BackgroundColor3 = (qtier == i) and ON or NEU
-            end)
-        end
-        button(qrow, 314, 100, "START QUEST", Color3.fromRGB(58, 48, 24), function()
-            local n = (qbox.Text:gsub("^%s+", ""):gsub("%s+$", ""))
-            task.spawn(function()
-                if #n > 0 then P.startQuest(n, qtier)
-                else P.startQuestForTarget() end
-            end)
-        end)
-        label(page, "Empty box = look the quest up from the enemy you are farming.",
-            10, Color3.fromRGB(196, 150, 110))
-
-        local prow = row(page)
-        button(prow, 0, 200, "PROBE NEAREST NPC", Color3.fromRGB(40, 56, 74), function()
-            local rows = P.questProbe()
-            if scanTxt then
-                scanTxt.Text = table.concat(rows, "\n")
-            end
-        end)
-
-        local qs = Instance.new("TextLabel")
-        qs.Size = UDim2.new(1, 0, 0, 90)
-        qs.BackgroundTransparency = 1
-        qs.Font = Enum.Font.Code
-        qs.TextSize = 10
-        qs.TextXAlignment = Enum.TextXAlignment.Left
-        qs.TextYAlignment = Enum.TextYAlignment.Top
-        qs.TextColor3 = Color3.fromRGB(170, 190, 210)
-        qs.TextWrapped = true
-        qs.LayoutOrder = nextOrder()
-        qs.Parent = page
-        table.insert(live, function()
-            local opts = P.lastQuestOptions
-            qs.Text = "active quest: " .. (P.questActive() and "YES" or "no")
-                .. "\nlast: " .. tostring(P.lastQuestResult or "-")
-                .. "\ndialog buttons seen: "
-                .. ((opts and #opts > 0) and table.concat(opts, " | ") or "-")
+        button(sys, "Stop and close the panel", "bad", function()
+            P.stop()
+            gui:Destroy()
         end)
     end
 
     -- =====================================================
-    -- TRAVEL TAB
+    -- STATS
     -- =====================================================
     do
-        local page = pages.TRAVEL
-        label(page, "FAST TRAVEL  (server spawn points)")
-        local dst = Instance.new("TextLabel")
-        dst.Size = UDim2.new(1, 0, 0, 18)
-        dst.BackgroundTransparency = 1
-        dst.Font = Enum.Font.Code
-        dst.TextSize = 12
-        dst.TextXAlignment = Enum.TextXAlignment.Left
-        dst.TextColor3 = Color3.fromRGB(215, 230, 244)
-        dst.LayoutOrder = nextOrder()
-        dst.Parent = page
-
-        local spawns, sIdx = {}, 1
-        local function refreshSpawns()
-            spawns = P.spawnList()
-            if sIdx > #spawns then sIdx = 1 end
-            dst.Text = (#spawns > 0)
-                and ("> " .. tostring(spawns[sIdx]) .. "   (" .. sIdx .. "/" .. #spawns .. ")")
-                or "> no spawn list (are you on a team?)"
-        end
-        refreshSpawns()
-
-        local t1 = row(page)
-        button(t1, 0, 96, "< PREV", NEU, function()
-            if #spawns > 0 then sIdx = ((sIdx - 2) % #spawns) + 1 refreshSpawns() end
-        end)
-        button(t1, 100, 96, "NEXT >", NEU, function()
-            if #spawns > 0 then sIdx = (sIdx % #spawns) + 1 refreshSpawns() end
-        end)
-        button(t1, 200, 96, "REFRESH", NEU, function() refreshSpawns() end)
-        button(t1, 302, 112, "TRAVEL", Color3.fromRGB(58, 48, 24), function()
-            local n = spawns[sIdx]
-            if n then task.spawn(function() pcall(P.travelTo, n) end) end
-        end)
-
-        label(page, "OR TYPE A SPAWN NAME")
-        local tr = row(page, 24)
-        local tbox = Instance.new("TextBox")
-        tbox.Size = UDim2.fromOffset(300, 22)
-        tbox.BackgroundColor3 = Color3.fromRGB(22, 27, 35)
-        tbox.BorderSizePixel = 0
-        tbox.ClearTextOnFocus = false
-        tbox.Font = Enum.Font.Code
-        tbox.TextSize = 11
-        tbox.TextXAlignment = Enum.TextXAlignment.Left
-        tbox.TextColor3 = Color3.fromRGB(225, 236, 246)
-        tbox.PlaceholderText = "Middle Town"
-        tbox.Text = ""
-        tbox.Parent = tr
-        local tbc = Instance.new("UICorner") tbc.CornerRadius = UDim.new(0, 4) tbc.Parent = tbox
-        button(tr, 308, 106, "GO", Color3.fromRGB(58, 48, 24), function()
-            local n = (tbox.Text:gsub("^%s+", ""):gsub("%s+$", ""))
-            if #n > 0 then task.spawn(function() pcall(P.travelTo, n) end) end
-        end)
-
-        local t2 = row(page)
-        button(t2, 0, 200, "FORCE RESPAWN", Color3.fromRGB(46, 34, 38), function()
-            task.spawn(function() pcall(P.forceRespawn) end)
-        end)
-
-        local tinfo = Instance.new("TextLabel")
-        tinfo.Size = UDim2.new(1, 0, 0, 96)
-        tinfo.BackgroundTransparency = 1
-        tinfo.Font = Enum.Font.Code
-        tinfo.TextSize = 10
-        tinfo.TextXAlignment = Enum.TextXAlignment.Left
-        tinfo.TextYAlignment = Enum.TextYAlignment.Top
-        tinfo.TextColor3 = Color3.fromRGB(170, 190, 210)
-        tinfo.TextWrapped = true
-        tinfo.LayoutOrder = nextOrder()
-        tinfo.Parent = page
-        table.insert(live, function()
-            tinfo.Text = "last travel: " .. tostring(P.lastTravel or "-")
-                .. "\n\nTravel sets your spawn point then destroys the character,"
-                .. " so the server rebuilds it at the destination. Farming pauses"
-                .. " during the respawn and resumes on arrival."
-        end)
-    end
-
-    -- =====================================================
-    -- INFO TAB
-    -- =====================================================
-    do
-        local page = pages.INFO
-        local info = Instance.new("TextLabel")
-        info.Size = UDim2.new(1, 0, 1, 0)
-        info.BackgroundTransparency = 1
-        info.Font = Enum.Font.Code
-        info.TextSize = 11
-        info.TextXAlignment = Enum.TextXAlignment.Left
-        info.TextYAlignment = Enum.TextYAlignment.Top
-        info.TextColor3 = Color3.fromRGB(180, 198, 216)
-        info.LayoutOrder = nextOrder()
-        info.Parent = page
+        local page = pages.Stats
+        local card = group(page, "this run")
+        local big = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 54), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = 34, TextColor3 = C.text,
+            TextXAlignment = Enum.TextXAlignment.Left, Text = "0",
+            LayoutOrder = nextOrder(), Parent = card,
+        })
+        local sub = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.dim,
+            TextXAlignment = Enum.TextXAlignment.Left, Text = "kills",
+            LayoutOrder = nextOrder(), Parent = card,
+        })
         table.insert(live, function()
             local mins = math.max((os.clock() - stats.startedAt) / 60, 1 / 60)
+            big.Text = tostring(stats.kills)
+            sub.Text = string.format("kills  ·  %.1f per minute  ·  %d landed hits",
+                stats.kills / mins, stats.damaging)
+        end)
+
+        local detail = group(page, "detail")
+        local body = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = C.dim,
+            Text = "", LayoutOrder = nextOrder(), Parent = detail,
+        })
+        table.insert(live, function()
             local char = player.Character
             local held = char and char:FindFirstChildOfClass("Tool")
             local _, _, hum = parts()
-            info.Text = table.concat({
+            local prim, back = selectionLists()
+            body.Text = table.concat({
                 "state        " .. state,
-                "status       " .. statusLine,
+                "working      " .. tostring(P.focusName or "-")
+                                .. "  (" .. typeIdx .. "/" .. math.max(#typeOrder, 1) .. ")",
+                "farming      " .. (#prim > 0 and table.concat(prim, ", ") or "by level"),
+                "backup       " .. (#back > 0 and table.concat(back, ", ") or "-"),
+                "quest        " .. tostring(P.questProgress or "off")
+                                .. (P.questEnemy and ("  " .. P.questEnemy) or ""),
                 "",
-                "kills        " .. stats.kills .. string.format("   (%.1f/min)", stats.kills / mins),
-                "DAMAGE HITS  " .. stats.damaging,
+                "weapon       " .. (held and held.Name or "none"),
+                "attack       " .. tostring(CFG.AttackMode),
+                "combat hook  " .. (P.fastOK and ("on, reach " .. CFG.HitboxMagnitude)
+                                              or "NOT attached"),
                 "swings       " .. stats.swings,
-                "pulled       " .. stats.pulled,
-                "",
-                "weapon       " .. (held and held.Name or "NONE"),
-                "mode         " .. tostring(CFG.AttackMode),
-                "hover        " .. CFG.HoverHeight,
-                "anti-grav    " .. (CFG.HoldAltitude and "ON" or "off")
-                                .. (holdCF and "  [holding]" or ""),
-                "magnet       " .. (CFG.Magnet and "ON" or "off")
-                                .. "  range " .. CFG.MagnetRange
-                                .. "  leash " .. CFG.LeashRadius,
-                "held/skipped " .. stats.pulled .. " / " .. (stats.outOfLeash or 0),
-                "tilt         " .. CFG.AttackTilt,
-                "working type " .. tostring(P.focusName or "-")
-                                .. "  (" .. typeIdx .. "/" .. #typeOrder .. ")",
-                "giver name   " .. tostring(CFG.QuestGiverName or "-"),
-                "last travel  " .. tostring(P.lastTravel or "-"),
+                "held         " .. stats.pulled .. "  skipped " .. (stats.outOfLeash or 0),
+                "nearest held " .. (stats.nearestHeld or 0) .. " studs",
                 "level        " .. tostring(playerLevel() or "?"),
                 "health       " .. (hum and math.floor(hum.Health) or "?"),
                 "",
                 "escalations  " .. stats.escalations,
-                "travels      " .. stats.travels,
+                "teleports    " .. stats.travels,
                 "retreats     " .. stats.retreats,
-                string.format("last progress %.1fs ago", os.clock() - lastProgressAt),
+                string.format("progress     %.0fs ago", os.clock() - lastProgressAt),
             }, "\n")
         end)
     end
 
-    showTab("FARM")
+    showTab("Farm")
 
-    -- ---------- refresh loop ----------
+    runBtn.Activated:Connect(function()
+        if P.running then P.stop() else startFarm() end
+    end)
+
+    -- ---------- refresh ----------
     task.spawn(function()
         while gui and gui.Parent do
-            title.Text = "BF FARM PRO   [" .. state .. "]"
-            title.TextColor3 = P.running
-                and Color3.fromRGB(126, 226, 152) or Color3.fromRGB(200, 210, 224)
+            runBtn.Text = P.running and "Stop" or "Start farming"
+            runBtn.BackgroundColor3 = P.running and C.red or C.accent
+            dot.BackgroundColor3 = P.running and C.green or C.faint
+            stateLbl.Text = string.lower(state)
             statusLbl.Text = statusLine
-            for _, fn in ipairs(live) do fn() end
+            for _, fn in ipairs(live) do pcall(fn) end
             task.wait(0.35)
         end
     end)
@@ -2740,12 +3791,14 @@ function P.start(names, opts)
 
     for k in pairs(stats) do stats[k] = 0 end
     stats.startedAt = os.clock()
-    activeNames, anchor, lastClusterHP = nil, nil, nil
+    activeNames = nil
+    pcall(P.armQuest)
     escalation = 0
     blacklist = {}
     countedDead = {}
     lastProgressAt = os.clock()
     P.running = true
+    moveEnabled = true
     setState("RESOLVE")
 
     installFastAttack()
@@ -2763,7 +3816,6 @@ function P.start(names, opts)
 
     track(player.CharacterAdded:Connect(function()
         task.wait(2)
-        anchor = nil
         equipWeapon()
         installFastAttack()
         progress()
@@ -2776,6 +3828,9 @@ end
 
 function P.stop()
     P.running = false
+    -- cancel anything in flight, then re-arm so the manual buttons still work
+    moveEnabled = false
+    task.delay(0.3, function() moveEnabled = true end)
     fastOn = false
     pcall(P.releaseM1)
     clearHold()
@@ -2789,6 +3844,20 @@ function P.stop()
     say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d escalations=%d", stats.kills, stats.swings, stats.escalations))
 end
+
+-- Backup enemy set. Farmed only while the primaries are on their respawn
+-- timer, then dropped the moment a primary is loaded again.
+function P.setSecondary(names)
+    if type(names) == "string" then names = { names } end
+    if not names or #names == 0 then
+        secondaryNames = nil
+    else
+        secondaryNames = {}
+        for _, n in ipairs(names) do secondaryNames[n] = true end
+    end
+    return secondaryNames
+end
+function P.secondary() return secondaryNames end
 
 function P.stats() return stats end
 function P.state() return state, statusLine, escalation end
