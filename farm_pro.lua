@@ -968,6 +968,45 @@ local function questMarker(model)
     return ok and hit or false
 end
 
+-- QUEST GIVERS, from the Blox Fruits wiki NPC list (checked 2026-09-12).
+--
+-- Two tables, because they answer two different questions.
+--
+-- KNOWN_GIVERS is every name the wiki lists as a farm-quest giver, with no
+-- island attached. Most of them are literally "<Island> Quest Giver", and the
+-- ones that are not - Adventurer, Villager, Pirate Adventurer, Mole - are the
+-- First Sea flavour names that no pattern match would ever catch. Being ON
+-- this list is a strong signal on its own: whatever island you are standing
+-- on, an NPC named from it is the quest giver, even when the enemy mapping
+-- below is wrong. That makes the scan work everywhere without depending on
+-- the mapping being perfect.
+--
+-- Deliberately NOT included: Bartilo (cafe), Trevor (fruit), King Neptune,
+-- Military Detective (the Sea 2 key), Elite Hunter. They are quest NPCs but
+-- not enemy-farm givers, and listing them would drag the farm to the wrong one.
+local KNOWN_GIVERS = {}
+for _, n in ipairs({
+    -- First Sea
+    "Bandit Quest Giver", "Adventurer", "Pirate Adventurer", "Desert Adventurer",
+    "Villager", "Marine", "Marine Leader", "Colosseum Quest Giver",
+    "Sky Adventurer", "Sky Quest Giver 2", "Mole", "Head Jailer", "Jail Keeper",
+    "Freezeburg Quest Giver", "Submerged Quest Giver 1", "Submerged Quest Giver 2",
+    -- Second Sea
+    "Area 1 Quest Giver", "Area 2 Quest Giver", "Marine Quest Giver",
+    "Graveyard Quest Giver", "Snow Quest Giver", "Ice Quest Giver",
+    "Fire Quest Giver", "Forgotten Quest Giver", "Front Crew Quest Giver",
+    "Rear Crew Quest Giver", "Frost Quest Giver",
+    -- Third Sea
+    "Pirate Port Quest Giver", "Hydra Town Quest Giver", "Dragon Crew Quest Giver",
+    "Marine Tree Quest Giver", "Turtle Adventure Quest Giver",
+    "Deep Forest Quest Giver", "Haunted Castle Quest Giver 1",
+    "Haunted Castle Quest Giver 2", "Cake Quest Giver 1", "Cake Quest Giver 2",
+    "Chocolate Quest Giver 1", "Chocolate Quest Giver 2", "Ice Cream Quest Giver",
+    "Peanut Quest Giver", "Candy Cane Quest Giver", "Submerged Quest Giver 3",
+    "Tiki Quest Giver 1", "Tiki Quest Giver 2", "Tiki Quest Giver 3",
+}) do KNOWN_GIVERS[string.lower(n)] = n end
+P.knownGivers = KNOWN_GIVERS
+
 -- markerOnly = accept ONLY an NPC carrying the "?" QUEST billboard. That is
 -- the closest-quest-giver mode: it needs no name and works on every island,
 -- because the billboard is what the game itself shows the player.
@@ -989,6 +1028,10 @@ local function findQuestGiver(maxRange, wantName, markerOnly)
                         local low = string.lower(m.Name)
                         local named = string.find(low, "quest", 1, true)
                                    or string.find(low, "giver", 1, true)
+                        -- on the wiki's list of quest givers: that is worth
+                        -- more than any pattern match, and it works on every
+                        -- island without the enemy mapping being right
+                        local known = KNOWN_GIVERS[low] ~= nil
                         local marker = questMarker(m)
                         -- an exact name beats everything: quest givers are
                         -- ordinary NPCs with island-specific names, and the
@@ -996,16 +1039,20 @@ local function findQuestGiver(maxRange, wantName, markerOnly)
                         local exact = want and (low == want)
                         local score = d
                             - (exact and 50000 or 0)
+                            - (known and 20000 or 0)
                             - (marker and 5000 or 0)
                             - (named and 1000 or 0)
-                        local accept = exact or marker or named
+                        local accept = exact or known or marker or named
                             or m:FindFirstChildOfClass("Humanoid")
-                        if markerOnly then accept = (exact or marker) and true or false end
+                        if markerOnly then
+                            accept = (exact or known or marker) and true or false
+                        end
                         if accept then
                             table.insert(cands, {
                                 model = m, part = part, dist = d, name = m.Name,
                                 score = score,
                                 signal = (exact and "EXACT NAME")
+                                      or (known and "known giver")
                                       or (marker and "QUEST marker")
                                       or (named and "name") or "npc",
                                 interact = m:FindFirstChildWhichIsA("ClickDetector", true)
@@ -1242,11 +1289,88 @@ end
 -- Quest givers are ordinary NPCs with island-specific flavour names. Naming
 -- one makes it unmissable; without a name the "?" billboard is the fallback.
 -- Add to this as you confirm them, or type one into the QUEST tab.
+-- GIVER_NAMES is the enemy -> giver mapping. The NAMES come from the wiki; the
+-- pairing of name to enemy is read off each island, and a few of them are a
+-- best reading rather than a certainty (marked). A wrong entry costs almost
+-- nothing: no NPC by that name is near, the scan falls through to the nearest
+-- "?" marker, and the moment an accept works the name that ACTUALLY worked is
+-- learned into P.learnedGivers and overrides this table from then on.
 local GIVER_NAMES = {
-    ["Monkey"]      = "Adventurer",
-    ["Gorilla"]     = "Adventurer",
-    ["Snow Bandit"] = "Villager",
-    ["Snowman"]     = "Villager",
+    -- First Sea
+    ["Bandit"]                = "Bandit Quest Giver",
+    ["Monkey"]                = "Adventurer",
+    ["Gorilla"]               = "Adventurer",
+    ["Pirate"]                = "Pirate Adventurer",
+    ["Brute"]                 = "Pirate Adventurer",
+    ["Desert Bandit"]         = "Desert Adventurer",
+    ["Desert Officer"]        = "Desert Adventurer",
+    ["Snow Bandit"]           = "Villager",
+    ["Snowman"]               = "Villager",
+    ["Chief Petty Officer"]   = "Marine",
+    ["Sky Bandit"]            = "Sky Adventurer",
+    ["Dark Master"]           = "Sky Adventurer",
+    ["Prisoner"]              = "Jail Keeper",          -- Prison, two candidates
+    ["Dangerous Prisoner"]    = "Jail Keeper",          -- the other is Head Jailer
+    ["Toga Warrior"]          = "Colosseum Quest Giver",
+    ["Gladiator"]             = "Colosseum Quest Giver",
+    ["God's Guard"]           = "Sky Quest Giver 2",
+    ["Shanda"]                = "Sky Quest Giver 2",
+    ["Royal Squad"]           = "Mole",                 -- Upper Skylands
+    ["Royal Soldier"]         = "Mole",
+    ["Galley Pirate"]         = "Freezeburg Quest Giver",  -- uncertain pairing
+    ["Galley Captain"]        = "Freezeburg Quest Giver",  -- uncertain pairing
+
+    -- Second Sea
+    ["Raider"]                = "Area 1 Quest Giver",
+    ["Mercenary"]             = "Area 1 Quest Giver",
+    ["Swan Pirate"]           = "Area 2 Quest Giver",
+    ["Factory Staff"]         = "Area 2 Quest Giver",
+    ["Marine Lieutenant"]     = "Marine Quest Giver",
+    ["Marine Captain"]        = "Marine Quest Giver",
+    ["Zombie"]                = "Graveyard Quest Giver",
+    ["Vampire"]               = "Graveyard Quest Giver",
+    ["Snow Trooper"]          = "Snow Quest Giver",
+    ["Winter Warrior"]        = "Snow Quest Giver",
+    ["Lab Subordinate"]       = "Ice Quest Giver",
+    ["Horned Warrior"]        = "Ice Quest Giver",
+    ["Magma Ninja"]           = "Fire Quest Giver",
+    ["Lava Pirate"]           = "Fire Quest Giver",
+    ["Sea Soldier"]           = "Forgotten Quest Giver",
+    ["Water Fighter"]         = "Forgotten Quest Giver",
+    ["Ship Deckhand"]         = "Front Crew Quest Giver",
+    ["Ship Engineer"]         = "Front Crew Quest Giver",
+    ["Ship Steward"]          = "Rear Crew Quest Giver",
+    ["Ship Officer"]          = "Rear Crew Quest Giver",
+    ["Arctic Warrior"]        = "Frost Quest Giver",
+    ["Snow Lurker"]           = "Frost Quest Giver",
+
+    -- Third Sea
+    ["Reborn Skeleton"]       = "Haunted Castle Quest Giver 1",
+    ["Living Zombie"]         = "Haunted Castle Quest Giver 1",
+    ["Demonic Soul"]          = "Haunted Castle Quest Giver 2",
+    ["Posessed Mummy"]        = "Haunted Castle Quest Giver 2",
+    ["Peanut Scout"]          = "Peanut Quest Giver",
+    ["Peanut President"]      = "Peanut Quest Giver",
+    ["Ice Cream Chef"]        = "Ice Cream Quest Giver",
+    ["Ice Cream Commander"]   = "Ice Cream Quest Giver",
+    ["Cookie Crafter"]        = "Cake Quest Giver 1",
+    ["Cake Guard"]            = "Cake Quest Giver 1",
+    ["Baking Staff"]          = "Cake Quest Giver 2",
+    ["Head Baker"]            = "Cake Quest Giver 2",
+    ["Cocoa Warrior"]         = "Chocolate Quest Giver 1",
+    ["Chocolate Bar Battler"] = "Chocolate Quest Giver 1",
+    ["Sweet Thief"]           = "Chocolate Quest Giver 2",
+    ["Candy Rebel"]           = "Chocolate Quest Giver 2",
+    ["Candy Pirate"]          = "Candy Cane Quest Giver",
+    ["Isle Outlaw"]           = "Tiki Quest Giver 1",
+    ["Island Boy"]            = "Tiki Quest Giver 1",
+    ["Isle Champion"]         = "Tiki Quest Giver 3",
+    ["Forest Pirate"]         = "Marine Tree Quest Giver",
+    ["Mythological Pirate"]   = "Marine Tree Quest Giver",
+    ["Jungle Pirate"]         = "Deep Forest Quest Giver",
+    ["Musketeer Pirate"]      = "Deep Forest Quest Giver",
+    ["Fishman Raider"]        = "Hydra Town Quest Giver",   -- uncertain pairing
+    ["Fishman Captain"]       = "Hydra Town Quest Giver",   -- uncertain pairing
 }
 P.giverNames = GIVER_NAMES
 
@@ -3334,9 +3458,11 @@ local function buildUI()
             "When no name is set, take the nearest NPC with the quest marker",
             function() return CFG.QuestGiverClosest end,
             function(v) CFG.QuestGiverClosest = v end)
-        note(giver, "Each island's giver has its own name - Adventurer, Villager, "
-            .. "and so on. Nothing is guessed: whichever NPC an accept actually "
-            .. "works at is remembered against that enemy and reused from then on.")
+        note(giver, "Every quest giver name from the wiki is built in, so the "
+            .. "right NPC is recognised on any island - Adventurer in the Jungle, "
+            .. "Villager in the Frozen Village, and the rest. Whichever one an "
+            .. "accept actually works at is then remembered for that enemy and "
+            .. "overrides the built-in list.")
         buttonPair(giver,
             "Save this spot", "plain", function() pcall(P.setGiverHere) end,
             "Forget spot", "plain", function() pcall(P.clearGiver) end)
