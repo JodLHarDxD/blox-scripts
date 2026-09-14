@@ -203,6 +203,46 @@ local CFG = {
     HoldAltitude       = true,
 
     AnyEnemyFallback   = true,   -- if quest enemies absent, hit whatever is loaded
+
+    -- =====================================================
+    -- GROUND MODE
+    -- =====================================================
+    -- The quiet way to run. Nothing here is a claim that the game cannot tell
+    -- a script is attached -- the executor is its own problem and no Lua can
+    -- hide it. What this switch removes is everything the SERVER can measure
+    -- as impossible for a person:
+    --   * position deltas no walk speed explains (the tween flight)
+    --   * a character with collisions off, standing inside walls and rock
+    --   * a character hanging in the air with gravity cancelled every frame
+    --   * NPCs whose CFrame is written by a client that does not own them
+    --   * a hitbox 150 studs wide and an attack clock set to negative infinity
+    -- With it on the farm walks on its legs, through doors, and hits what is
+    -- in front of it. It is slower. That is the whole point.
+    GroundMode         = false,
+    GroundReach        = 12,     -- stop walking and start swinging at this range
+    GroundTravelMax    = 1200,   -- refuse to walk further than this on its own
+    GroundRestMin      = 0.10,   -- gap between swings, low end
+    GroundRestMax      = 0.28,   -- and high end; a real hand is never regular
+    GroundBreathMin    = 0.8,    -- pause after a kill, low end
+    GroundBreathMax    = 2.4,    -- and high end
+    GroundStuckJump    = true,   -- jump when the walk sticks
+    -- Z/X/C/V are cast down the CURSOR's ray, and the cursor rides the middle
+    -- of the screen, so where the camera points is where the skill goes.
+    -- Turning the body is not enough: the camera does not follow it. So in
+    -- ground mode the camera is put behind the shoulder and aimed at whatever
+    -- is being hit -- which is also exactly what a person's camera does. It is
+    -- handed back the moment the farm stops or the mode goes off.
+    GroundAimCamera    = true,
+    GroundCamBack      = 13,     -- studs behind the shoulder
+    GroundCamUp        = 5,      -- and above it
+
+    -- ONE SPECIES, NOTHING ELSE
+    -- Off, the farm is allowed to improvise: a backup list when the primaries
+    -- are respawning, anything loaded when the island is empty. That is how it
+    -- ends up on an NPC you never picked. On, the chosen names are the only
+    -- things it will ever look at, and an empty island means it waits.
+    StrictTarget       = false,
+
     Debug              = false,
 }
 
@@ -239,59 +279,74 @@ local LEVELS = {
     {550,624,"Royal Soldier",Vector3.new(-7836.8,5607.8,-1540.5)},
     {625,649,"Galley Pirate",Vector3.new(5551.0,42.5,3946.3)},
     {650,699,"Galley Captain",Vector3.new(5436.0,38.5,4757.8)},
-    {700,724,"Raider",Vector3.new(-728.3,16.5,2345.9)},
-    {725,774,"Mercenary",Vector3.new(-972.5,73.0,1419.1)},
-    {775,799,"Swan Pirate",Vector3.new(1036.5,125.0,1321.8)},
-    {800,874,"Marine Commodore",Vector3.new(-3855.7,73.0,-3295.8)},
-    {875,899,"Magma Ninja",Vector3.new(-5426.3,12.0,-5769.7)},
-    {900,949,"Lava Pirate",Vector3.new(-5234.4,12.0,-4898.6)},
-    {950,974,"Head Baker",Vector3.new(-2088.0,38.0,-12464.8)},
-    {975,999,"Dark Master",Vector3.new(-2088.9,38.0,-12488.7)},
-    {1000,1049,"Ice Admiral",Vector3.new(-5520.3,12.0,-5235.2)},
-    {1050,1099,"Tide Keeper",Vector3.new(-3711.3,123.0,-11208.9)},
-    {1100,1124,"Forest Pirate",Vector3.new(-13479.6,332.4,-7625.4)},
-    {1125,1174,"Mythological Pirate",Vector3.new(-13545.2,470.0,-6917.2)},
-    {1175,1199,"Jungle Pirate",Vector3.new(-12073.2,332.4,-10141.2)},
-    {1200,1249,"Musketeer Pirate",Vector3.new(-13274.5,332.4,-7896.7)},
-    {1250,1274,"Reborn Skeleton",Vector3.new(-8760.8,142.1,6062.5)},
-    {1275,1299,"Living Zombie",Vector3.new(-10144.8,139.0,5932.9)},
-    {1300,1324,"Demonic Soul",Vector3.new(-9513.9,172.1,6145.7)},
-    {1325,1349,"Posessed Mummy",Vector3.new(-9546.7,6.0,6336.5)},
-    {1350,1374,"Peanut Scout",Vector3.new(-2104.0,38.0,-10192.3)},
-    {1375,1399,"Peanut President",Vector3.new(-2150.5,38.0,-10194.6)},
-    {1400,1424,"Ice Cream Chef",Vector3.new(-641.2,38.0,-12824.0)},
-    {1425,1449,"Ice Cream Commander",Vector3.new(-789.9,65.9,-10967.3)},
-    {1450,1474,"Cookie Crafter",Vector3.new(-2365.4,38.0,-12099.5)},
-    {1475,1499,"Cake Guard",Vector3.new(-1570.3,38.0,-12355.9)},
-    {1500,1524,"Baking Staff",Vector3.new(-1927.2,38.0,-12850.9)},
-    {1525,1574,"Head Baker",Vector3.new(-2088.0,38.0,-12464.8)},
-    {1575,1599,"Cocoa Warrior",Vector3.new(231.8,25.0,-12197.5)},
-    {1600,1624,"Chocolate Bar Battler",Vector3.new(620.6,25.0,-12619.6)},
-    {1625,1649,"Sweet Thief",Vector3.new(2433.6,25.0,-12225.7)},
-    {1650,1699,"Candy Rebel",Vector3.new(2519.2,25.0,-11847.6)},
-    {1700,1724,"Candy Pirate",Vector3.new(-1106.6,11.6,-14204.9)},
-    {1725,1774,"Snow Demon",Vector3.new(-5412.5,12.0,-5269.2)},
-    {1775,1799,"Isle Outlaw",Vector3.new(-5622.0,8.0,-276.5)},
-    {1800,1849,"Island Boy",Vector3.new(-4898.4,8.0,-185.5)},
-    {1850,1899,"Sun-Kissed Warrior",Vector3.new(-2010.8,38.0,-10194.5)},
-    {1900,1924,"Cave Dweller",Vector3.new(-2104.0,38.0,-10192.3)},
-    {1925,1974,"Magma Ninja",Vector3.new(-5426.3,12.0,-5769.7)},
-    {1975,1999,"Lava Pirate",Vector3.new(-5234.4,12.0,-4898.6)},
-    {2000,2024,"Tide Keeper",Vector3.new(-3711.3,123.0,-11208.9)},
-    {2025,2049,"Fishman Raider",Vector3.new(-10533.2,332.0,-8788.5)},
-    {2050,2074,"Fishman Captain",Vector3.new(-10961.0,332.0,-8940.5)},
-    {2075,2099,"Forest Pirate",Vector3.new(-13479.6,332.4,-7625.4)},
-    {2100,2124,"Jungle Pirate",Vector3.new(-12073.2,332.4,-10141.2)},
-    {2125,2149,"Sea Soldier",Vector3.new(-5850.8,16.0,-285.3)},
-    {2150,2199,"Ship Deckhand",Vector3.new(1232.9,125.0,33059.2)},
-    {2200,2224,"Ship Engineer",Vector3.new(919.0,44.0,32917.4)},
-    {2225,2249,"Ship Steward",Vector3.new(915.4,126.0,33518.1)},
-    {2250,2299,"Ship Officer",Vector3.new(915.4,181.0,33331.8)},
-    {2300,2324,"Arctic Warrior",Vector3.new(5823.5,23.7,-6302.3)},
-    {2325,2349,"Snow Lurker",Vector3.new(5518.8,28.0,-6859.6)},
-    {2350,2374,"Sea Soldier",Vector3.new(-5850.8,16.0,-285.3)},
-    {2375,2399,"Haunted Castle",Vector3.new(-9515.8,142.0,5543.9)},
-    {2400,2450,"Isle Champion",Vector3.new(5283.7,51.5,1036.2)},
+    -- SECOND SEA
+    {700,724,"Raider",Vector3.new(68.9,93.6,2429.7)},
+    {725,774,"Mercenary",Vector3.new(-864.9,122.5,1453.2)},
+    {775,799,"Swan Pirate",Vector3.new(1065.4,137.6,1324.4)},
+    {800,874,"Factory Staff",Vector3.new(533.2,128.5,355.6)},
+    {875,899,"Marine Lieutenant",Vector3.new(-2489.3,84.6,-3151.9)},
+    {900,949,"Marine Captain",Vector3.new(-2335.2,79.8,-3245.9)},
+    {950,974,"Zombie",Vector3.new(-5536.5,101.1,-835.6)},
+    {975,999,"Vampire",Vector3.new(-5806.1,16.7,-1164.4)},
+    {1000,1049,"Snow Trooper",Vector3.new(535.2,432.7,-5484.9)},
+    {1050,1099,"Winter Warrior",Vector3.new(1234.5,457.0,-5174.1)},
+    {1100,1124,"Lab Subordinate",Vector3.new(-5720.6,63.3,-4784.6)},
+    {1125,1174,"Horned Warrior",Vector3.new(-6292.8,91.2,-5502.7)},
+    {1175,1199,"Magma Ninja",Vector3.new(-5461.8,130.4,-5836.5)},
+    {1200,1249,"Lava Pirate",Vector3.new(-5251.2,55.2,-4774.4)},
+    {1250,1274,"Ship Deckhand",Vector3.new(921.1,126.0,33088.3)},
+    {1275,1299,"Ship Engineer",Vector3.new(886.3,40.5,32800.8)},
+    {1300,1324,"Ship Steward",Vector3.new(943.9,129.6,33444.4)},
+    {1325,1349,"Ship Officer",Vector3.new(955.4,181.1,33331.9)},
+    {1350,1374,"Arctic Warrior",Vector3.new(5935.5,77.3,-6472.8)},
+    {1375,1424,"Snow Lurker",Vector3.new(5628.5,57.6,-6618.4)},
+    {1425,1449,"Sea Soldier",Vector3.new(-3185.0,58.8,-9663.6)},
+    {1450,1499,"Water Fighter",Vector3.new(-3262.9,298.7,-10552.5)},
+
+    -- THIRD SEA
+    -- Rebuilt from the level table the public farm scripts share, cross-read
+    -- against the wiki. The rows that were here before had Third Sea enemies
+    -- sitting at Second Sea levels -- Reborn Skeleton at 1250 when it is a
+    -- 1975 enemy -- so "farm by my level" resolved to a species that does not
+    -- exist where it sent you, and the quest lookup then had nothing to match.
+    {1500,1524,"Pirate Millionaire",Vector3.new(81.2,43.8,5724.7)},
+    {1525,1574,"Pistol Billionaire",Vector3.new(81.2,43.8,5724.7)},
+    {1575,1599,"Dragon Crew Warrior",Vector3.new(6242.0,51.5,-1244.0)},
+    {1600,1624,"Dragon Crew Archer",Vector3.new(6488.9,383.4,-110.7)},
+    {1625,1649,"Female Islander",Vector3.new(5825.2,682.9,704.6)},
+    {1650,1699,"Giant Islander",Vector3.new(4530.4,656.8,-131.6)},
+    {1700,1724,"Marine Commodore",Vector3.new(2490.1,190.4,-7160.1)},
+    {1725,1774,"Marine Rear Admiral",Vector3.new(3951.4,229.1,-6912.8)},
+    {1775,1799,"Fishman Raider",Vector3.new(-10322.4,390.9,-8580.1)},
+    {1800,1824,"Fishman Captain",Vector3.new(-11194.5,442.0,-8608.8)},
+    {1825,1849,"Forest Pirate",Vector3.new(-13225.8,428.2,-7753.1)},
+    {1850,1899,"Mythological Pirate",Vector3.new(-13869.2,565.0,-7084.4)},
+    {1900,1924,"Jungle Pirate",Vector3.new(-11982.2,376.3,-10451.4)},
+    {1925,1974,"Musketeer Pirate",Vector3.new(-13282.3,496.2,-9565.2)},
+    {1975,1999,"Reborn Skeleton",Vector3.new(-8817.9,191.2,6298.7)},
+    {2000,2024,"Living Zombie",Vector3.new(-10125.2,184.0,6242.0)},
+    {2025,2049,"Demonic Soul",Vector3.new(-9712.0,204.7,6193.3)},
+    {2050,2074,"Posessed Mummy",Vector3.new(-9545.8,69.6,6339.6)},
+    {2075,2099,"Peanut Scout",Vector3.new(-2126.4,90.6,-10302.0)},
+    {2100,2124,"Peanut President",Vector3.new(-2118.8,70.3,-10509.3)},
+    {2125,2149,"Ice Cream Chef",Vector3.new(-685.3,96.3,-10957.6)},
+    {2150,2199,"Ice Cream Commander",Vector3.new(-635.7,143.0,-11335.2)},
+    {2200,2224,"Cookie Crafter",Vector3.new(-2321.7,36.7,-12216.7)},
+    {2225,2249,"Cake Guard",Vector3.new(-1418.1,36.7,-12255.7)},
+    {2250,2274,"Baking Staff",Vector3.new(-1980.4,36.7,-12983.8)},
+    {2275,2299,"Head Baker",Vector3.new(-2251.6,52.3,-13033.4)},
+    {2300,2324,"Cocoa Warrior",Vector3.new(168.0,26.2,-12238.9)},
+    {2325,2349,"Chocolate Bar Battler",Vector3.new(701.3,25.6,-12708.2)},
+    {2350,2374,"Sweet Thief",Vector3.new(-140.3,25.6,-12652.3)},
+    {2375,2399,"Candy Rebel",Vector3.new(47.9,25.6,-13029.2)},
+    {2400,2424,"Candy Pirate",Vector3.new(-1437.6,17.1,-14385.7)},
+    {2425,2449,"Snow Demon",Vector3.new(-916.2,17.1,-14638.8)},
+    {2450,2474,"Isle Outlaw",Vector3.new(-16162.8,11.7,-96.5)},
+    {2475,2499,"Island Boy",Vector3.new(-16357.3,20.6,1005.6)},
+    {2500,2524,"Sun-kissed Warrior",Vector3.new(-16357.3,20.6,1005.6)},
+    {2525,2549,"Isle Champion",Vector3.new(-16848.9,21.7,1041.4)},
+    {2550,2574,"Serpent Hunter",Vector3.new(-16621.4,121.4,1290.7)},
+    {2575,2600,"Skull Slayer",Vector3.new(-16811.6,84.6,1542.2)},
 }
 
 -- =========================================================
@@ -518,9 +573,15 @@ end
 --   * velocity zeroed every Heartbeat
 -- Roblox re-asserts both continuously, so a one-shot write is always undone.
 local TweenService = game:GetService("TweenService")
+local PathService  = game:GetService("PathfindingService")
 
 local savedCollide = {}
 local stabConns = {}
+
+-- The one question every movement decision now asks. Hoisted to the top of
+-- this section because the stabilizer, which is built further down, reads it.
+local function groundOn() return CFG.GroundMode == true end
+P.groundOn = groundOn
 
 -- Hoisted: the stabilizer's Heartbeat closure reads both of these, and it is
 -- created before the movement code further down.
@@ -534,7 +595,27 @@ local function killVelocity(root)
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
+-- Put back everything the hover mode took away. Called when ground mode goes
+-- on, and on stop. Without this, switching to ground mode mid-run leaves you
+-- walking around with collisions still off -- which is the exact thing ground
+-- mode exists to stop.
+local function restoreBody()
+    for part, was in pairs(savedCollide) do
+        if part and part.Parent then pcall(function() part.CanCollide = was end) end
+    end
+    table.clear(savedCollide)
+    local _, _, hum = parts()
+    if hum then pcall(function() hum.AutoRotate = true end) end
+end
+P.restoreBody = restoreBody
+
 local function stabilize()
+    -- GROUND MODE: the body is the player's again. Collisions stay on, the
+    -- humanoid turns itself, and gravity is left alone.
+    if groundOn() then
+        if next(savedCollide) then restoreBody() end
+        return
+    end
     local char, root, hum = parts()
     if not char or not root or not hum then return end
     hum.AutoRotate = false
@@ -659,6 +740,10 @@ local function startStabilizer()
     if #stabConns > 0 then return end
     table.insert(stabConns, RunService.PreSimulation:Connect(stabilize))
     table.insert(stabConns, RunService.Heartbeat:Connect(function()
+        -- Zeroing velocity every frame is what holds a body in the air. It is
+        -- also what would stop a walking one dead, so in ground mode neither
+        -- this nor the hold runs at all.
+        if groundOn() then return end
         local _, root = parts()
         if root then killVelocity(root) end
         pcall(holdStep)
@@ -668,15 +753,7 @@ end
 local function stopStabilizer()
     for _, c in ipairs(stabConns) do pcall(function() c:Disconnect() end) end
     table.clear(stabConns)
-    local char = parts()
-    if char then
-        for part, was in pairs(savedCollide) do
-            if part and part.Parent then pcall(function() part.CanCollide = was end) end
-        end
-    end
-    table.clear(savedCollide)
-    local _, _, hum = parts()
-    if hum then pcall(function() hum.AutoRotate = true end) end
+    restoreBody()
 end
 
 local function setHold(cf) holdCF, holdAnchor, holdLook = cf, nil, nil end
@@ -754,6 +831,183 @@ local function pin(pos, lookAt)
         end
     end
     killVelocity(root)
+end
+
+-- =========================================================
+-- WALKING
+-- =========================================================
+-- Everything above this line moves the character by writing its CFrame. The
+-- server accepts those writes -- Roblox trusts the client with its own
+-- character -- but it can also see them, and nothing a person does produces
+-- a 220-stud step or a straight line through a castle wall.
+--
+-- This is the other way: ask PathfindingService for a route, then hand each
+-- waypoint to Humanoid:MoveTo. The humanoid walks at its own WalkSpeed, the
+-- physics engine does the collisions, and the path goes AROUND the wall. Every
+-- position the server sees is one the game itself produced.
+--
+-- Jitter is deliberate. A route walked waypoint to waypoint at a constant rate
+-- with the same pause between every swing is, over an hour, a straighter line
+-- than a person ever draws. So arrival slop and every rest below is a range.
+local function jitter(lo, hi) return lo + math.random() * (hi - lo) end
+local function swingGap() return jitter(CFG.GroundRestMin or 0.1, CFG.GroundRestMax or 0.28) end
+local function breathe()  return jitter(CFG.GroundBreathMin or 0.8, CFG.GroundBreathMax or 2.4) end
+
+-- Turn to face something WITHOUT moving. A yaw-only write, which is the same
+-- thing a mouse turn produces; the position is untouched. Only fired when the
+-- body is actually pointing somewhere else, so it is not a per-frame write.
+local function faceGround(root, targetPos)
+    local flat = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
+    if (flat - root.Position).Magnitude < 0.5 then return end
+    local want = CFrame.new(root.Position, flat)
+    local dot = root.CFrame.LookVector:Dot(want.LookVector)
+    if dot > 0.9 then return end          -- already within ~25 degrees
+    root.CFrame = want
+end
+
+-- THE CAMERA, BORROWED AND GIVEN BACK.
+-- Scriptable is a real hijack: while it is set, the player's own mouse look is
+-- dead. That is acceptable for an AFK mode and unacceptable for anything else,
+-- so it is only ever taken while ground mode is engaging something, and every
+-- exit path hands it back.
+local camHeld = false
+local function releaseCamera()
+    if not camHeld then return end
+    camHeld = false
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    pcall(function()
+        local _, _, hum = parts()
+        if hum then cam.CameraSubject = hum end
+        cam.CameraType = Enum.CameraType.Custom
+    end)
+end
+P.releaseCamera = releaseCamera
+
+local lastCamAt = 0
+local function aimCameraAt(root, targetPos)
+    if not groundOn() or not CFG.GroundAimCamera then return end
+    local cam = workspace.CurrentCamera
+    if not cam or not root then return end
+    if os.clock() - lastCamAt < 0.06 then return end
+    lastCamAt = os.clock()
+
+    local eye  = root.Position + Vector3.new(0, 2, 0)
+    local flat = targetPos - eye
+    flat = Vector3.new(flat.X, 0, flat.Z)
+    if flat.Magnitude < 0.5 then return end
+    local back = eye - flat.Unit * (CFG.GroundCamBack or 13)
+        + Vector3.new(0, CFG.GroundCamUp or 5, 0)
+
+    pcall(function()
+        if not camHeld then
+            cam.CameraType = Enum.CameraType.Scriptable
+            camHeld = true
+        end
+        cam.CFrame = CFrame.new(back, targetPos)
+        -- Centre of the screen is now the enemy, so that is where the cursor
+        -- belongs: the skill ray and the camera agree.
+        local vs = cam.ViewportSize
+        VIM:SendMouseMoveEvent(vs.X * 0.5, vs.Y * 0.5, game)
+    end)
+end
+
+-- Walk to a point. Returns true if it arrived.
+--   arrive : how close counts as there
+--   budget : seconds to spend before giving up
+local function walkTo(goal, opts)
+    opts = opts or {}
+    local _, root, hum = parts()
+    if not root or not hum then return false end
+    local arrive = opts.arrive or 6
+    local budget = opts.budget or 30
+
+    clearHold()
+    cancelMove()
+    if (root.Position - goal).Magnitude <= arrive then return true end
+
+    local path = PathService:CreatePath({
+        AgentRadius   = 3,
+        AgentHeight   = 6,
+        AgentCanJump  = true,
+        AgentMaxSlope = 60,
+        WaypointSpacing = 8,
+    })
+
+    local deadline = os.clock() + budget
+    local recomputes = 0
+
+    while os.clock() < deadline and moveEnabled do
+        local _, r, h = parts()
+        if not r or not h then return false end
+        if (r.Position - goal).Magnitude <= arrive then return true end
+
+        local ok = pcall(function() path:ComputeAsync(r.Position, goal) end)
+        local points = (ok and path.Status == Enum.PathStatus.Success)
+            and path:GetWaypoints() or nil
+
+        if not points or #points < 2 then
+            -- No route: the goal may be mid-air, inside geometry, or on the
+            -- far side of water. Push toward it in a straight walk instead,
+            -- which still respects collisions, and let the stuck check decide.
+            h:MoveTo(goal)
+            local before = r.Position
+            task.wait(1.0)
+            local _, r2 = parts()
+            if not r2 then return false end
+            if (r2.Position - before).Magnitude < 1.5 then
+                if CFG.GroundStuckJump then h.Jump = true end
+                recomputes += 1
+                if recomputes > 5 then return false end
+            end
+        else
+            for i = 2, #points do
+                if not moveEnabled then return false end
+                local wp = points[i]
+                local _, r3, h3 = parts()
+                if not r3 or not h3 then return false end
+
+                if wp.Action == Enum.PathWaypointAction.Jump then h3.Jump = true end
+                h3:MoveTo(wp.Position)
+
+                -- MoveToFinished can wait its full eight seconds on a waypoint
+                -- that cannot be reached, so it is raced against a short clock.
+                local reached, stamp = false, r3.Position
+                local wpDeadline = os.clock() + 3
+                while os.clock() < wpDeadline do
+                    local _, r4 = parts()
+                    if not r4 then return false end
+                    if (r4.Position - wp.Position).Magnitude < 5 then reached = true break end
+                    if (r4.Position - goal).Magnitude <= arrive then return true end
+                    task.wait(0.1)
+                end
+
+                if not reached then
+                    local _, r5, h5 = parts()
+                    if r5 and (r5.Position - stamp).Magnitude < 1.5 then
+                        -- Standing still against something. One jump clears a
+                        -- ledge; two means the route is wrong, so rebuild it.
+                        if CFG.GroundStuckJump and h5 then h5.Jump = true end
+                        recomputes += 1
+                        if recomputes > 5 then return false end
+                        break
+                    end
+                end
+                if os.clock() > deadline then break end
+            end
+        end
+    end
+
+    local _, rf = parts()
+    return rf ~= nil and (rf.Position - goal).Magnitude <= arrive + 8
+end
+P.walkTo = walkTo
+
+-- One door for every "get me there" in the farm. Ground mode walks; the old
+-- mode flies. Nothing downstream has to know which is on.
+local function goTo(pos, opts)
+    if groundOn() then return walkTo(pos, opts) end
+    return moveTo(pos, MOVE_SPEED)
 end
 
 
@@ -957,7 +1211,40 @@ local function stopPuller()
 end
 
 local function syncPuller()
+    -- Dragging an NPC is a client writing the CFrame of a model it does not
+    -- own. It is the loudest thing in this whole script, so ground mode does
+    -- not get to have it, whatever the toggles say.
+    if groundOn() then stopPuller() return end
     if CFG.Magnet or CFG.PullEnemies then startPuller() else stopPuller() end
+end
+
+-- THE SWITCH.
+-- Flipping CFG.GroundMode by hand would leave the body mid-hover with its
+-- collisions off and the fast-attack hook still installed. This turns the
+-- whole posture over at once, in both directions.
+function P.setGroundMode(on)
+    CFG.GroundMode = on and true or false
+    if CFG.GroundMode then
+        CFG.Magnet, CFG.PullEnemies = false, false
+        CFG.AnyEnemyFallback = false
+        fastOn = false                  -- stop feeding the combat controller
+        clearHold()
+        releaseCamera()
+        cancelMove()
+        restoreBody()                   -- collisions and AutoRotate back on
+        local _, _, hum = parts()
+        if hum then pcall(function() hum.PlatformStand = false end) end
+        say("ground mode: walking, no magnet, no hover")
+    else
+        releaseCamera()
+        -- A hold set while the hold loop was asleep is stale; left in place it
+        -- would yank the body to wherever the last teleport anchored it.
+        clearHold()
+        if P.running then installFastAttack() end
+        say("ground mode off")
+    end
+    syncPuller()
+    return CFG.GroundMode
 end
 
 -- =========================================================
@@ -1389,6 +1676,22 @@ local GIVER_NAMES = {
     ["Snow Lurker"]           = "Frost Quest Giver",
 
     -- Third Sea
+    -- These are the wiki's titles. Read GIVER_POS below first: a position
+    -- cannot be spelled wrong, and the accept only ever needed the position.
+    ["Pirate Millionaire"]    = "Port Town Quest Giver",
+    ["Pistol Billionaire"]    = "Port Town Quest Giver",
+    ["Dragon Crew Warrior"]   = "Hydra Town Quest Giver",
+    ["Dragon Crew Archer"]    = "Hydra Town Quest Giver",
+    ["Female Islander"]       = "Hydra Island Quest Giver",
+    ["Giant Islander"]        = "Hydra Island Quest Giver",
+    ["Marine Commodore"]      = "Marine Tree Quest Giver",
+    ["Marine Rear Admiral"]   = "Marine Tree Quest Giver",
+    ["Fishman Raider"]        = "Deep Forest Quest Giver 3",
+    ["Fishman Captain"]       = "Deep Forest Quest Giver 3",
+    ["Forest Pirate"]         = "Deep Forest Quest Giver",
+    ["Mythological Pirate"]   = "Deep Forest Quest Giver",
+    ["Jungle Pirate"]         = "Deep Forest Quest Giver 2",
+    ["Musketeer Pirate"]      = "Deep Forest Quest Giver 2",
     ["Reborn Skeleton"]       = "Haunted Castle Quest Giver 1",
     ["Living Zombie"]         = "Haunted Castle Quest Giver 1",
     ["Demonic Soul"]          = "Haunted Castle Quest Giver 2",
@@ -1406,17 +1709,98 @@ local GIVER_NAMES = {
     ["Sweet Thief"]           = "Chocolate Quest Giver 2",
     ["Candy Rebel"]           = "Chocolate Quest Giver 2",
     ["Candy Pirate"]          = "Candy Cane Quest Giver",
+    ["Snow Demon"]            = "Candy Cane Quest Giver",
     ["Isle Outlaw"]           = "Tiki Quest Giver 1",
     ["Island Boy"]            = "Tiki Quest Giver 1",
-    ["Isle Champion"]         = "Tiki Quest Giver 3",
-    ["Forest Pirate"]         = "Marine Tree Quest Giver",
-    ["Mythological Pirate"]   = "Marine Tree Quest Giver",
-    ["Jungle Pirate"]         = "Deep Forest Quest Giver",
-    ["Musketeer Pirate"]      = "Deep Forest Quest Giver",
-    ["Fishman Raider"]        = "Hydra Town Quest Giver",   -- uncertain pairing
-    ["Fishman Captain"]       = "Hydra Town Quest Giver",   -- uncertain pairing
+    ["Sun-kissed Warrior"]    = "Tiki Quest Giver 2",
+    ["Isle Champion"]         = "Tiki Quest Giver 2",
+    ["Serpent Hunter"]        = "Tiki Quest Giver 3",
+    ["Skull Slayer"]          = "Tiki Quest Giver 3",
 }
 P.giverNames = GIVER_NAMES
+
+-- WHERE THE GIVER STANDS.
+-- The accept failed with "unknown giver" for a reason that had nothing to do
+-- with the remote: the server refuses StartQuest unless you are standing near
+-- that island's giver, and the only way this script knew where that was, was
+-- to scan the world for an NPC by NAME. A name it does not have -- and every
+-- Third Sea name was missing -- means no scan hit, no walk, and no accept.
+--
+-- A coordinate cannot be misspelled, and it does not depend on the NPC being
+-- streamed in at the moment the scan runs. So the giver is a POSITION first
+-- and a name second; the name scan is now only the fallback for anything not
+-- listed here. These feed the same giverSpots memory the accept already used,
+-- so a spot you save by hand still overrides the table.
+local GIVER_POS = {
+    -- Second Sea
+    ["Raider"]                = Vector3.new(-427.7, 73.0, 1835.9),
+    ["Mercenary"]             = Vector3.new(-427.7, 73.0, 1835.9),
+    ["Swan Pirate"]           = Vector3.new(635.6, 73.1, 917.8),
+    ["Factory Staff"]         = Vector3.new(635.6, 73.1, 917.8),
+    ["Marine Lieutenant"]     = Vector3.new(-2441.0, 73.0, -3217.7),
+    ["Marine Captain"]        = Vector3.new(-2441.0, 73.0, -3217.7),
+    ["Zombie"]                = Vector3.new(-5494.3, 48.5, -794.6),
+    ["Vampire"]               = Vector3.new(-5494.3, 48.5, -794.6),
+    ["Snow Trooper"]          = Vector3.new(607.1, 401.5, -5370.6),
+    ["Winter Warrior"]        = Vector3.new(607.1, 401.5, -5370.6),
+    ["Lab Subordinate"]       = Vector3.new(-6061.8, 15.9, -4902.0),
+    ["Horned Warrior"]        = Vector3.new(-6061.8, 15.9, -4902.0),
+    ["Magma Ninja"]           = Vector3.new(-5429.1, 16.0, -5298.0),
+    ["Lava Pirate"]           = Vector3.new(-5429.1, 16.0, -5298.0),
+    ["Ship Deckhand"]         = Vector3.new(1040.3, 125.1, 32911.0),
+    ["Ship Engineer"]         = Vector3.new(1040.3, 125.1, 32911.0),
+    ["Ship Steward"]          = Vector3.new(971.4, 125.1, 33245.5),
+    ["Ship Officer"]          = Vector3.new(971.4, 125.1, 33245.5),
+    ["Arctic Warrior"]        = Vector3.new(5668.1, 28.2, -6484.6),
+    ["Snow Lurker"]           = Vector3.new(5668.1, 28.2, -6484.6),
+    ["Sea Soldier"]           = Vector3.new(-3054.6, 236.9, -10147.8),
+    ["Water Fighter"]         = Vector3.new(-3054.6, 236.9, -10147.8),
+
+    -- Third Sea
+    ["Pirate Millionaire"]    = Vector3.new(-290.1, 42.9, 5581.6),
+    ["Pistol Billionaire"]    = Vector3.new(-290.1, 42.9, 5581.6),
+    ["Dragon Crew Warrior"]   = Vector3.new(5832.8, 51.7, -1101.5),
+    ["Dragon Crew Archer"]    = Vector3.new(5832.8, 51.7, -1101.5),
+    ["Female Islander"]       = Vector3.new(5448.9, 601.5, 751.1),
+    ["Giant Islander"]        = Vector3.new(5448.9, 601.5, 751.1),
+    ["Marine Commodore"]      = Vector3.new(2180.5, 27.8, -6741.6),
+    ["Marine Rear Admiral"]   = Vector3.new(2180.5, 27.8, -6741.6),
+    ["Fishman Raider"]        = Vector3.new(-10581.7, 330.9, -8761.2),
+    ["Fishman Captain"]       = Vector3.new(-10581.7, 330.9, -8761.2),
+    ["Forest Pirate"]         = Vector3.new(-13234.0, 331.5, -7625.4),
+    ["Mythological Pirate"]   = Vector3.new(-13234.0, 331.5, -7625.4),
+    ["Jungle Pirate"]         = Vector3.new(-12680.4, 390.0, -9902.0),
+    ["Musketeer Pirate"]      = Vector3.new(-12680.4, 390.0, -9902.0),
+    -- HAUNTED CASTLE. Giver 1 is in the grey hut in the middle of the grounds
+    -- and hands out Reborn Skeleton and Living Zombie. Giver 2 stands at the
+    -- castle's front door, among the Demonic Souls, and hands out Demonic Soul
+    -- and Posessed Mummy.
+    ["Reborn Skeleton"]       = Vector3.new(-9480.8, 142.1, 5566.1),
+    ["Living Zombie"]         = Vector3.new(-9480.8, 142.1, 5566.1),
+    ["Demonic Soul"]          = Vector3.new(-9517.0, 178.0, 6078.5),
+    ["Posessed Mummy"]        = Vector3.new(-9517.0, 178.0, 6078.5),
+    ["Peanut Scout"]          = Vector3.new(-2104.4, 38.1, -10194.1),
+    ["Peanut President"]      = Vector3.new(-2104.4, 38.1, -10194.1),
+    ["Ice Cream Chef"]        = Vector3.new(-820.2, 65.8, -10966.2),
+    ["Ice Cream Commander"]   = Vector3.new(-820.2, 65.8, -10966.2),
+    ["Cookie Crafter"]        = Vector3.new(-2022.3, 36.9, -12030.9),
+    ["Cake Guard"]            = Vector3.new(-2022.3, 36.9, -12030.9),
+    ["Baking Staff"]          = Vector3.new(-1928.3, 37.7, -12840.6),
+    ["Head Baker"]            = Vector3.new(-1928.3, 37.7, -12840.6),
+    ["Cocoa Warrior"]         = Vector3.new(231.8, 23.9, -12200.3),
+    ["Chocolate Bar Battler"] = Vector3.new(231.8, 23.9, -12200.3),
+    ["Sweet Thief"]           = Vector3.new(151.2, 23.9, -12774.6),
+    ["Candy Rebel"]           = Vector3.new(151.2, 23.9, -12774.6),
+    ["Candy Pirate"]          = Vector3.new(-1149.3, 13.6, -14445.6),
+    ["Snow Demon"]            = Vector3.new(-1149.3, 13.6, -14445.6),
+    ["Isle Outlaw"]           = Vector3.new(-16549.9, 55.7, -179.9),
+    ["Island Boy"]            = Vector3.new(-16549.9, 55.7, -179.9),
+    ["Sun-kissed Warrior"]    = Vector3.new(-16541.0, 54.8, 1051.5),
+    ["Isle Champion"]         = Vector3.new(-16541.0, 54.8, 1051.5),
+    ["Serpent Hunter"]        = Vector3.new(-16665.2, 104.6, 1579.7),
+    ["Skull Slayer"]          = Vector3.new(-16665.2, 104.6, 1579.7),
+}
+P.giverPositions = GIVER_POS
 
 local QUESTS = {
     ["Bandit"]                = { "BanditQuest1", 1 },
@@ -1455,16 +1839,16 @@ local QUESTS = {
     ["Mercenary"]             = { "Area1Quest", 2 },
     ["Swan Pirate"]           = { "Area2Quest", 1 },
     ["Factory Staff"]         = { "Area2Quest", 2 },
-    ["Marine Lieutenant"]     = { "MarineQuest2", 1 },
-    ["Marine Captain"]        = { "MarineQuest2", 2 },
+    ["Marine Lieutenant"]     = { "MarineQuest3", 1 },
+    ["Marine Captain"]        = { "MarineQuest3", 2 },
     ["Zombie"]                = { "ZombieQuest", 1 },
     ["Vampire"]               = { "ZombieQuest", 2 },
     ["Snow Trooper"]          = { "SnowMountainQuest", 1 },
     ["Winter Warrior"]        = { "SnowMountainQuest", 2 },
     ["Lab Subordinate"]       = { "IceSideQuest", 1 },
     ["Horned Warrior"]        = { "IceSideQuest", 2 },
-    ["Magma Ninja"]           = { "MagmaSideQuest", 1 },
-    ["Lava Pirate"]           = { "MagmaSideQuest", 2 },
+    ["Magma Ninja"]           = { "FireSideQuest", 1 },
+    ["Lava Pirate"]           = { "FireSideQuest", 2 },
     ["Ship Deckhand"]         = { "ShipQuest1", 1 },
     ["Ship Engineer"]         = { "ShipQuest1", 2 },
     ["Ship Steward"]          = { "ShipQuest2", 1 },
@@ -1473,6 +1857,53 @@ local QUESTS = {
     ["Snow Lurker"]           = { "FrostQuest", 2 },
     ["Sea Soldier"]           = { "ForgottenQuest", 1 },
     ["Water Fighter"]         = { "ForgottenQuest", 2 },
+
+    -- THIRD SEA
+    -- None of this existed before, which is the whole reason the quest button
+    -- came back "no quest name known" on every Third Sea island: the table
+    -- stopped at Water Fighter. The names are the server's own quest ids, not
+    -- the titles the dialog shows.
+    ["Pirate Millionaire"]    = { "PiratePortQuest", 1 },
+    ["Pistol Billionaire"]    = { "PiratePortQuest", 2 },
+    ["Dragon Crew Warrior"]   = { "AmazonQuest", 1 },
+    ["Dragon Crew Archer"]    = { "AmazonQuest", 2 },
+    ["Female Islander"]       = { "AmazonQuest2", 1 },
+    ["Giant Islander"]        = { "AmazonQuest2", 2 },
+    ["Marine Commodore"]      = { "MarineTreeIsland", 1 },
+    ["Marine Rear Admiral"]   = { "MarineTreeIsland", 2 },
+    ["Fishman Raider"]        = { "DeepForestIsland3", 1 },
+    ["Fishman Captain"]       = { "DeepForestIsland3", 2 },
+    ["Forest Pirate"]         = { "DeepForestIsland", 1 },
+    ["Mythological Pirate"]   = { "DeepForestIsland", 2 },
+    ["Jungle Pirate"]         = { "DeepForestIsland2", 1 },
+    ["Musketeer Pirate"]      = { "DeepForestIsland2", 2 },
+    -- HAUNTED CASTLE. Two givers, two quests, two tiers each.
+    --   Giver 1, in the grey hut in the middle : Reborn Skeleton, Living Zombie
+    --   Giver 2, at the castle's front door    : Demonic Soul, Posessed Mummy
+    ["Reborn Skeleton"]       = { "HauntedQuest1", 1 },
+    ["Living Zombie"]         = { "HauntedQuest1", 2 },
+    ["Demonic Soul"]          = { "HauntedQuest2", 1 },
+    ["Posessed Mummy"]        = { "HauntedQuest2", 2 },
+    ["Peanut Scout"]          = { "NutsIslandQuest", 1 },
+    ["Peanut President"]      = { "NutsIslandQuest", 2 },
+    ["Ice Cream Chef"]        = { "IceCreamIslandQuest", 1 },
+    ["Ice Cream Commander"]   = { "IceCreamIslandQuest", 2 },
+    ["Cookie Crafter"]        = { "CakeQuest1", 1 },
+    ["Cake Guard"]            = { "CakeQuest1", 2 },
+    ["Baking Staff"]          = { "CakeQuest2", 1 },
+    ["Head Baker"]            = { "CakeQuest2", 2 },
+    ["Cocoa Warrior"]         = { "ChocQuest1", 1 },
+    ["Chocolate Bar Battler"] = { "ChocQuest1", 2 },
+    ["Sweet Thief"]           = { "ChocQuest2", 1 },
+    ["Candy Rebel"]           = { "ChocQuest2", 2 },
+    ["Candy Pirate"]          = { "CandyQuest1", 1 },
+    ["Snow Demon"]            = { "CandyQuest1", 2 },
+    ["Isle Outlaw"]           = { "TikiQuest1", 1 },
+    ["Island Boy"]            = { "TikiQuest1", 2 },
+    ["Sun-kissed Warrior"]    = { "TikiQuest2", 1 },
+    ["Isle Champion"]         = { "TikiQuest2", 2 },
+    ["Serpent Hunter"]        = { "TikiQuest3", 1 },
+    ["Skull Slayer"]          = { "TikiQuest3", 2 },
 }
 P.quests = QUESTS
 
@@ -1609,7 +2040,7 @@ function P.giverFor(enemy)
     if not enemy then return nil, nil end
     return (CFG.QuestGiverName ~= "" and CFG.QuestGiverName)
         or P.learnedGivers[enemy] or GIVER_NAMES[enemy],
-        P.giverSpots[enemy] or P.giverPos
+        P.giverSpots[enemy] or GIVER_POS[enemy] or P.giverPos
 end
 
 -- ONE accept attempt.
@@ -1662,7 +2093,9 @@ function P.acceptQuest(opts)
             want = P.learnedGivers[enemy] or GIVER_NAMES[enemy]
         end
 
-        local dest = (enemy and P.giverSpots[enemy]) or P.giverPos
+        -- saved by hand > the table > the one global spot you last saved
+        local dest = (enemy and (P.giverSpots[enemy] or GIVER_POS[enemy]))
+            or P.giverPos
         if not dest then
             -- Bounded on purpose. An unbounded search finds an NPC with the
             -- right name on a DIFFERENT island and flies you to it.
@@ -1684,14 +2117,24 @@ function P.acceptQuest(opts)
         end
         if dest then
             atGiver = true
-            say("flying to the quest giver")
             clearHold()
-            -- BESIDE it at its own height. The proximity check is a sphere
-            -- around the NPC, and hovering overhead sits outside it.
-            local stand = dest + Vector3.new(0, 3, 5)
-            moveTo(stand, MOVE_SPEED)
-            setHold(CFrame.new(stand, dest))
-            task.wait(0.35)
+            if groundOn() then
+                -- Walk up to it and stand there like a person queueing for a
+                -- quest. No hold afterwards: the hold is the hover.
+                say("walking to the quest giver")
+                walkTo(dest, { arrive = 8, budget = 45 })
+                local _, r = parts()
+                if r then faceGround(r, dest) end
+                task.wait(jitter(0.4, 1.0))
+            else
+                -- BESIDE it at its own height. The proximity check is a sphere
+                -- around the NPC, and hovering overhead sits outside it.
+                say("flying to the quest giver")
+                local stand = dest + Vector3.new(0, 3, 5)
+                moveTo(stand, MOVE_SPEED)
+                setHold(CFrame.new(stand, dest))
+                task.wait(0.35)
+            end
         end
     end
 
@@ -1788,7 +2231,7 @@ function P.acceptQuest(opts)
 
     if atGiver and CFG.QuestReturnToFarm and home then
         clearHold()
-        moveTo(home, MOVE_SPEED)
+        goTo(home, { arrive = 10, budget = 45 })
     end
     clearHold()
     if P.running then
@@ -1990,8 +2433,19 @@ local function escalate(currentCluster)
         clearHold()
 
     elseif escalation == 3 then
-        say("stuck: reinstalling fast attack")
-        installFastAttack()
+        if groundOn() then
+            -- No hook to reinstall here. Stuck on the ground almost always
+            -- means the thing is behind something, so back off and re-path.
+            say("stuck: backing off and re-pathing")
+            local _, r, h = parts()
+            if r and h then
+                h:MoveTo(r.Position - r.CFrame.LookVector * 12)
+                task.wait(0.8)
+            end
+        else
+            say("stuck: reinstalling fast attack")
+            installFastAttack()
+        end
         equipWeapon()
         clearHold()
 
@@ -2097,6 +2551,33 @@ local function retreat()
     stats.retreats += 1
     say("retreating - low health")
     local _, root = parts()
+
+    -- GROUND MODE: a player who is losing runs away. Straight up 200 studs is
+    -- not a retreat, it is a flight, so instead it turns its back on whatever
+    -- is nearest and walks until the bar comes back.
+    if groundOn() then
+        local deadline = os.clock() + math.max(CFG.RegenWait, 6)
+        while P.running and os.clock() < deadline do
+            local _, r, h = parts()
+            if not r or not h then break end
+            if healthPct() > 0.9 then break end
+            local away = r.Position
+            local near = liveEnemies(nil)
+            if #near > 0 then
+                local sum = Vector3.zero
+                for _, e in ipairs(near) do sum += e.root.Position end
+                local threat = sum / #near
+                local dir = (r.Position - threat)
+                dir = Vector3.new(dir.X, 0, dir.Z)
+                if dir.Magnitude > 0.1 then away = r.Position + dir.Unit * 60 end
+            end
+            h:MoveTo(away)
+            task.wait(0.5)
+        end
+        progress()
+        return
+    end
+
     local safeSpot
     if root then
         local p = root.Position
@@ -2153,6 +2634,13 @@ local function step()
     end
 
     -- ---------- find work ----------
+    -- STRICT. With this on, the chosen names are the entire world. Every
+    -- widening rule below -- the backup list, the quest override, "hit
+    -- whatever is loaded" -- is skipped, and an empty island means it waits
+    -- for a respawn instead of finding something else to hit. That is the
+    -- switch that stops it drifting onto an NPC you never picked.
+    local strict = CFG.StrictTarget and activeNames ~= nil and not anyEnemyMode
+
     -- While rotating, only the focused type counts as work.
     local wantNames = (CFG.RotateTypes and focusSet) or activeNames
     activeFilter = wantNames
@@ -2160,7 +2648,9 @@ local function step()
 
     -- A quest counts kills of ONE species, so while the quest loop is running
     -- that species outranks the rotation: killing anything else moves nothing.
-    if CFG.AutoQuest and P.questEnemy then
+    -- Under STRICT it still has to be a species you actually chose.
+    if CFG.AutoQuest and P.questEnemy
+        and (not strict or activeNames[P.questEnemy]) then
         local qset = { [P.questEnemy] = true }
         local qlist = liveEnemies(qset)
         if #qlist > 0 then
@@ -2177,7 +2667,7 @@ local function step()
 
     -- Primaries are all dead and on a respawn timer. Instead of hovering over
     -- empty ground, work the BACKUP names until they come back.
-    if #list == 0 and CFG.UseSecondary and secondaryNames and next(secondaryNames) then
+    if #list == 0 and not strict and CFG.UseSecondary and secondaryNames and next(secondaryNames) then
         list = liveEnemies(secondaryNames)
         if #list > 0 then
             activeFilter = secondaryNames
@@ -2185,21 +2675,34 @@ local function step()
         end
     end
 
-    if #list == 0 and CFG.AnyEnemyFallback and activeNames then
+    if #list == 0 and not strict and CFG.AnyEnemyFallback and activeNames then
         activeFilter = nil           -- nothing selected is loaded: take any EXP
         list = liveEnemies(nil)
         if #list > 0 then say("selected enemies absent - hitting what is loaded") end
     end
 
     if #list == 0 then
+        -- Nothing to aim at, so the view goes back to the player.
+        releaseCamera()
         -- ---------- TRAVEL ----------
+        -- STRICT and already standing on the right patch: there is nothing to
+        -- travel to, the species is simply on its respawn timer. Wait for it.
+        if strict and travelGoal
+            and (travelGoal - root.Position).Magnitude < (CFG.RecentreDistance or 60) * 3 then
+            say(string.format("waiting for %s to respawn",
+                tostring(P.focusName or "targets")))
+            task.wait(jitter(1.5, 3.5))
+            return
+        end
         if travelGoal then
             if state ~= "TRAVEL" then
                 setState("TRAVEL")
                 stats.travels += 1
             end
             local far = (travelGoal - root.Position).Magnitude
-            if far > (CFG.MaxAutoTravel or 1500) then
+            local cap = groundOn() and (CFG.GroundTravelMax or 1200)
+                or (CFG.MaxAutoTravel or 1500)
+            if far > cap then
                 -- The farm does not cross the map on its own. A level-table row
                 -- pointing at another island is how it ended up at the
                 -- Underwater City while farming the desert.
@@ -2208,10 +2711,18 @@ local function step()
                 task.wait(2)
                 return
             end
-            say("no targets loaded - flying to the farm spot")
-            P.flyTo(travelGoal)
-            task.wait(0.3)
-            if os.clock() - stateEnteredAt > CFG.TravelTimeout then
+            if groundOn() then
+                say("no targets loaded - walking to the farm spot")
+                walkTo(travelGoal, { arrive = 12, budget = 60 })
+                task.wait(jitter(0.3, 0.8))
+            else
+                say("no targets loaded - flying to the farm spot")
+                P.flyTo(travelGoal)
+                task.wait(0.3)
+            end
+            local travelCap = groundOn() and math.max(CFG.TravelTimeout, 120)
+                or CFG.TravelTimeout
+            if os.clock() - stateEnteredAt > travelCap then
                 say("travel timeout - re-resolving")
                 setState("RESOLVE")
             end
@@ -2236,8 +2747,12 @@ local function step()
         local centre = sum / #list
         if (root.Position - centre).Magnitude > CFG.RecentreDistance then
             say("centring on " .. tostring(P.focusName or "targets"))
-            moveTo(centre + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
-            setAnchor(centre, nil)
+            if groundOn() then
+                walkTo(centre, { arrive = 14, budget = 30 })
+            else
+                moveTo(centre + Vector3.new(0, CFG.HoverHeight, 0), MOVE_SPEED)
+                setAnchor(centre, nil)
+            end
             local _, r2 = parts()
             if r2 then root = r2 end
         end
@@ -2263,7 +2778,13 @@ local function step()
 
     -- With MAGNET on the enemy comes to us, so travelling to it is wasted
     -- motion, and moving would drag the whole stack across the island.
-    if CFG.Magnet then
+    if groundOn() then
+        -- Walk to it. It will hit back, and that is the trade: a character
+        -- that takes damage is a character the server can explain.
+        clearHold()
+        walkTo(target.root.Position, { arrive = CFG.GroundReach, budget = 25 })
+        progress()          -- the walk counts; it is not a stall
+    elseif CFG.Magnet then
         setHold(flatCF(root.CFrame))
     else
         -- Go to it, slightly above so melee AI cannot path to us.
@@ -2284,6 +2805,9 @@ local function step()
                 stats.kills += 1
             end
             progress()
+            -- A person does not begin the next fight on the same tick the last
+            -- one ended. Only ground mode pays for this.
+            if groundOn() then task.wait(breathe()) end
             break
         end
 
@@ -2293,21 +2817,37 @@ local function step()
         -- Re-seat on the target each swing; it moves, and so do we.
         -- setHold is what stops the slow sink between swings: without it the
         -- position is written once and gravity undoes it before the next one.
-        if CFG.Magnet then
-            if not holdCF then setHold(flatCF(r.CFrame)) end
-        else
-            -- follow it: the anchor is the ground point, so hover height and
-            -- tilt stay live while the hold loop does the actual pinning
-            setAnchor(target.root.Position, target.root.Position)
-            local tp = target.root.Position + Vector3.new(0, CFG.HoverHeight, 0)
-            if (r.Position - tp).Magnitude > 12 then
-                r.CFrame = CFrame.new(tp, target.root.Position)
-                killVelocity(r)
+        if groundOn() then
+            -- Chase on foot when it walks off, face it when it is in reach,
+            -- and swing on an irregular clock. No CFrame follow, no hold.
+            local reach = CFG.GroundReach or 12
+            local d = (r.Position - target.root.Position).Magnitude
+            if d > reach + 4 then
+                walkTo(target.root.Position, { arrive = reach, budget = 6 })
+                progress()
+            else
+                faceGround(r, target.root.Position)
             end
-        end
+            aimCameraAt(r, target.root.Position)
+            swing()
+            task.wait(swingGap())
+        else
+            if CFG.Magnet then
+                if not holdCF then setHold(flatCF(r.CFrame)) end
+            else
+                -- follow it: the anchor is the ground point, so hover height and
+                -- tilt stay live while the hold loop does the actual pinning
+                setAnchor(target.root.Position, target.root.Position)
+                local tp = target.root.Position + Vector3.new(0, CFG.HoverHeight, 0)
+                if (r.Position - tp).Magnitude > 12 then
+                    r.CFrame = CFrame.new(tp, target.root.Position)
+                    killVelocity(r)
+                end
+            end
 
-        swing()
-        task.wait(CFG.AttackGap)
+            swing()
+            task.wait(CFG.AttackGap)
+        end
 
         if hum.Health < lastHP - 0.5 then
             stats.damaging += 1
@@ -2324,7 +2864,12 @@ local function step()
         end
     end
 
-    if os.clock() - lastProgressAt > CFG.StuckSeconds then
+    -- Seven seconds of no damage means stuck when you are hovering on top of
+    -- the thing. On foot it just means you are still walking, so the window is
+    -- widened rather than the ladder disabled.
+    local stuckWindow = groundOn() and math.max(CFG.StuckSeconds, 30)
+        or CFG.StuckSeconds
+    if os.clock() - lastProgressAt > stuckWindow then
         blacklist[target.model] = os.clock() + 20
         escalate(nil)
     end
@@ -2370,8 +2915,9 @@ local function watchdog()
         if stats.swings ~= lastSwings then
             lastSwings = stats.swings
             lastSeen = os.clock()
-        elseif os.clock() - lastSeen > 20 and state == "ENGAGE" then
-            say("watchdog: no swings in 20s - forcing re-resolve")
+        elseif os.clock() - lastSeen > (groundOn() and 75 or 20)
+            and state == "ENGAGE" then
+            say("watchdog: no swings for a long time - forcing re-resolve")
             escalation = 0
             setState("RESOLVE")
             lastSeen = os.clock()
@@ -3617,16 +4163,27 @@ local function buildUI()
             hero.TextColor3 = P.running and C.text or C.base
         end)
 
-        gap(v, 18)
+        gap(v, 16)
+
+        -- The posture, not a tuning knob: it changes how everything below it
+        -- behaves, so it sits with the start button rather than in Tuning.
+        switchRow(v, "Ground mode",
+            "Walks and collides. No hover, no magnet, no hook.",
+            function() return CFG.GroundMode end,
+            function(x) P.setGroundMode(x) end)
+
+        gap(v, 10)
 
         navRow(v, "Targets", function()
             local prim, back = selectionLists()
-            if #prim == 0 then return "by level" end
+            local lock = CFG.StrictTarget and "  ·  locked" or ""
+            if #prim == 0 then return "by level" .. lock end
             return prim[1] .. (#prim > 1 and (" +" .. (#prim - 1)) or "")
-                .. (#back > 0 and "  ·  " .. #back .. " backup" or "")
+                .. (#back > 0 and "  ·  " .. #back .. " backup" or "") .. lock
         end, "targets")
         hairline(v)
         navRow(v, "Magnet", function()
+            if CFG.GroundMode then return "off in ground mode" end
             if not CFG.Magnet then return "off" end
             local where = (CFG.StackX == 0 and CFG.StackZ == 0) and "under"
                 or ((CFG.StackY or 0) == 0 and "level" or "ahead")
@@ -3747,6 +4304,17 @@ local function buildUI()
             end
             startFarm()
         end)
+
+        gap(v, 8)
+        heading2(v, "nothing else")
+        switchRow(v, "Only what I picked",
+            "No backups, no improvising, no other species. Ever.",
+            function() return CFG.StrictTarget end,
+            function(x) CFG.StrictTarget = x end)
+        caption(v, "On, an empty island means it stands and waits for the "
+            .. "respawn. Off, it fills the gap with backups and then with "
+            .. "whatever is loaded, which is how it ends up on an NPC you "
+            .. "never chose.")
 
         gap(v, 8)
         heading2(v, "one type at a time")
@@ -4251,6 +4819,34 @@ local function buildUI()
         actionRow(v, "Let go", nil, function() clearHold() end)
 
         gap(v, 8)
+        heading2(v, "on foot")
+        sliderRow(v, "Swing from", 4, 40, 1,
+            function() return CFG.GroundReach end,
+            function(x) CFG.GroundReach = x end, " studs")
+        sliderRow(v, "Walk limit", 200, 4000, 100,
+            function() return CFG.GroundTravelMax end,
+            function(x) CFG.GroundTravelMax = x end, " studs")
+        sliderRow(v, "Rest after a kill", 0, 6, 0.2,
+            function() return CFG.GroundBreathMax end,
+            function(x)
+                CFG.GroundBreathMax = x
+                CFG.GroundBreathMin = math.min(CFG.GroundBreathMin, x)
+            end, "s")
+        switchRow(v, "Jump when the walk sticks", nil,
+            function() return CFG.GroundStuckJump end,
+            function(x) CFG.GroundStuckJump = x end)
+        switchRow(v, "Point the camera at the fight",
+            "Skills go where the camera looks, not where the body faces",
+            function() return CFG.GroundAimCamera end,
+            function(x)
+                CFG.GroundAimCamera = x
+                if not x then P.releaseCamera() end
+            end)
+        caption(v, "Ground mode only. Reach is how close it walks before it "
+            .. "starts swinging, and the rest is the pause it takes between "
+            .. "one kill and the next.")
+
+        gap(v, 8)
         heading2(v, "how far it may wander")
         sliderRow(v, "Farm travel limit", 200, 6000, 100,
             function() return CFG.MaxAutoTravel end,
@@ -4417,7 +5013,9 @@ function P.start(names, opts)
     moveEnabled = true
     setState("RESOLVE")
 
-    installFastAttack()
+    -- The fast-attack hook rewrites the combat controller's clock and hitbox
+    -- in memory every frame. Ground mode does not install it at all.
+    if not groundOn() then installFastAttack() end
     equipWeapon()
     startStabilizer()
     syncPuller()
@@ -4433,7 +5031,7 @@ function P.start(names, opts)
     track(player.CharacterAdded:Connect(function()
         task.wait(2)
         equipWeapon()
-        installFastAttack()
+        if not groundOn() then installFastAttack() end
         progress()
     end))
 
@@ -4449,6 +5047,7 @@ function P.stop()
     task.delay(0.3, function() moveEnabled = true end)
     fastOn = false
     pcall(P.releaseM1)
+    pcall(releaseCamera)
     clearHold()
     cancelMove()
     stopStabilizer()
@@ -4460,6 +5059,9 @@ function P.stop()
     say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d escalations=%d", stats.kills, stats.swings, stats.escalations))
 end
+
+-- Console shorthand:  _G.BFP.ground(true)
+function P.ground(on) return P.setGroundMode(on ~= false) end
 
 -- Backup enemy set. Farmed only while the primaries are on their respawn
 -- timer, then dropped the moment a primary is loaded again.
