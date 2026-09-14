@@ -107,10 +107,17 @@ local CFG = {
     --   fruit M1 whose hitbox starts out from the body : 12-18
     StandOff           = 8,
     StandSlack         = 2,      -- drift allowed before it corrects
-    -- Skills are cast down the CURSOR's ray, and the cursor rides the middle
-    -- of the screen. Turning the body does not move the camera, so the camera
-    -- is aimed instead. Handed back the moment the farm stops.
-    AimCamera          = true,
+    -- FACING. A melee M1 -- a sword, or a fighting style like Sanguine Art --
+    -- swings where the BODY points, so the body is pinned at the target and
+    -- re-pinned every pass. This is what makes hits land; without it the
+    -- character drifts off-axis between swings and the arc misses.
+    FaceLock           = true,
+    -- AIMING THE CAMERA IS A SEPARATE, HEAVIER THING, AND IT IS NOW OFF.
+    -- It takes the camera (Scriptable, so your mouse look is dead) and parks
+    -- your cursor at the centre of the screen. That is only worth paying for
+    -- fruit skills, which are cast down the cursor's ray. For melee it buys
+    -- nothing and costs you the view and control of your own mouse.
+    AimCamera          = false,
     CamBack            = 13,
     CamUp              = 5,
 
@@ -149,7 +156,14 @@ local CFG = {
     -- again. It is not a limit on kills -- it chains targets the whole time.
     SweepSeconds       = 10,
     StuckSeconds       = 30,
-    TargetTimeout      = 45,
+    -- WHEN TO GIVE UP ON ONE ENEMY.
+    -- This used to be a wall clock: 45 seconds on a target and it was parked
+    -- regardless. With a slower weapon a perfectly healthy fight simply ran
+    -- out of time and got abandoned half-killed. It is now measured from the
+    -- last time its HEALTH DROPPED, so a fight that is being won never
+    -- expires, however long it takes, and one that is not moving at all is
+    -- parked quickly.
+    GiveUpSeconds      = 12,
     JumpWhenStuck      = true,
     Debug              = false,
 }
@@ -561,6 +575,10 @@ local farmSpot       = nil     -- where that species lives
 -- sweeps on purpose: a respawn is a NEW model instance, so it is not in here
 -- and is fair game, while the ones still standing untouched stay preferred.
 local sweptModels    = {}
+-- The one currently being fought. It outranks everything in pickNext, because
+-- a half-killed enemy is worth more than a fresh one and walking away from it
+-- wastes every swing already spent.
+local engagedModel   = nil
 
 P.learnedGivers = {}
 P.learnedQuests = {}
@@ -875,11 +893,16 @@ end
 
 -- Turn to face something without moving. Yaw only, which is what a mouse turn
 -- produces; the position is untouched.
-local function faceTarget(root, targetPos)
+-- 0.94 is about twenty degrees of slop, which was fine for walking up to a
+-- quest giver and useless for landing a swing: the body sat up to twenty
+-- degrees off and the arc went past the enemy. Tight now, so the aim is
+-- re-asserted on essentially every pass.
+local function faceTarget(root, targetPos, tight)
     local flat = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
     if (flat - root.Position).Magnitude < 0.5 then return end
     local want = CFrame.new(root.Position, flat)
-    if root.CFrame.LookVector:Dot(want.LookVector) > 0.94 then return end
+    local slop = tight and 0.9995 or 0.94
+    if root.CFrame.LookVector:Dot(want.LookVector) > slop then return end
     root.CFrame = want
 end
 
@@ -1035,16 +1058,25 @@ local function station(targetRoot)
     local spot  = them - dir * want
 
     if d > want + slack then
-        if d > 45 then
-            walkTo(spot, { arrive = want + slack, budget = 12 })
+        -- walkTo BLOCKS. It runs ComputeAsync and then sits on waypoints, and
+        -- while it does that nothing swings -- which is the "it just stands
+        -- there in the middle of a fight" you can see from outside. So it is
+        -- only used when the target is genuinely far; anything nearer gets a
+        -- plain MoveTo, which returns immediately and lets the loop keep
+        -- hitting. An approach that cannot close is caught by GiveUpSeconds
+        -- rather than by blocking here for twelve seconds.
+        if d > 120 then
+            walkTo(spot, { arrive = want + slack, budget = 4 })
         else
             h:MoveTo(Vector3.new(spot.X, me.Y, spot.Z))
         end
+        if CFG.FaceLock then faceTarget(r, them, true) end
     elseif d < want - slack then
         h:MoveTo(Vector3.new(spot.X, me.Y, spot.Z))
+        if CFG.FaceLock then faceTarget(r, them, true) end
     else
         h:MoveTo(me)                 -- stop; we are where we want to be
-        faceTarget(r, them)
+        faceTarget(r, them, CFG.FaceLock)
     end
     return d
 end
@@ -1097,6 +1129,11 @@ local function pickNext(list, pos, seen)
     local fresh, freshD = nil, math.huge
     for _, e in ipairs(list) do
         local d = (e.root.Position - pos).Magnitude
+        -- Already fighting this one: finish it. The sweep boundary used to cut
+        -- across a live engagement -- ten seconds elapse, the loop re-enters,
+        -- and the half-killed enemy is now "already seen" so a FRESH one wins.
+        -- That is the turning-around-mid-fight you can watch it do.
+        if e.model == engagedModel then return e, d end
         if d < bestD then best, bestD = e, d end
         if not seen[e.model] and d < freshD then fresh, freshD = e, d end
     end
@@ -1797,6 +1834,7 @@ local function step()
         end
         activeName, farmSpot = name, spot
         table.clear(sweptModels)
+        engagedModel = nil
         say("target: " .. name)
         setState("FIGHT")
         progress()
@@ -1859,8 +1897,9 @@ local function step()
     local target, bestD = pickNext(list, root.Position, seen)
     if not target then task.wait(0.3) return end
     seen[target.model] = true
-    local timeout = os.clock() + CFG.TargetTimeout
-    local lastHP  = target.hum.Health
+    engagedModel = target.model
+    local lastHitAt = os.clock()       -- last time this one's health moved
+    local lastHP    = target.hum.Health
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -1887,10 +1926,15 @@ local function step()
                 end
             end
         end
-        -- One that cannot be killed in TargetTimeout is behind something or
-        -- out of reach. Park it and move on rather than spending the sweep.
-        local expired = (not gone) and (not dead) and os.clock() > timeout
-        if expired then blacklist[m] = os.clock() + 30 end
+        -- Nothing landing for GiveUpSeconds means it is behind something or
+        -- out of reach. A fight that IS landing never expires, however slow
+        -- the weapon: the clock is reset by damage, not by the wall.
+        local expired = (not gone) and (not dead)
+            and (os.clock() - lastHitAt) > (CFG.GiveUpSeconds or 12)
+        if expired then
+            blacklist[m] = os.clock() + 30
+            say("nothing landing on this one - leaving it")
+        end
 
         if gone or dead or expired then
             -- Only pause here if you have actually asked for a pause.
@@ -1902,8 +1946,9 @@ local function step()
             if not nxt then break end          -- camp is clear; step() decides
             target  = nxt
             seen[target.model] = true
-            timeout = os.clock() + CFG.TargetTimeout
-            lastHP  = target.hum.Health
+            engagedModel = target.model
+            lastHitAt = os.clock()
+            lastHP    = target.hum.Health
             tryDash(nd)                        -- close the gap like a player
             say(string.format("%s  %.0f studs  hp %.0f", target.name, nd, lastHP))
             task.wait()                        -- one frame, so this cannot spin
@@ -1929,9 +1974,18 @@ local function step()
 
         if hum.Health < lastHP - 0.5 then
             stats.damaging += 1
+            lastHitAt = os.clock()     -- it is working; do not time this out
             progress()
         end
         lastHP = hum.Health
+    end
+    -- The sweep ended with this one still alive (count filled, or the clock
+    -- ran out). Leave it flagged so the next pass picks it straight back up
+    -- instead of turning to a fresh one.
+    if target and target.hum and target.hum.Health > 0 then
+        engagedModel = target.model
+    else
+        engagedModel = nil
     end
 
     if math.random() < 0.02 then
@@ -2757,13 +2811,31 @@ local function buildUI()
             .. "over the enemy. It closes in AND backs off to hold the number, "
             .. "so the enemy stays in front of you either way.")
 
-        switchRow(v, "Point the camera at it",
-            "Skills fire down the cursor ray, not where the body faces",
+        switchRow(v, "Lock the body on the target",
+            "A melee swing goes where the body points",
+            function() return CFG.FaceLock end,
+            function(x) CFG.FaceLock = x end)
+        switchRow(v, "Take the camera and aim it",
+            "Off: your view and your cursor stay yours",
             function() return CFG.AimCamera end,
             function(x)
                 CFG.AimCamera = x
                 if not x then releaseCamera() end
             end)
+        caption(v, "Two different things. Locking the BODY costs you nothing "
+            .. "and is what makes a sword or a fighting style land. Taking the "
+            .. "CAMERA is only worth it for fruit skills, which fire down the "
+            .. "cursor ray - and it makes your mouse look dead and parks your "
+            .. "cursor at the middle of the screen, which is your cursor "
+            .. "fighting the script for the aim.")
+
+        sliderRow(v, "Give up if nothing lands for", 3, 60, 1,
+            function() return CFG.GiveUpSeconds end,
+            function(x) CFG.GiveUpSeconds = x end, "s")
+        caption(v, "Measured from the last time the enemy's health actually "
+            .. "moved, not from when the fight started - so a slow kill is "
+            .. "never abandoned half-finished, and something you cannot reach "
+            .. "is dropped quickly.")
 
         gap(v, 8)
         heading2(v, "what gets pressed")
