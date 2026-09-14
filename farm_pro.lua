@@ -116,7 +116,16 @@ local CFG = {
 
     -- ---------- QUEST LOOP ----------
     QuestLoop          = true,
-    QuestWalkToGiver   = true,   -- the server refuses the accept otherwise
+    -- WHO HAS TO WALK.
+    --   "auto"   : ask from wherever you are standing. If that comes back with
+    --              nothing, walk up and ask again -- once -- and remember the
+    --              answer for that species from then on.
+    --   "always" : walk to the giver every cycle, whatever it costs.
+    --   "never"  : never walk. Ask from range and take what you get.
+    -- Auto is the default because the right answer is per island, not global:
+    -- the Demonic Soul giver is at the door, the Posessed Mummies are
+    -- underground, and walking back up for them is most of the cycle.
+    GiverMode          = "auto",
     QuestReturnToFarm  = true,
     QuestGiverName     = nil,    -- exact NPC name; blank = use the table
     QuestName          = nil,    -- exact server quest id; blank = look it up
@@ -551,6 +560,9 @@ local farmSpot       = nil     -- where that species lives
 P.learnedGivers = {}
 P.learnedQuests = {}
 P.giverSpots    = {}
+-- enemy -> true if the accept only works standing at the giver, false if it
+-- works from range. nil means it has not been probed yet.
+P.giverNeeded   = {}
 P.lockedQuest   = nil
 
 -- THE ABORT EPOCH.
@@ -1414,6 +1426,7 @@ function P.clearGiver()
     if e then
         P.giverSpots[e] = nil
         P.learnedGivers[e] = nil
+        P.giverNeeded[e] = nil      -- re-test whether the walk is needed too
     end
     say("giver reset to the table")
 end
@@ -1468,7 +1481,16 @@ function P.acceptQuest(opts)
     local home = root and root.Position
     local atGiver = false
 
-    if CFG.QuestWalkToGiver then
+    -- THE WALK IS NOT ALWAYS NECESSARY, AND IT IS THE EXPENSIVE PART.
+    -- Roughly 230 studs each way at Haunted Castle, for eight kills. Whether
+    -- the server actually checks your distance turns out to vary, so this
+    -- measures it once per species instead of assuming either way.
+    local mode = CFG.GiverMode or "auto"
+    local probing = (mode == "auto") and (P.giverNeeded[enemy] == nil)
+    local mustWalk = (mode == "always")
+        or (mode == "auto" and P.giverNeeded[enemy] == true)
+
+    local function goToGiver()
         local wantName, dest = P.giverFor(enemy)
         if not dest then
             -- Bounded on purpose: an unbounded search finds an NPC with the
@@ -1484,20 +1506,22 @@ function P.acceptQuest(opts)
                 P.giverName = giver.name
             end
         end
-        if dest then
-            atGiver = true
-            setState("TO GIVER")
-            say("walking to the quest giver")
-            walkTo(dest, { arrive = 8, budget = 60 })
-            if stale(myEpoch) then
-                P.lastQuestResult = "stopped on the way to the giver"
-                say(P.lastQuestResult)
-                return false
-            end
-            local _, r = parts()
-            if r then faceTarget(r, dest) end
-            task.wait(jitter(0.4, 1.0))
-        end
+        if not dest then return true end          -- nowhere to walk; ask anyway
+        atGiver = true
+        setState("TO GIVER")
+        say("walking to the quest giver")
+        walkTo(dest, { arrive = 8, budget = 60 })
+        if stale(myEpoch) then return false end
+        local _, r = parts()
+        if r then faceTarget(r, dest) end
+        task.wait(jitter(0.4, 1.0))
+        return true
+    end
+
+    if mustWalk and not goToGiver() then
+        P.lastQuestResult = "stopped on the way to the giver"
+        say(P.lastQuestResult)
+        return false
     end
 
     -- Last gate before the remote. Everything above this point is movement and
@@ -1533,39 +1557,60 @@ function P.acceptQuest(opts)
     end
 
     local q, ok, res
-    for i, t in ipairs(tiers) do
-        if stale(myEpoch) then break end
-        ok, res = pcall(function()
-            return commF:InvokeServer("StartQuest", qname, t)
-        end)
-        task.wait(0.45)
-        q = P.readQuest(true)
+    local function attempt()
+        local gotQ, gotOk, gotRes
+        for i, t in ipairs(tiers) do
+            if stale(myEpoch) then break end
+            gotOk, gotRes = pcall(function()
+                return commF:InvokeServer("StartQuest", qname, t)
+            end)
+            task.wait(0.45)
+            gotQ = P.readQuest(true)
 
-        if not q and atGiver and i == 1 then
-            say("remote refused - talking to the NPC")
-            for _ = 1, 3 do
-                pcall(function()
-                    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                    task.wait(0.07)
-                    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-                end)
-                task.wait(0.3)
+            if not gotQ and atGiver and i == 1 then
+                say("remote refused - talking to the NPC")
+                for _ = 1, 3 do
+                    pcall(function()
+                        VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                        task.wait(0.07)
+                        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                    end)
+                    task.wait(0.3)
+                end
+                pcall(clickQuestDialog, enemy)
+                task.wait(0.5)
+                gotQ = P.readQuest(true)
             end
-            pcall(clickQuestDialog, enemy)
-            task.wait(0.5)
-            q = P.readQuest(true)
-        end
 
-        tier = t
-        if not q then break end
-        if wanted(q.enemy) then break end
-        if i == #tiers then
-            say(string.format("no tier of %s asks for %s", tostring(qname), tostring(enemy)))
-            break
+            tier = t
+            if not gotQ then break end
+            if wanted(gotQ.enemy) then break end
+            if i == #tiers then
+                say(string.format("no tier of %s asks for %s",
+                    tostring(qname), tostring(enemy)))
+                break
+            end
+            say(string.format("tier %d wants %s - trying tier %d", t,
+                tostring(gotQ.enemy), tiers[i + 1]))
         end
-        say(string.format("tier %d wants %s - trying tier %d", t,
-            tostring(q.enemy), tiers[i + 1]))
+        return gotQ, gotOk, gotRes
     end
+
+    q, ok, res = attempt()
+
+    -- THE ONE PROBE.
+    -- Asked from range and got nothing back, and we have never tested this
+    -- species: walk up and ask once more. Bounded to the first cycle on
+    -- purpose -- an unreadable tracker also returns nothing, and re-asking on
+    -- a quest that DID start would reset its count. One risk, once, and the
+    -- answer is kept for every cycle afterwards.
+    if not q and probing and not atGiver and not stale(myEpoch) then
+        say("nothing from here - walking up to test whether it is required")
+        if goToGiver() then q, ok, res = attempt() end
+    end
+
+    -- Record what this species actually needs, either way.
+    if q and enemy then P.giverNeeded[enemy] = atGiver and true or false end
 
     local matched = (q ~= nil) and wanted(q.enemy)
     P.questMatched = matched
@@ -2860,13 +2905,50 @@ local function buildUI()
                 if x then P.armQuest() end
                 say(x and "quest loop on" or "quest loop off")
             end)
-        switchRow(v, "Walk to the giver",
-            "The server refuses the accept unless you are standing there",
-            function() return CFG.QuestWalkToGiver end,
-            function(x) CFG.QuestWalkToGiver = x end)
         switchRow(v, "Walk back afterwards", nil,
             function() return CFG.QuestReturnToFarm end,
             function(x) CFG.QuestReturnToFarm = x end)
+
+        gap(v, 8)
+        heading2(v, "does it have to walk to the giver")
+        local modeBox = chooser(v, 128)
+        local modeSig = nil
+        local MODES = {
+            { "auto",   "Find out and remember",  "asks from here first" },
+            { "always", "Always walk to it",      "safe, and the slow one" },
+            { "never",  "Never walk, ask anyway", "fastest if it works" },
+        }
+        local function modeRefresh()
+            local e = activeName or CFG.Target
+            local sig = tostring(CFG.GiverMode) .. "|" .. tostring(e)
+                .. "|" .. tostring(e and P.giverNeeded[e])
+            if sig == modeSig then return end
+            modeSig = sig
+            for _, c in ipairs(modeBox:GetChildren()) do
+                if c:IsA("GuiObject") then c:Destroy() end
+            end
+            for i, m in ipairs(MODES) do
+                local tag = m[3]
+                if m[1] == "auto" and e then
+                    local known = P.giverNeeded[e]
+                    if known == true then tag = e .. ": must walk"
+                    elseif known == false then tag = e .. ": range works" end
+                end
+                chooserRow(modeBox, i, m[2], tag, CFG.GiverMode == m[1], function()
+                    CFG.GiverMode = m[1]
+                    say("giver: " .. m[2])
+                    modeSig = nil
+                end)
+            end
+        end
+        modeRefresh()
+        addLive(modeRefresh)
+        caption(v, "The walk is the expensive part of the cycle - about 230 "
+            .. "studs each way at Haunted Castle, for eight kills, and far "
+            .. "worse for anything underground. Auto asks from wherever you "
+            .. "are standing, and only walks up if that comes back empty. It "
+            .. "tests once per species and keeps the answer, so Demonic Soul "
+            .. "and Posessed Mummy each get whatever they actually need.")
 
         readout(v, function()
             local e = activeName or CFG.Target
