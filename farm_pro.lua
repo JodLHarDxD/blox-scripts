@@ -557,6 +557,10 @@ local moveEnabled    = true
 
 local activeName     = nil     -- the ONE species being farmed
 local farmSpot       = nil     -- where that species lives
+-- Which enemies this camp-clearing run has already worked. Survives across
+-- sweeps on purpose: a respawn is a NEW model instance, so it is not in here
+-- and is fair game, while the ones still standing untouched stay preferred.
+local sweptModels    = {}
 
 P.learnedGivers = {}
 P.learnedQuests = {}
@@ -1605,7 +1609,11 @@ function P.acceptQuest(opts)
     -- loop. Auto only -- "never" means never, because it is your switch.
     if not q and mode == "auto" and not atGiver and not stale(myEpoch) then
         say("nothing from here - walking up and asking again")
-        if goToGiver() then q, ok, res = attempt() end
+        -- atGiver is only set once a destination was actually found and
+        -- walked to. Without that guard this re-asks from the same spot, and a
+        -- second StartQuest on a quest that DID start resets its count.
+        local moved = goToGiver() and atGiver
+        if moved then q, ok, res = attempt() end
     end
 
     local matched = (q ~= nil) and wanted(q.enemy)
@@ -1788,6 +1796,7 @@ local function step()
             return
         end
         activeName, farmSpot = name, spot
+        table.clear(sweptModels)
         say("target: " .. name)
         setState("FIGHT")
         progress()
@@ -1845,7 +1854,7 @@ local function step()
     local want     = math.max(CFG.StandOff or 8, 1)
     local slack    = math.max(CFG.StandSlack or 2, 0.5)
     local sweepEnd = os.clock() + (CFG.SweepSeconds or 10)
-    local seen     = {}
+    local seen     = sweptModels
 
     local target, bestD = pickNext(list, root.Position, seen)
     if not target then task.wait(0.3) return end
@@ -1865,6 +1874,18 @@ local function step()
             countedDead[m] = os.clock()
             stats.kills += 1
             progress()
+            -- The build before this one checked the quest after every kill.
+            -- The sweep would not have looked again for SweepSeconds, which
+            -- leaves a finished count sitting there doing nothing. Cheap read,
+            -- cached for half a second anyway, and it ends the sweep the
+            -- instant the count fills so the loop can go collect the next one.
+            if CFG.QuestLoop then
+                local qq = P.readQuest(true)
+                if qq and qq.have >= qq.need then
+                    say("count is full - ending the sweep")
+                    break
+                end
+            end
         end
         -- One that cannot be killed in TargetTimeout is behind something or
         -- out of reach. Park it and move on rather than spending the sweep.
@@ -1917,6 +1938,11 @@ local function step()
         local now = os.clock()
         for model, t in pairs(countedDead) do
             if now - t > 120 then countedDead[model] = nil end
+        end
+        -- Anything that has left the world can go; keeping destroyed models as
+        -- keys forever is a leak, and they can never match a respawn anyway.
+        for model in pairs(sweptModels) do
+            if not model.Parent then sweptModels[model] = nil end
         end
     end
 
