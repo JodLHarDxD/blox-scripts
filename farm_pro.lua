@@ -93,6 +93,13 @@ local CFG = {
     -- Walk speed. Off, the game's value stands.
     SetWalkSpeed       = false,
     WalkSpeed          = 16,
+    -- DASH. Blox Fruits binds it to Q, and a player leans on it constantly:
+    -- into a target, out of a hit, and above all BETWEEN targets. Walking the
+    -- gap is most of why the farm was slower than you are.
+    Dash               = true,
+    DashFrom           = 16,     -- only dash when the next one is further out
+    DashCooldown       = 0.9,    -- your number; the game has its own floor too
+    DashKey            = "Q",
 
     -- ---------- DISTANCE ----------
     -- The only range in the script.
@@ -122,8 +129,15 @@ local CFG = {
     -- ---------- SAFETY ----------
     MinHealthPercent   = 0.30,
     RegenWait          = 6,
-    RestMin            = 0.6,    -- pause after a kill, low end
-    RestMax            = 1.8,    -- and high end
+    -- PAUSE AFTER A KILL. Zero, and deliberately so: a second of standing
+    -- still per kill is a second nobody playing would ever spend, and over a
+    -- respawn cycle it is the difference between clearing a camp and clearing
+    -- half of it. The sliders are still there if you ever want it back.
+    RestMin            = 0,
+    RestMax            = 0,
+    -- How long one uninterrupted sweep runs before the loop checks the quest
+    -- again. It is not a limit on kills -- it chains targets the whole time.
+    SweepSeconds       = 10,
     StuckSeconds       = 30,
     TargetTimeout      = 45,
     JumpWhenStuck      = true,
@@ -800,7 +814,28 @@ local function swing()
 end
 
 local function swingGap() return jitter(CFG.SwingMin or 0.12, CFG.SwingMax or 0.30) end
-local function restGap()  return jitter(CFG.RestMin or 0.6, CFG.RestMax or 1.8) end
+local function restGap()  return jitter(CFG.RestMin or 0, CFG.RestMax or 0) end
+
+-- THE DASH.
+-- Fired at the gap, not at the enemy: only when the next target is further
+-- away than DashFrom, so it closes distance instead of overshooting something
+-- already in reach. The body is already pointing at the target by then --
+-- AutoRotate turns it toward whatever MoveTo is walking at -- so the dash goes
+-- the right way without any extra aiming.
+local DASH_KEYS = {
+    Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, F = Enum.KeyCode.F,
+    R = Enum.KeyCode.R, LeftShift = Enum.KeyCode.LeftShift,
+}
+local lastDashAt = 0
+local function tryDash(distance)
+    if not CFG.Dash then return false end
+    if distance and distance < (CFG.DashFrom or 16) then return false end
+    if os.clock() - lastDashAt < (CFG.DashCooldown or 0.9) then return false end
+    lastDashAt = os.clock()
+    pressKey(DASH_KEYS[CFG.DashKey or "Q"] or Enum.KeyCode.Q)
+    return true
+end
+P.tryDash = tryDash
 
 -- =========================================================
 -- WALKING
@@ -1022,6 +1057,25 @@ local function liveEnemies(name)
     return out
 end
 P.liveEnemies = liveEnemies
+
+-- WHICH ONE NEXT.
+-- Nearest-first on its own oscillates, and that is the "it kills three and
+-- never touches the other three" bug: you kill the near one, a RESPAWN pops up
+-- closer than the two standing untouched on the far side, and nearest-first
+-- goes back to it. Forever. So the sweep remembers what it has already worked
+-- and prefers the nearest one it has NOT, falling back to plain nearest only
+-- when everything has been visited.
+local function pickNext(list, pos, seen)
+    local best, bestD = nil, math.huge
+    local fresh, freshD = nil, math.huge
+    for _, e in ipairs(list) do
+        local d = (e.root.Position - pos).Magnitude
+        if d < bestD then best, bestD = e, d end
+        if not seen[e.model] and d < freshD then fresh, freshD = e, d end
+    end
+    if fresh then return fresh, freshD end
+    return best, bestD
+end
 
 function P.nearbyNames()
     local folder = workspace:FindFirstChild("Enemies")
@@ -1710,37 +1764,59 @@ local function step()
         return
     end
 
-    -- ---------- FIGHT ----------
+    -- ---------- FIGHT: ONE SWEEP, NOT ONE TARGET ----------
+    -- The old shape was: pick one, kill it, LEAVE the loop, rest a second, go
+    -- back through resolve, re-scan, pick again. Three of those four steps are
+    -- dead time, and they cost more than the fight does. This stays inside and
+    -- chains: the instant one dies the next is chosen and dashed at, with no
+    -- pause and no round trip through the state machine.
     setState("FIGHT")
 
-    local target, bestD = nil, math.huge
-    for _, e in ipairs(list) do
-        local d = (e.root.Position - root.Position).Magnitude
-        if d < bestD then target, bestD = e, d end
-    end
-    if not target then task.wait(0.3) return end
+    local want     = math.max(CFG.StandOff or 8, 1)
+    local slack    = math.max(CFG.StandSlack or 2, 0.5)
+    local sweepEnd = os.clock() + (CFG.SweepSeconds or 10)
+    local seen     = {}
 
-    local hpStart = target.hum.Health
-    say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, hpStart,
+    local target, bestD = pickNext(list, root.Position, seen)
+    if not target then task.wait(0.3) return end
+    seen[target.model] = true
+    local timeout = os.clock() + CFG.TargetTimeout
+    local lastHP  = target.hum.Health
+    say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
-    local want    = math.max(CFG.StandOff or 8, 1)
-    local slack   = math.max(CFG.StandSlack or 2, 0.5)
-    local timeout = os.clock() + CFG.TargetTimeout
-    local lastHP  = hpStart
+    while P.running and os.clock() < sweepEnd do
+        local m    = target.model
+        local hum  = target.hum
+        local gone = (not m) or (not m.Parent) or (not hum) or (hum.Parent == nil)
+        local dead = (not gone) and hum.Health <= 0
 
-    while P.running and os.clock() < timeout do
-        local m, hum = target.model, target.hum
-        if not m or not m.Parent then break end
-        if hum.Health <= 0 then
-            if not countedDead[m] then
-                countedDead[m] = os.clock()
-                stats.kills += 1
-            end
+        if dead and not countedDead[m] then
+            countedDead[m] = os.clock()
+            stats.kills += 1
             progress()
-            cancelWalk()
-            task.wait(restGap())
-            break
+        end
+        -- One that cannot be killed in TargetTimeout is behind something or
+        -- out of reach. Park it and move on rather than spending the sweep.
+        local expired = (not gone) and (not dead) and os.clock() > timeout
+        if expired then blacklist[m] = os.clock() + 30 end
+
+        if gone or dead or expired then
+            -- Only pause here if you have actually asked for a pause.
+            if (CFG.RestMax or 0) > 0 then task.wait(restGap()) end
+            local _, rNow = parts()
+            if not rNow then break end
+            list = liveEnemies(activeName)
+            local nxt, nd = pickNext(list, rNow.Position, seen)
+            if not nxt then break end          -- camp is clear; step() decides
+            target  = nxt
+            seen[target.model] = true
+            timeout = os.clock() + CFG.TargetTimeout
+            lastHP  = target.hum.Health
+            tryDash(nd)                        -- close the gap like a player
+            say(string.format("%s  %.0f studs  hp %.0f", target.name, nd, lastHP))
+            task.wait()                        -- one frame, so this cannot spin
+            continue
         end
 
         local _, r = parts()
@@ -1755,8 +1831,9 @@ local function step()
             swing()
             task.wait(swingGap())
         else
+            tryDash(d)                -- still closing: dash again if it is off
             progress()                -- walking is not stalling
-            task.wait(0.15)
+            task.wait(0.06)
         end
 
         if hum.Health < lastHP - 0.5 then
@@ -2655,7 +2732,41 @@ local function buildUI()
             end, "s")
         caption(v, "Each gap is drawn between the two numbers. Put them on the "
             .. "same value for a flat fixed rate - nothing here is capped and "
-            .. "nothing is chosen for you.")
+            .. "nothing is chosen for you. Rest is 0 by default: the farm goes "
+            .. "straight from one kill to the next.")
+
+        gap(v, 8)
+        heading2(v, "closing the gap")
+        switchRow(v, "Dash between targets",
+            "The instant one dies, dash at the next one",
+            function() return CFG.Dash end,
+            function(x) CFG.Dash = x end)
+        sliderRow(v, "Only dash past", 4, 60, 1,
+            function() return CFG.DashFrom end,
+            function(x) CFG.DashFrom = x end, " studs")
+        sliderRow(v, "Dash no more often than", 0.2, 4, 0.1,
+            function() return CFG.DashCooldown end,
+            function(x) CFG.DashCooldown = x end, "s")
+        sliderRow(v, "Sweep length", 4, 40, 1,
+            function() return CFG.SweepSeconds end,
+            function(x) CFG.SweepSeconds = x end, "s")
+        textRow(v, "dash key: Q, E, F, R, LeftShift", function(val)
+            val = (val:gsub("^%l", string.upper))
+            if DASH_KEYS[val] then
+                CFG.DashKey = val
+                say("dash key: " .. val)
+            else
+                say("unknown key: " .. tostring(val))
+            end
+        end)
+        readout(v, function()
+            if not CFG.Dash then return "Dash off. It walks every gap." end
+            return string.format("Dash on %s, for anything past %d studs, at "
+                .. "most every %.1fs. It chains targets for %ds before looking "
+                .. "at the quest again.", tostring(CFG.DashKey or "Q"),
+                math.floor(CFG.DashFrom), CFG.DashCooldown,
+                math.floor(CFG.SweepSeconds))
+        end)
 
         gap(v, 8)
         heading2(v, "the game's own cooldown")
