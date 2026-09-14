@@ -553,6 +553,17 @@ P.learnedQuests = {}
 P.giverSpots    = {}
 P.lockedQuest   = nil
 
+-- THE ABORT EPOCH.
+-- STOP used to be advisory. acceptQuest walks to the giver, accepts, and walks
+-- back, and none of that checked P.running -- so pressing Stop mid-quest let
+-- the whole thing run to completion and fire StartQuest anyway. moveEnabled
+-- made it worse: stop set it false and put it back true 0.3s later so the
+-- manual buttons would still work, which meant an in-flight walk simply
+-- resumed. Every long operation now captures this number on entry and gives up
+-- the moment it changes. Stop bumps it, so stop means stop.
+local epoch = 0
+local function stale(e) return e ~= epoch end
+
 local function track(c) table.insert(conns, c) return c end
 local function log(m) if CFG.Debug then print("[BFP] " .. tostring(m)) end end
 local function say(s) statusLine = tostring(s) end
@@ -922,8 +933,9 @@ local function walkTo(goal, opts)
         WaypointSpacing = 8,
     })
 
+    local myEpoch = epoch
     local deadline, retries = os.clock() + budget, 0
-    while os.clock() < deadline and moveEnabled do
+    while os.clock() < deadline and moveEnabled and not stale(myEpoch) do
         local _, r, h = parts()
         if not r or not h then return false end
         if (r.Position - goal).Magnitude <= arrive then return true end
@@ -948,7 +960,7 @@ local function walkTo(goal, opts)
             end
         else
             for i = 2, #points do
-                if not moveEnabled then return false end
+                if not moveEnabled or stale(myEpoch) then return false end
                 local wp = points[i]
                 local _, r3, h3 = parts()
                 if not r3 or not h3 then return false end
@@ -961,6 +973,7 @@ local function walkTo(goal, opts)
                 local reached, stamp = false, r3.Position
                 local wpDeadline = os.clock() + 3
                 while os.clock() < wpDeadline do
+                    if stale(myEpoch) then return false end
                     local _, r4 = parts()
                     if not r4 then return false end
                     if (r4.Position - wp.Position).Magnitude < 5 then reached = true break end
@@ -1450,6 +1463,7 @@ function P.acceptQuest(opts)
         return false
     end
 
+    local myEpoch = epoch
     local _, root = parts()
     local home = root and root.Position
     local atGiver = false
@@ -1475,10 +1489,24 @@ function P.acceptQuest(opts)
             setState("TO GIVER")
             say("walking to the quest giver")
             walkTo(dest, { arrive = 8, budget = 60 })
+            if stale(myEpoch) then
+                P.lastQuestResult = "stopped on the way to the giver"
+                say(P.lastQuestResult)
+                return false
+            end
             local _, r = parts()
             if r then faceTarget(r, dest) end
             task.wait(jitter(0.4, 1.0))
         end
+    end
+
+    -- Last gate before the remote. Everything above this point is movement and
+    -- can be abandoned freely; below it a quest actually gets taken, and taking
+    -- one after STOP is exactly the surprise this guards against.
+    if stale(myEpoch) then
+        P.lastQuestResult = "stopped before asking - no quest taken"
+        say(P.lastQuestResult)
+        return false
     end
 
     -- ASK, THEN CHECK WHAT ARRIVED.
@@ -1506,6 +1534,7 @@ function P.acceptQuest(opts)
 
     local q, ok, res
     for i, t in ipairs(tiers) do
+        if stale(myEpoch) then break end
         ok, res = pcall(function()
             return commF:InvokeServer("StartQuest", qname, t)
         end)
@@ -1568,7 +1597,7 @@ function P.acceptQuest(opts)
           or ("sent, tracker unreadable (" .. tostring(res) .. ")"))
     say(P.lastQuestResult)
 
-    if atGiver and CFG.QuestReturnToFarm and home then
+    if atGiver and CFG.QuestReturnToFarm and home and not stale(myEpoch) then
         setState("TO FARM")
         say("walking back to the farm")
         walkTo(home, { arrive = 12, budget = 60 })
@@ -3065,6 +3094,7 @@ end
 
 function P.stop()
     P.running = false
+    epoch += 1                 -- everything in flight gives up on this line
     moveEnabled = false
     task.delay(0.3, function() moveEnabled = true end)
     pcall(releaseCamera)
