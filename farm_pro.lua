@@ -117,15 +117,16 @@ local CFG = {
     -- ---------- QUEST LOOP ----------
     QuestLoop          = true,
     -- WHO HAS TO WALK.
-    --   "auto"   : ask from wherever you are standing. If that comes back with
-    --              nothing, walk up and ask again -- once -- and remember the
-    --              answer for that species from then on.
+    --   "auto"   : walk if the giver is NEAR, ask from range if it is far.
     --   "always" : walk to the giver every cycle, whatever it costs.
     --   "never"  : never walk. Ask from range and take what you get.
-    -- Auto is the default because the right answer is per island, not global:
-    -- the Demonic Soul giver is at the door, the Posessed Mummies are
-    -- underground, and walking back up for them is most of the cycle.
+    -- The question is not whether the walk is possible, it is whether it is
+    -- worth it, and that is a distance: the Demonic Soul giver stands right
+    -- beside them and costs nothing, the Posessed Mummies are a long path
+    -- underground from theirs. One radius separates those two cases without
+    -- being told which island you are on.
     GiverMode          = "auto",
+    GiverWalkRadius    = 250,    -- auto walks only when the giver is this close
     QuestReturnToFarm  = true,
     QuestGiverName     = nil,    -- exact NPC name; blank = use the table
     QuestName          = nil,    -- exact server quest id; blank = look it up
@@ -560,9 +561,6 @@ local farmSpot       = nil     -- where that species lives
 P.learnedGivers = {}
 P.learnedQuests = {}
 P.giverSpots    = {}
--- enemy -> true if the accept only works standing at the giver, false if it
--- works from range. nil means it has not been probed yet.
-P.giverNeeded   = {}
 P.lockedQuest   = nil
 
 -- THE ABORT EPOCH.
@@ -1426,7 +1424,6 @@ function P.clearGiver()
     if e then
         P.giverSpots[e] = nil
         P.learnedGivers[e] = nil
-        P.giverNeeded[e] = nil      -- re-test whether the walk is needed too
     end
     say("giver reset to the table")
 end
@@ -1486,9 +1483,6 @@ function P.acceptQuest(opts)
     -- the server actually checks your distance turns out to vary, so this
     -- measures it once per species instead of assuming either way.
     local mode = CFG.GiverMode or "auto"
-    local probing = (mode == "auto") and (P.giverNeeded[enemy] == nil)
-    local mustWalk = (mode == "always")
-        or (mode == "auto" and P.giverNeeded[enemy] == true)
 
     local function goToGiver()
         local wantName, dest = P.giverFor(enemy)
@@ -1517,6 +1511,14 @@ function P.acceptQuest(opts)
         task.wait(jitter(0.4, 1.0))
         return true
     end
+
+    -- How far the giver actually is, right now. An unknown distance means the
+    -- giver still has to be found by scanning, and that is worth walking for.
+    local _, gpos = P.giverFor(enemy)
+    local giverDist = (gpos and root) and (gpos - root.Position).Magnitude or nil
+    local mustWalk = (mode == "always")
+        or (mode == "auto" and (giverDist == nil
+            or giverDist <= (CFG.GiverWalkRadius or 250)))
 
     if mustWalk and not goToGiver() then
         P.lastQuestResult = "stopped on the way to the giver"
@@ -1598,19 +1600,13 @@ function P.acceptQuest(opts)
 
     q, ok, res = attempt()
 
-    -- THE ONE PROBE.
-    -- Asked from range and got nothing back, and we have never tested this
-    -- species: walk up and ask once more. Bounded to the first cycle on
-    -- purpose -- an unreadable tracker also returns nothing, and re-asking on
-    -- a quest that DID start would reset its count. One risk, once, and the
-    -- answer is kept for every cycle afterwards.
-    if not q and probing and not atGiver and not stale(myEpoch) then
-        say("nothing from here - walking up to test whether it is required")
+    -- Asked from range and got nothing back: walk up and ask once more, so a
+    -- server that DOES check distance still works instead of stalling the
+    -- loop. Auto only -- "never" means never, because it is your switch.
+    if not q and mode == "auto" and not atGiver and not stale(myEpoch) then
+        say("nothing from here - walking up and asking again")
         if goToGiver() then q, ok, res = attempt() end
     end
-
-    -- Record what this species actually needs, either way.
-    if q and enemy then P.giverNeeded[enemy] = atGiver and true or false end
 
     local matched = (q ~= nil) and wanted(q.enemy)
     P.questMatched = matched
@@ -2914,14 +2910,17 @@ local function buildUI()
         local modeBox = chooser(v, 128)
         local modeSig = nil
         local MODES = {
-            { "auto",   "Find out and remember",  "asks from here first" },
-            { "always", "Always walk to it",      "safe, and the slow one" },
-            { "never",  "Never walk, ask anyway", "fastest if it works" },
+            { "auto",   "Walk only if it is near", "by distance" },
+            { "always", "Always walk to it",       "safe, and the slow one" },
+            { "never",  "Never walk, ask anyway",  "fastest if it works" },
         }
         local function modeRefresh()
             local e = activeName or CFG.Target
-            local sig = tostring(CFG.GiverMode) .. "|" .. tostring(e)
-                .. "|" .. tostring(e and P.giverNeeded[e])
+            local _, gp = P.giverFor(e)
+            local _, rr = parts()
+            local gd = (gp and rr) and math.floor((gp - rr.Position).Magnitude) or nil
+            local sig = tostring(CFG.GiverMode) .. "|" .. tostring(e) .. "|"
+                .. tostring(gd and math.floor(gd / 25))
             if sig == modeSig then return end
             modeSig = sig
             for _, c in ipairs(modeBox:GetChildren()) do
@@ -2929,10 +2928,10 @@ local function buildUI()
             end
             for i, m in ipairs(MODES) do
                 local tag = m[3]
-                if m[1] == "auto" and e then
-                    local known = P.giverNeeded[e]
-                    if known == true then tag = e .. ": must walk"
-                    elseif known == false then tag = e .. ": range works" end
+                if m[1] == "auto" and gd then
+                    tag = (gd <= (CFG.GiverWalkRadius or 250))
+                        and ("giver " .. gd .. " away: walks")
+                        or  ("giver " .. gd .. " away: asks")
                 end
                 chooserRow(modeBox, i, m[2], tag, CFG.GiverMode == m[1], function()
                     CFG.GiverMode = m[1]
@@ -2943,12 +2942,16 @@ local function buildUI()
         end
         modeRefresh()
         addLive(modeRefresh)
-        caption(v, "The walk is the expensive part of the cycle - about 230 "
-            .. "studs each way at Haunted Castle, for eight kills, and far "
-            .. "worse for anything underground. Auto asks from wherever you "
-            .. "are standing, and only walks up if that comes back empty. It "
-            .. "tests once per species and keeps the answer, so Demonic Soul "
-            .. "and Posessed Mummy each get whatever they actually need.")
+        sliderRow(v, "Near means within", 30, 800, 10,
+            function() return CFG.GiverWalkRadius end,
+            function(x) CFG.GiverWalkRadius = x end, " studs")
+        caption(v, "The walk is the expensive part of the cycle, and whether "
+            .. "it is worth paying is a distance. The Demonic Soul giver "
+            .. "stands right beside them, so walking costs nothing and auto "
+            .. "walks it. The Posessed Mummies are a long path underground "
+            .. "from theirs, so auto asks from range instead. If asking from "
+            .. "range comes back empty it walks up and asks again, so a server "
+            .. "that does check distance still works.")
 
         readout(v, function()
             local e = activeName or CFG.Target
