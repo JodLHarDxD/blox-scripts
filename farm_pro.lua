@@ -68,6 +68,14 @@ local CFG = {
     -- something else, this puts yours back, and nothing else is ever equipped.
     Weapon             = nil,
 
+    -- ---------- AFTER A DEATH ----------
+    -- A death drops the tool and turns both haki off. Enhancement (J) is
+    -- re-asserted whenever the character is missing it; Observation (E) is
+    -- pressed once per life after a death. See keepHaki for why E is never
+    -- pressed blind.
+    AutoBuso           = true,
+    AutoKen            = true,
+
     -- ---------- ATTACK ----------
     -- Independent switches, not a mode. M1 alone is enough for most weapons.
     M1                 = true,
@@ -102,16 +110,23 @@ local CFG = {
     -- Only dash when the gap is BIGGER than a dash covers. Set this too small
     -- and every dash overshoots the enemy and then has to walk back, which is
     -- half of what "it goes to the enemy and comes back" was.
-    DashFrom           = 45,
+    DashFrom           = 25,
     DashCooldown       = 0.9,    -- your number; the game has its own floor too
     DashKey            = "Q",
-    -- The wiki says the dash follows your WASD keys, and this script presses
-    -- none. With no keys held the game falls back to "forward" -- which may be
-    -- the body (pinned at the target already) or the camera (yours, pointing
-    -- anywhere). This makes the camera agree before dashing, so the one case
-    -- that cannot be aimed simply does not fire. Turn it off if you find the
-    -- dash is reading MoveDirection after all and you want more of them.
-    DashNeedsCamera    = true,
+    -- WHY IT NEVER DASHED, AND WHAT THE DASH ACTUALLY FOLLOWS.
+    -- With no WASD held the game dashes "forward", and forward is the CAMERA,
+    -- not the body. The body is pinned at the target by FaceLock; the camera
+    -- is yours and points wherever you last left it. The build before this
+    -- refused to dash unless your camera happened to agree, and while the
+    -- character runs around a camp your camera never turns with it, so the
+    -- dash almost never fired. Lowering the distance changed nothing because
+    -- distance was never the gate.
+    --
+    -- On: the camera's yaw is turned at the target for the press. Pitch and
+    -- zoom are left alone and your mouse is free again the same frame, so the
+    -- dash lands where the walk is going. Off: dash only when your camera
+    -- already agrees -- view untouched, dashes rare.
+    DashTurnsCamera    = true,
 
     -- ---------- DISTANCE ----------
     -- The only range in the script.
@@ -578,7 +593,7 @@ P.knownGivers = KNOWN_GIVERS
 local stats = {
     kills = 0, swings = 0, damaging = 0, quests = 0,
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
-    switches = 0, hops = 0, detours = 0,
+    switches = 0, hops = 0, detours = 0, hakiPresses = 0,
 }
 
 local state          = "IDLE"
@@ -733,10 +748,12 @@ P.heldTool = function()
 end
 
 -- Put the locked weapon back if it is not in hand.
+local lastHeld = nil      -- what was in hand last, so a respawn can get it back
 local function keepWeapon()
     local want = CFG.Weapon
     if not want or want == "" then
         local t = heldTool()
+        if t then lastHeld = t.Name; P.lastHeld = lastHeld end
         return t and t.Name or nil
     end
     local t = heldTool()
@@ -869,6 +886,77 @@ local function pressKey(code)
     end)
 end
 
+-- =========================================================
+-- HAKI, AND WHAT A DEATH TAKES WITH IT
+-- =========================================================
+-- Dying drops the tool, turns Enhancement (J) off and turns Observation (E)
+-- off. In the Third Sea the swing does not land without Enhancement, so a
+-- respawn without it walks back to the camp and dies again.
+--
+-- Enhancement can be CHECKED: the character carries a child named HasBuso
+-- while it is on. So it is re-asserted whenever it is missing, capped at
+-- three presses per life so a wrong marker name can never become a toggle
+-- war.
+-- Observation cannot be read back from here, and E is a toggle, so pressing
+-- it blind would turn it OFF if it was on. It is pressed exactly once per
+-- life, and only after the character has proved it is taking input (the
+-- Enhancement press landed). At farm start, if Enhancement is already on,
+-- your setup is trusted and E is not touched.
+P.busoOK   = false
+P.kenDone  = false
+local kenChar     = nil    -- the life E has been pressed for
+local seenChar    = nil
+local seenCharAt  = 0
+local busoTries   = 0
+local lastBusoAt  = 0
+
+local function hasBuso()
+    local char = player.Character
+    return char ~= nil and char:FindFirstChild("HasBuso") ~= nil
+end
+P.hasBuso = hasBuso
+
+local function keepHaki()
+    local char, root, hum = parts()
+    if not char or not root or not hum then return end
+    if char ~= seenChar then
+        seenChar, seenCharAt = char, os.clock()
+        busoTries = 0
+    end
+    if os.clock() - seenCharAt < 1.5 then return end   -- let the spawn settle
+
+    if CFG.AutoBuso then
+        if hasBuso() then
+            P.busoOK = true
+        else
+            P.busoOK = false
+            if busoTries < 3 and os.clock() - lastBusoAt > 2.5 then
+                lastBusoAt = os.clock()
+                busoTries += 1
+                stats.hakiPresses += 1
+                pressKey(Enum.KeyCode.J)
+                say("enhancement off - pressing J")
+            end
+        end
+    end
+
+    if CFG.AutoKen and kenChar ~= char then
+        local ready
+        if CFG.AutoBuso then
+            ready = hasBuso()
+        else
+            ready = (os.clock() - seenCharAt) > 3
+        end
+        if ready then
+            kenChar = char
+            P.kenDone = true
+            stats.hakiPresses += 1
+            pressKey(Enum.KeyCode.E)
+            say("observation - pressing E")
+        end
+    end
+end
+
 local SKILL_KEYS = {
     { "SkillZ", Enum.KeyCode.Z },
     { "SkillX", Enum.KeyCode.X },
@@ -961,37 +1049,47 @@ local lastDashAt = 0
 -- the target. If it cannot confirm that, it does not dash. A dash that does
 -- not happen costs a moment; a dash in the wrong direction costs the walk
 -- back, and that is the trade that was being got wrong.
+-- Turn only the camera's YAW at a point. Pitch and zoom are kept. The default
+-- camera reads its own look vector back at the start of every frame and
+-- applies your mouse on top, so one write sticks and your mouse takes over
+-- again immediately. Camera state is client-only; the server never sees it.
+local function turnCameraAt(targetPos)
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+    local here = cam.CFrame.Position
+    local flat = targetPos - here
+    flat = Vector3.new(flat.X, 0, flat.Z)
+    if flat.Magnitude < 0.5 then return false end
+    local f    = flat.Unit
+    local sinP = math.clamp(cam.CFrame.LookVector.Y, -0.99, 0.99)
+    local cosP = math.sqrt(1 - sinP * sinP)
+    local look = Vector3.new(f.X * cosP, sinP, f.Z * cosP)
+    return pcall(function()
+        cam.CFrame = CFrame.lookAt(here, here + look)
+    end)
+end
+
+-- THE DASH GOES WHERE THE CAMERA LOOKS.
+-- With no WASD held, the game dashes "forward", and forward is the camera.
+-- The build before this guessed at that and, unable to aim the camera without
+-- taking your view, refused to dash unless your camera already agreed -- and
+-- because the character turns around a camp while your camera does not, it
+-- almost never did. Now the camera's yaw is turned at the target for the
+-- press (pitch, zoom and your mouse untouched), so body, walk and camera all
+-- agree at the instant of the key.
 local function tryDash(distance, toward)
     if not CFG.Dash then return false end
-    if distance and distance < (CFG.DashFrom or 45) then return false end
+    if distance and distance < (CFG.DashFrom or 25) then return false end
     if os.clock() - lastDashAt < (CFG.DashCooldown or 0.9) then return false end
 
-    local _, r, h = parts()
-    if not r or not h then return false end
-
-    -- Standing still means the dash would use the body's facing, and the body
-    -- may not have finished turning. Only dash out of real movement.
-    local md = h.MoveDirection
-    if md.Magnitude < 0.1 then return false end
-
-    -- And that movement has to be at the target, not merely nonzero.
+    local _, r = parts()
+    if not r then return false end
     local want = toward and Vector3.new(toward.X, 0, toward.Z) or nil
-    if want and want.Magnitude < 0.1 then want = nil end
-    if want and md.Unit:Dot(want.Unit) < 0.8 then return false end   -- ~35 deg
+    if not want or want.Magnitude < 0.1 then return false end
 
-    -- THE CAMERA HAS A VOTE, BECAUSE WE DO NOT KNOW WHOSE INPUT THE GAME READS.
-    -- The wiki is clear that the dash direction comes from the WASD keys, and
-    -- this script presses none of them -- it moves with Humanoid:MoveTo. So
-    -- the game either reads MoveDirection (checked above) or falls back to
-    -- "forward" with no keys held, and forward is either the body, which
-    -- FaceLock has already pinned at the target, or the camera, which is
-    -- yours and points wherever you left it.
-    --
-    -- That last case is the one that used to throw the character off sideways.
-    -- It cannot be fixed without taking your view, so instead the dash simply
-    -- declines when the camera disagrees. A dash that does not fire costs a
-    -- moment of walking; one in the wrong direction costs the walk back.
-    if CFG.DashNeedsCamera and want then
+    if CFG.DashTurnsCamera then
+        if not turnCameraAt(r.Position + toward) then return false end
+    else
         local cam = workspace.CurrentCamera
         if not cam then return false end
         local look = cam.CFrame.LookVector
@@ -2020,6 +2118,7 @@ local function step()
 
     keepWeapon()
     keepSpeed()
+    pcall(keepHaki)
 
     -- ---------- THE QUEST LOOP ----------
     if CFG.QuestLoop then pcall(P.questCycle) end
@@ -2172,14 +2271,6 @@ local function step()
             -- swing window, so the chase starts on the same frame it happens.
             swingWait(hum, target.root, swingFrom)
         else
-            -- ---- CLOSING: keep the M1 running. ----
-            -- M1 only. Skills stay on their in-reach cadence; burning one at
-            -- an enemy twenty studs out is what "wasting the special" is.
-            if closing and CFG.M1 then
-                stats.swings += 1
-                pressM1()
-            end
-
             -- ---- SOMEBODY NEARER? Hit them instead. ----
             -- While walking to one, the list is re-read four times a second
             -- (cheap: names are cached, it is one pass over the folder) and
@@ -2237,9 +2328,17 @@ local function step()
                 stuckSince, jumpedAt = nil, nil
             end
 
-            -- station() has already pointed the body and issued the MoveTo, so
-            -- by now MoveDirection is real and tryDash can check it.
-            tryDash(d, target.root.Position - r.Position)
+            -- ---- DASH, then the closing M1 -- never both on one pass. ----
+            -- A swing started on top of the dash cuts the dash short.
+            local dashed = tryDash(d, target.root.Position - r.Position)
+
+            -- ---- CLOSING: keep the M1 running. ----
+            -- M1 only. Skills stay on their in-reach cadence; burning one at
+            -- an enemy twenty studs out is what "wasting the special" is.
+            if closing and CFG.M1 and not dashed then
+                stats.swings += 1
+                pressM1()
+            end
             progress()                -- walking is not stalling
             lastHitAt = os.clock()    -- nor is chasing one that was knocked away
             if closing then
@@ -3070,6 +3169,43 @@ local function buildUI()
             return "Free. Holding " .. tostring(P.heldTool() or "nothing")
                 .. ". Nothing will change it."
         end)
+
+        gap(v, 8)
+        heading2(v, "after a death")
+        switchRow(v, "Enhancement (J) - keep it on",
+            "Checked every pass; J is pressed when the character lacks it",
+            function() return CFG.AutoBuso end,
+            function(x) CFG.AutoBuso = x end)
+        switchRow(v, "Observation (E) - back on after a death",
+            "Once per life, after the Enhancement press has landed",
+            function() return CFG.AutoKen end,
+            function(x) CFG.AutoKen = x end)
+        readout(v, function()
+            local lines = {}
+            table.insert(lines, "Held now: " .. tostring(P.heldTool() or "nothing")
+                .. ".  Remembered for a respawn: " .. tostring(P.lastHeld or "nothing yet") .. ".")
+            if CFG.AutoBuso then
+                table.insert(lines, hasBuso()
+                    and "Enhancement: ON (the character carries HasBuso)."
+                    or  "Enhancement: OFF - pressing J, up to 3 tries per life.")
+            else
+                table.insert(lines, "Enhancement: not managed.")
+            end
+            if CFG.AutoKen then
+                table.insert(lines, (kenChar == player.Character)
+                    and "Observation: E pressed this life, or trusted from start."
+                    or  "Observation: will press E once the character is taking input.")
+            else
+                table.insert(lines, "Observation: not managed.")
+            end
+            return table.concat(lines, "\n")
+        end)
+        caption(v, "E is a toggle and cannot be read back, so it is never "
+            .. "pressed blind. At start, if Enhancement is already on, your "
+            .. "setup is trusted and E is left alone. If Enhancement is off at "
+            .. "start it is a fresh life, and both go back on. If the "
+            .. "Enhancement line above says OFF while you can see it is on, "
+            .. "the marker name is wrong - tell me.")
     end
 
     -- =====================================================
@@ -3205,7 +3341,7 @@ local function buildUI()
         gap(v, 8)
         heading2(v, "closing the gap")
         switchRow(v, "Dash to close a long gap",
-            "Only while already running at the target",
+            "Body, walk and camera all aimed at it for the press",
             function() return CFG.Dash end,
             function(x) CFG.Dash = x end)
         sliderRow(v, "Only dash past", 10, 150, 5,
@@ -3214,10 +3350,10 @@ local function buildUI()
         sliderRow(v, "Dash no more often than", 0.2, 4, 0.1,
             function() return CFG.DashCooldown end,
             function(x) CFG.DashCooldown = x end, "s")
-        switchRow(v, "Only dash when the camera agrees",
-            "The game aims a dash by your keys, and we press none",
-            function() return CFG.DashNeedsCamera end,
-            function(x) CFG.DashNeedsCamera = x end)
+        switchRow(v, "Turn my camera at it for the dash",
+            "Off: dash only when your camera already faces it (rare)",
+            function() return CFG.DashTurnsCamera end,
+            function(x) CFG.DashTurnsCamera = x end)
         sliderRow(v, "Sweep length", 4, 40, 1,
             function() return CFG.SweepSeconds end,
             function(x) CFG.SweepSeconds = x end, "s")
@@ -3232,18 +3368,17 @@ local function buildUI()
         end)
         readout(v, function()
             if not CFG.Dash then
-                return "Dash off. It walks every gap.\n"
-                    .. "It was firing before the character had turned, so it "
-                    .. "threw you at the enemy you had just killed and then "
-                    .. "walked back. It now refuses unless you are already "
-                    .. "running at the target."
+                return "Dash off. It walks every gap."
             end
-            return string.format("Dash on %s, only past %d studs, at most "
-                .. "every %.1fs, and only while already moving at the target. "
-                .. "%d fired so far. Keep the distance above what one dash "
-                .. "covers or it overshoots and walks back.",
+            return string.format("Dash on %s, past %d studs, at most every "
+                .. "%.1fs. %d fired so far. The dash goes where the camera "
+                .. "looks, so %s. If it overshoots and walks back, raise the "
+                .. "distance.",
                 tostring(CFG.DashKey or "Q"), math.floor(CFG.DashFrom),
-                CFG.DashCooldown, stats.dashes or 0)
+                CFG.DashCooldown, stats.dashes or 0,
+                CFG.DashTurnsCamera
+                    and "the camera's yaw is turned at the target for the press"
+                    or  "it only fires when your camera already agrees")
         end)
 
         gap(v, 8)
@@ -3522,6 +3657,8 @@ local function buildUI()
                 "quests      " .. stats.quests,
                 "walks       " .. stats.walks,
                 "dashes      " .. stats.dashes,
+                "haki        " .. stats.hakiPresses .. "   (J/E presses)"
+                    .. (hasBuso() and "   enhancement ON" or "   enhancement OFF"),
                 "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
                 "hops        " .. stats.hops .. "   (stuck on something, jumped)",
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round)",
@@ -3586,6 +3723,18 @@ function P.start(name)
 
     keepWeapon()
     startSpeedHold()
+    -- Trust your setup at start. If Enhancement is on, Observation is left
+    -- exactly as you have it. If Enhancement is off, this is a fresh life and
+    -- both go back on -- see keepHaki. With Enhancement not managed there is
+    -- nothing to infer from, so E is never pressed at start.
+    seenChar, seenCharAt = player.Character, os.clock() - 10
+    busoTries = 0
+    P.kenDone = false
+    if CFG.AutoBuso and not hasBuso() then
+        kenChar = nil
+    else
+        kenChar = player.Character
+    end
     -- Installed either way so the switch works instantly, but it does nothing
     -- at all until CFG.FastAttack is on.
     pcall(installFastAttack)
@@ -3600,10 +3749,29 @@ function P.start(name)
 
     track(player.CharacterAdded:Connect(function()
         task.wait(2)
+        -- The tool. A lock puts its own back through keepWeapon. Free hands
+        -- put back whatever was in hand before the death, once the Backpack
+        -- has filled (it lags the spawn by a moment).
+        if not (CFG.Weapon and #CFG.Weapon > 0) and lastHeld then
+            for _ = 1, 12 do
+                local char = player.Character
+                local bp   = player:FindFirstChild("Backpack")
+                local tool = bp and bp:FindFirstChild(lastHeld)
+                local hum  = char and char:FindFirstChildOfClass("Humanoid")
+                if tool and tool:IsA("Tool") and hum then
+                    pcall(function() hum:EquipTool(tool) end)
+                    say("back in hand: " .. lastHeld)
+                    break
+                end
+                task.wait(0.5)
+            end
+        end
         keepWeapon()
         keepSpeed()
         pcall(installFastAttack)
         progress()
+        -- Haki comes back through keepHaki on the next step: it sees the new
+        -- character, waits for the spawn to settle, then J, then E.
     end))
 
     task.spawn(mainLoop)
