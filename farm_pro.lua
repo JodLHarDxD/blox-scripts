@@ -119,6 +119,15 @@ local CFG = {
     --   fruit M1 whose hitbox starts out from the body : 12-18
     StandOff           = 8,
     StandSlack         = 2,      -- drift allowed before it corrects
+    -- KEEP THE M1 GOING WHILE IT COMES BACK.
+    -- A swing or a skill throws the enemy away and it walks straight back at
+    -- you. Its attack reach and your swing reach are about the same, so if
+    -- the M1 only starts once it is inside reach, it is a race at the
+    -- boundary -- and when the NPC wins it, its hit stuns you and it chains.
+    -- From this many studs out the M1 is kept running while you close, so it
+    -- walks into hits already in the air and is stunned before it can swing.
+    -- At or below the swing reach this does nothing extra.
+    SwingFrom          = 30,
     -- FACING. A melee M1 -- a sword, or a fighting style like Sanguine Art --
     -- swings where the BODY points, so the body is pinned at the target and
     -- re-pinned every pass. This is what makes hits land; without it the
@@ -2149,14 +2158,28 @@ local function step()
         local d = station(target.root)
         aimCameraAt(r, target.root.Position)
 
-        -- Only swing when the enemy is actually inside the distance you set.
-        -- Swinging at something forty studs away lands nothing anyway.
-        if d <= want + slack * 2 then
+        -- reach is where a swing connects. swingFrom is further out: while
+        -- the target is walking back from a throw the M1 is kept going from
+        -- there, so it arrives into hits already in the air. Its hitstun lands
+        -- before its attack does, which is the whole point.
+        local reach     = want + slack * 2
+        local swingFrom = math.max(reach, CFG.SwingFrom or 0)
+        local closing   = d > reach and d <= swingFrom
+
+        if d <= reach then
             swing()
-            -- Breaks the moment it dies, or the moment it is thrown out of
-            -- reach, so the chase starts on the same frame it happens.
-            swingWait(hum, target.root, want + slack * 2)
+            -- Breaks the moment it dies, or the moment it is thrown past the
+            -- swing window, so the chase starts on the same frame it happens.
+            swingWait(hum, target.root, swingFrom)
         else
+            -- ---- CLOSING: keep the M1 running. ----
+            -- M1 only. Skills stay on their in-reach cadence; burning one at
+            -- an enemy twenty studs out is what "wasting the special" is.
+            if closing and CFG.M1 then
+                stats.swings += 1
+                pressM1()
+            end
+
             -- ---- SOMEBODY NEARER? Hit them instead. ----
             -- While walking to one, the list is re-read four times a second
             -- (cheap: names are cached, it is one pass over the folder) and
@@ -2219,7 +2242,14 @@ local function step()
             tryDash(d, target.root.Position - r.Position)
             progress()                -- walking is not stalling
             lastHitAt = os.clock()    -- nor is chasing one that was knocked away
-            task.wait(0.06)
+            if closing then
+                -- The swing gap is the pace now, same as in reach. It still
+                -- breaks the instant the target dies or is thrown out past
+                -- the window.
+                swingWait(hum, target.root, swingFrom)
+            else
+                task.wait(0.06)
+            end
         end
 
         if hum.Health < lastHP - 0.5 then
@@ -3059,6 +3089,17 @@ local function buildUI()
             .. "one already inside this distance and being hit. Stuck on a "
             .. "root on the way: it hops, and if that did nothing it paths "
             .. "round.")
+
+        sliderRow(v, "Keep swinging from", 0, 60, 1,
+            function() return CFG.SwingFrom end,
+            function(x) CFG.SwingFrom = x end, " studs")
+        caption(v, "After a throw the enemy walks straight back at you, and "
+            .. "its reach is about the same as yours. If the M1 only starts "
+            .. "once it is in reach, it is a race at the boundary, and when "
+            .. "the NPC wins it you are stunned and it chains. From this far "
+            .. "out the M1 is kept going while you close, so it walks into "
+            .. "hits already in the air. Set it at or below the distance above "
+            .. "to swing only in reach.")
         sliderRow(v, "Allowed drift", 0.5, 8, 0.5,
             function() return CFG.StandSlack end,
             function(x) CFG.StandSlack = x end, " studs")
@@ -3465,7 +3506,8 @@ local function buildUI()
                 "target      " .. tostring(activeName or "-"),
                 "weapon      " .. tostring(P.heldTool() or "-")
                     .. ((CFG.Weapon and #CFG.Weapon > 0) and "  locked" or "  free"),
-                "distance    " .. math.floor(CFG.StandOff) .. " studs",
+                "distance    " .. math.floor(CFG.StandOff) .. " studs"
+                    .. "   swinging from " .. math.floor(CFG.SwingFrom or 0),
                 "walkspeed   " .. (hum and string.format("%.0f", hum.WalkSpeed) or "?")
                     .. (CFG.SetWalkSpeed
                         and ("  held at " .. math.floor(CFG.WalkSpeed)
