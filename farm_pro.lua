@@ -652,12 +652,37 @@ end
 
 -- YOUR walk speed, if you asked for one. Off means the game's value stands --
 -- it is not read, not saved and not restored, because nothing was changed.
+-- WHY SETTING THIS ONCE DID NOTHING.
+-- Blox Fruits writes WalkSpeed itself, constantly: on spawn, on damage, when
+-- a state changes, and whenever its own movement code decides to. A single
+-- write survives about one frame and is then overwritten.
+--
+-- Worse, the one write was happening in the OUTER loop, and the fight loop
+-- stays inside itself for up to SweepSeconds. So across an entire ten second
+-- sweep -- the fights and every gap walked between enemies -- this was never
+-- called once. Setting 107 and feeling no difference is exactly what that
+-- produces.
+--
+-- It is held on Heartbeat now, so the game can take it back as often as it
+-- likes and it goes straight back on the next frame.
+P.speedResets = 0       -- how many times the game has taken it back
 local function keepSpeed()
     if not CFG.SetWalkSpeed then return end
     local _, _, hum = parts()
     if hum and math.abs(hum.WalkSpeed - CFG.WalkSpeed) > 0.05 then
+        P.speedResets += 1
         pcall(function() hum.WalkSpeed = CFG.WalkSpeed end)
     end
+end
+
+local speedConn = nil
+local function startSpeedHold()
+    if speedConn then return end
+    speedConn = track(RunService.Heartbeat:Connect(keepSpeed))
+end
+local function stopSpeedHold()
+    if speedConn then pcall(function() speedConn:Disconnect() end) end
+    speedConn = nil
 end
 
 -- =========================================================
@@ -3071,10 +3096,15 @@ local function buildUI()
         readout(v, function()
             local _, _, hum = parts()
             local now = hum and string.format("%.0f", hum.WalkSpeed) or "?"
-            if CFG.SetWalkSpeed then
-                return "Holding " .. math.floor(CFG.WalkSpeed) .. ". Currently " .. now .. "."
+            if not CFG.SetWalkSpeed then
+                return "Free. Currently " .. now .. ", and nothing is changing it."
             end
-            return "Free. Currently " .. now .. ", and nothing is changing it."
+            return string.format("Holding %d. The humanoid reads %s right now, "
+                .. "and the game has taken it back %d times (it is put straight "
+                .. "back each frame). If that number climbs and the reading "
+                .. "still matches, it is working; if the reading will not "
+                .. "change at all, the server is refusing it.",
+                math.floor(CFG.WalkSpeed), now, P.speedResets or 0)
         end)
     end
 
@@ -3276,7 +3306,10 @@ local function buildUI()
                     .. ((CFG.Weapon and #CFG.Weapon > 0) and "  locked" or "  free"),
                 "distance    " .. math.floor(CFG.StandOff) .. " studs",
                 "walkspeed   " .. (hum and string.format("%.0f", hum.WalkSpeed) or "?")
-                    .. (CFG.SetWalkSpeed and "  held" or "  free"),
+                    .. (CFG.SetWalkSpeed
+                        and ("  held at " .. math.floor(CFG.WalkSpeed)
+                             .. ", " .. (P.speedResets or 0) .. " resets")
+                        or "  free"),
                 "fast attack " .. (CFG.FastAttack
                     and (P.fastOK and "on" or ("on, " .. tostring(P.fastNote))) or "off"),
                 "",
@@ -3346,7 +3379,7 @@ function P.start(name)
     setState("RESOLVE")
 
     keepWeapon()
-    keepSpeed()
+    startSpeedHold()
     -- Installed either way so the switch works instantly, but it does nothing
     -- at all until CFG.FastAttack is on.
     pcall(installFastAttack)
@@ -3378,6 +3411,7 @@ function P.stop()
     moveEnabled = false
     task.delay(0.3, function() moveEnabled = true end)
     pcall(releaseCamera)
+    pcall(stopSpeedHold)
     pcall(cancelWalk)
     if fastConn then pcall(function() fastConn:Disconnect() end) fastConn = nil end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
