@@ -201,6 +201,10 @@ local CFG = {
     -- parked quickly.
     GiveUpSeconds      = 12,
     JumpWhenStuck      = true,
+    -- Extra jumps pressed IN THE AIR when the first one did not clear the
+    -- thing. This is the game's own air jump, so it only does anything if
+    -- you have it; a Space press in the air without it is harmless.
+    AirJumps           = 2,
     Debug              = false,
 }
 
@@ -593,7 +597,7 @@ P.knownGivers = KNOWN_GIVERS
 local stats = {
     kills = 0, swings = 0, damaging = 0, quests = 0,
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
-    switches = 0, hops = 0, detours = 0, hakiPresses = 0,
+    switches = 0, hops = 0, airJumps = 0, detours = 0, hakiPresses = 0,
 }
 
 local state          = "IDLE"
@@ -887,6 +891,44 @@ local function pressKey(code)
         task.wait(0.04)
         VIM:SendKeyEvent(false, code, false, game)
     end)
+end
+
+-- JUMP THE WAY A PLAYER DOES: the Space key, not only Humanoid.Jump.
+-- Humanoid.Jump is a ground jump and nothing else. The extra jumps you have
+-- in the air are the game's own script listening for the JUMP KEY while you
+-- are airborne, and a property write never reaches it -- which is why the
+-- hop was "sometimes" a jump and never a climb. Space now goes through the
+-- input pipeline, and Humanoid.Jump is set as well so the ground jump is
+-- certain even if a key event were ever swallowed.
+local function jump()
+    local _, _, h = parts()
+    if h then pcall(function() h.Jump = true end) end
+    task.spawn(pressKey, Enum.KeyCode.Space)
+end
+
+-- SOMETHING AT KNEE HEIGHT A FEW STUDS AHEAD, in the direction of travel.
+-- Seen BEFORE the character reaches it, so the jump comes first and the
+-- shove never starts -- which is what you would do with a ledge in front of
+-- you. Only collidable geometry counts; the character and every enemy are
+-- excluded, so the target itself is never "an obstacle".
+local function ledgeAhead(r, h)
+    local md = h.MoveDirection
+    if md.Magnitude < 0.1 then return false end
+    if h.FloorMaterial == Enum.Material.Air then return false end   -- airborne already
+    local excl = {}
+    local char = player.Character
+    if char then table.insert(excl, char) end
+    local enemies = workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(excl, enemies) end
+    local ok, hit = pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = excl
+        params.RespectCanCollide = true
+        local origin = r.Position - Vector3.new(0, 1.5, 0)      -- knee height
+        return workspace:Raycast(origin, md.Unit * 4.5, params)
+    end)
+    return ok and hit ~= nil
 end
 
 -- =========================================================
@@ -1273,7 +1315,10 @@ P.walkTo = walkTo
 -- standing inside that gap takes nothing. Both corrections move along the same
 -- line, so the enemy stays in front instead of being orbited.
 -- Returns the current flat distance.
-local function station(targetRoot)
+-- climb: the target is above or below by more than a swing reaches, so keep
+-- pushing at it however close it is on the flat. The ray and the jump take
+-- it from there.
+local function station(targetRoot, climb)
     local _, r, h = parts()
     if not r or not h or not targetRoot then return math.huge end
 
@@ -1287,7 +1332,7 @@ local function station(targetRoot)
     local slack = math.max(CFG.StandSlack or 2, 0.5)
     local spot  = them - dir * want
 
-    if d > want + slack then
+    if d > want + slack or climb then
         -- walkTo BLOCKS. It runs ComputeAsync and then sits on waypoints, and
         -- while it does that nothing swings -- which is the "it just stands
         -- there in the middle of a fight" you can see from outside. So it is
@@ -1305,7 +1350,8 @@ local function station(targetRoot)
         elseif d > 120 then
             walkTo(spot, { arrive = want + slack, budget = 4 })
         else
-            h:MoveTo(Vector3.new(spot.X, me.Y, spot.Z))
+            local goal = climb and them or spot
+            h:MoveTo(Vector3.new(goal.X, me.Y, goal.Z))
         end
         if CFG.FaceLock then faceTarget(r, them, true) end
     elseif d < want - slack then
@@ -2189,7 +2235,8 @@ local function step()
     local lastHP      = target.hum.Health
     local lastLookAt  = 0              -- last time we looked for someone nearer
     local stuckSince  = nil            -- pushing against something since
-    local jumpedAt    = nil            -- and whether we have already hopped
+    local jumps       = 0              -- jumps spent on this stuck episode
+    local lastJumpAt  = 0              -- any jump, for spacing and the dash
     local windowAt    = nil            -- net-movement window: when it opened
     local windowPos   = nil            --   and where the character was then
     local creeping    = false          -- last window closed with no ground gained
@@ -2259,7 +2306,7 @@ local function step()
             targetSince = os.clock()
             lastHP      = target.hum.Health
             lastLookAt  = os.clock()
-            stuckSince, jumpedAt = nil, nil
+            stuckSince, jumps = nil, 0
             windowAt, windowPos, creeping = nil, nil, false
             targetDetours, unreachable, pathUntil = 0, false, 0
             -- NO DASH HERE. This is the instant the new target was chosen and
@@ -2275,7 +2322,15 @@ local function step()
         local _, r, h = parts()
         if not r or not h then break end
 
-        local d = station(target.root)
+        -- Above or below by more than a swing reaches counts as OUT of reach
+        -- however close it is on the flat. The distance was flat-only, so an
+        -- enemy on a ledge six studs up read as "in reach" and the character
+        -- stood at the foot of the ledge swinging into its face until the
+        -- give-up clock parked it. station() keeps pushing at it instead,
+        -- the ray sees the ledge, and the jump takes it up.
+        local dy    = math.abs(target.root.Position.Y - r.Position.Y)
+        local climb = dy > 6
+        local d = station(target.root, climb)
         aimCameraAt(r, target.root.Position)
 
         -- reach is where a swing connects. swingFrom is further out: while
@@ -2284,9 +2339,10 @@ local function step()
         -- before its attack does, which is the whole point.
         local reach     = want + slack * 2
         local swingFrom = math.max(reach, CFG.SwingFrom or 0)
-        local closing   = d > reach and d <= swingFrom
+        local inReach   = d <= reach and not climb
+        local closing   = (not inReach) and d <= swingFrom
 
-        if d <= reach then
+        if inReach then
             swing()
             -- Breaks the moment it dies, or the moment it is thrown past the
             -- swing window, so the chase starts on the same frame it happens.
@@ -2311,7 +2367,7 @@ local function step()
                         lastHitAt   = os.clock()
                         targetSince = os.clock()
                         lastHP      = target.hum.Health
-                        stuckSince, jumpedAt = nil, nil
+                        stuckSince, jumps = nil, 0
                         windowAt, windowPos, creeping = nil, nil, false
                         targetDetours, unreachable, pathUntil = 0, false, 0
                         stats.switches += 1
@@ -2322,23 +2378,33 @@ local function step()
                 end
             end
 
-            -- ---- STUCK ON A ROOT, A STEP, A TRUNK. ----
+            local now = os.clock()
+
+            -- ---- SOMETHING AHEAD? Jump it BEFORE you hit it. ----
+            -- A knee-height ray a few studs along the direction of travel. A
+            -- ledge, a step, a low wall is seen before the shove starts and
+            -- the jump goes first, at once -- no waiting for a stuck clock.
+            if CFG.JumpWhenStuck and now - lastJumpAt > 0.9 and ledgeAhead(r, h) then
+                jump()
+                lastJumpAt = now
+                stats.hops += 1
+            end
+
+            -- ---- STUCK ANYWAY: a root, a slide against a trunk. ----
             -- Two signals, because a big trunk does not look like a wall.
             --  fast: pushing and going nowhere (ground speed near zero).
-            --        Roots, steps, a flat wall.
             --  slow: pushing, and the last 1.2s gained under 2.5 studs of
             --        ground. That is the jitter against a trunk, the slide
             --        along its face, the orbit round it -- all of which show
-            --        SPEED but no progress, so the fast signal never saw them
-            --        and the character shoved at the tree.
-            -- Half a second stuck: hop, which clears roots and low edges. A
-            -- second and a half: stop shoving and path round it, and KEEP
-            -- pathing for eight seconds (station) instead of one pass. Three
-            -- detours on the same target: it cannot be got to; leave it.
+            --        SPEED but no progress, so the fast signal never saw them.
+            -- Stuck a third of a second: jump. Still stuck: the extra jumps
+            -- in the air, one every third of a second, which is the rhythm
+            -- the game's air jump wants. Still stuck after all of that: stop
+            -- shoving and path round it, and KEEP pathing for eight seconds
+            -- (station). Three detours on one target: it cannot be got to.
             local pushing = h.MoveDirection.Magnitude > 0.1
             local vel     = r.AssemblyLinearVelocity
             local ground  = Vector3.new(vel.X, 0, vel.Z).Magnitude
-            local now     = os.clock()
             if not pushing then
                 windowAt, windowPos, creeping = nil, nil, false
             else
@@ -2351,13 +2417,16 @@ local function step()
             end
             if pushing and (ground < 1.5 or creeping) then
                 stuckSince = stuckSince or now
-                local held = now - stuckSince
-                if held > 0.5 and not jumpedAt then
-                    if CFG.JumpWhenStuck then h.Jump = true end
-                    jumpedAt = now
-                    stats.hops += 1
-                elseif held > 1.5 then
-                    stuckSince, jumpedAt = nil, nil
+                local held  = now - stuckSince
+                local extra = math.floor(CFG.AirJumps or 0)
+                if held > 0.3 and jumps == 0 then
+                    if CFG.JumpWhenStuck then jump(); stats.hops += 1 end
+                    jumps, lastJumpAt = 1, now
+                elseif jumps >= 1 and jumps <= extra and now - lastJumpAt > 0.35 then
+                    if CFG.JumpWhenStuck then jump(); stats.airJumps += 1 end
+                    jumps, lastJumpAt = jumps + 1, now
+                elseif held > 2.2 then
+                    stuckSince, jumps = nil, 0
                     windowAt, windowPos, creeping = nil, nil, false
                     targetDetours += 1
                     stats.detours += 1
@@ -2371,12 +2440,18 @@ local function step()
                     continue
                 end
             else
-                stuckSince, jumpedAt = nil, nil
+                stuckSince, jumps = nil, 0
             end
 
             -- ---- DASH, then the closing M1 -- never both on one pass. ----
+            -- No dash while the target is above or below (a dash at a ledge
+            -- face is the wrong tool; the jump is the tool), none while
+            -- stuck, and none just after a jump -- in the air it goes
+            -- anywhere. That is the "dashing at the higher land" you watched.
             -- A swing started on top of the dash cuts the dash short.
-            local dashed = tryDash(d, target.root.Position - r.Position)
+            local noDash = climb or (stuckSince ~= nil) or (now - lastJumpAt < 1.2)
+            local dashed = (not noDash)
+                and tryDash(d, target.root.Position - r.Position) or false
 
             -- ---- CLOSING: keep the M1 running. ----
             -- M1 only. Skills stay on their in-reach cadence; burning one at
@@ -3268,10 +3343,20 @@ local function buildUI()
             .. "one it keeps looking, and if another is clearly nearer it "
             .. "turns to that one - a respawn beside you beats the untouched "
             .. "one across the camp. The only thing that beats nearest is the "
-            .. "one already inside this distance and being hit. Stuck on the "
-            .. "way - a root, or sliding against a big trunk - it hops, and "
-            .. "if that did nothing it paths round for the next eight "
-            .. "seconds. Three detours on one enemy and it is left alone.")
+            .. "one already inside this distance and being hit. A ledge or a "
+            .. "step ahead is seen and jumped before it is hit. Stuck anyway "
+            .. "- a root, or sliding against a big trunk - it jumps at once, "
+            .. "then the extra jumps in the air, and if none of that cleared "
+            .. "it, it paths round for the next eight seconds. Three detours "
+            .. "on one enemy and it is left alone. An enemy up on a ledge "
+            .. "counts as out of reach, so it climbs to it instead of "
+            .. "swinging into the wall.")
+
+        sliderRow(v, "Extra jumps in the air", 0, 3, 1,
+            function() return CFG.AirJumps end,
+            function(x) CFG.AirJumps = x end, "")
+        caption(v, "The game's own air jump, pressed when the first jump did "
+            .. "not clear the thing. Set 0 if you do not have it.")
 
         sliderRow(v, "Keep swinging from", 0, 60, 1,
             function() return CFG.SwingFrom end,
@@ -3707,7 +3792,8 @@ local function buildUI()
                 "haki        " .. stats.hakiPresses .. "   (J/E presses)"
                     .. (hasBuso() and "   enhancement ON" or "   enhancement OFF"),
                 "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
-                "hops        " .. stats.hops .. "   (stuck on something, jumped)",
+                "hops        " .. stats.hops .. "   (ledge seen or stuck, jumped)",
+                "air jumps   " .. stats.airJumps .. "   (extra jumps in the air)",
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
                 "gui scans   " .. tostring(P.questScans or 0)
                     .. "   (full PlayerGui walks - should stay tiny)",
