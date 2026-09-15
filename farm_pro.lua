@@ -96,8 +96,13 @@ local CFG = {
     -- DASH. Blox Fruits binds it to Q, and a player leans on it constantly:
     -- into a target, out of a hit, and above all BETWEEN targets. Walking the
     -- gap is most of why the farm was slower than you are.
-    Dash               = true,
-    DashFrom           = 16,     -- only dash when the next one is further out
+    -- OFF by default, because it was broken and you were right to keep it off.
+    -- What was wrong is fixed below; turn it on when you want to test it.
+    Dash               = false,
+    -- Only dash when the gap is BIGGER than a dash covers. Set this too small
+    -- and every dash overshoots the enemy and then has to walk back, which is
+    -- half of what "it goes to the enemy and comes back" was.
+    DashFrom           = 45,
     DashCooldown       = 0.9,    -- your number; the game has its own floor too
     DashKey            = "Q",
 
@@ -556,7 +561,7 @@ P.knownGivers = KNOWN_GIVERS
 -- =========================================================
 local stats = {
     kills = 0, swings = 0, damaging = 0, quests = 0,
-    escalations = 0, retreats = 0, walks = 0, startedAt = 0,
+    escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
 }
 
 local state          = "IDLE"
@@ -870,12 +875,52 @@ local DASH_KEYS = {
     R = Enum.KeyCode.R, LeftShift = Enum.KeyCode.LeftShift,
 }
 local lastDashAt = 0
-local function tryDash(distance)
+-- WHY THE DASH WAS BROKEN.
+-- The key itself was never the problem. Blox Fruits dashes along the direction
+-- you are MOVING, and falls back to the way the body is pointing when you are
+-- standing still. This script never presses WASD -- it moves with
+-- Humanoid:MoveTo -- and it no longer owns the camera either. So at the moment
+-- the key was pressed, the direction was simply whatever the character
+-- happened to be doing, and nothing checked it.
+--
+-- Three things went wrong from that:
+--   * it was fired the instant a new target was chosen, BEFORE the character
+--     had turned or taken a step. The body was still pointing at the enemy
+--     that had just died, so the dash threw you at the corpse and the walk
+--     then had to bring you back. That is the "goes to it and comes back".
+--   * with no direction check at all, any dash fired mid-turn went sideways.
+--   * DashFrom was 16 studs, which is far less than a dash covers, so even a
+--     correctly aimed one overshot and had to walk back.
+--
+-- So now it refuses unless the character is genuinely already moving TOWARD
+-- the target. If it cannot confirm that, it does not dash. A dash that does
+-- not happen costs a moment; a dash in the wrong direction costs the walk
+-- back, and that is the trade that was being got wrong.
+local function tryDash(distance, toward)
     if not CFG.Dash then return false end
-    if distance and distance < (CFG.DashFrom or 16) then return false end
+    if distance and distance < (CFG.DashFrom or 45) then return false end
     if os.clock() - lastDashAt < (CFG.DashCooldown or 0.9) then return false end
+
+    local _, r, h = parts()
+    if not r or not h then return false end
+
+    -- Standing still means the dash would use the body's facing, and the body
+    -- may not have finished turning. Only dash out of real movement.
+    local md = h.MoveDirection
+    if md.Magnitude < 0.1 then return false end
+
+    -- And that movement has to be at the target, not merely nonzero.
+    if toward then
+        local want = Vector3.new(toward.X, 0, toward.Z)
+        if want.Magnitude < 0.1 then return false end
+        if md.Unit:Dot(want.Unit) < 0.8 then return false end   -- ~35 degrees
+    end
+
     lastDashAt = os.clock()
-    pressKey(DASH_KEYS[CFG.DashKey or "Q"] or Enum.KeyCode.Q)
+    -- Spawned, not called. pressKey holds the key down for a frame before
+    -- releasing it, and doing that inline stalls the loop for that long.
+    task.spawn(pressKey, DASH_KEYS[CFG.DashKey or "Q"] or Enum.KeyCode.Q)
+    stats.dashes += 1
     return true
 end
 P.tryDash = tryDash
@@ -1321,33 +1366,65 @@ local function blockText(frame)
 end
 
 local questCache, questCacheAt = nil, 0
+-- The exact label the counter lives in, once we have found it once.
+local questLabel = nil
+P.questScans = 0        -- how many full tree walks this run has cost
+
+-- Read one label. This is the whole job once you know WHICH label.
+local function parseCounter(d)
+    if not d or not d.Parent then return nil end
+    local txt = d.Text
+    if type(txt) ~= "string" or #txt == 0 then return nil end
+    local have, need = string.match(txt, "(%d+)%s*/%s*(%d+)")
+    if not (have and need) then return nil end
+    if not shownOnScreen(d) then return nil end
+    local blob = d.Parent and blockText(d.Parent) or string.lower(txt)
+    if not (string.find(blob, "defeat", 1, true)
+        or string.find(blob, "eliminate", 1, true)
+        or string.find(blob, "kill", 1, true)) then return nil end
+    local enemy = string.match(blob, "defeat%s+%d+%s+([%a%s\'%-]+)")
+    if enemy then enemy = (enemy:gsub("%s+$", "")) end
+    return {
+        have = tonumber(have) or 0, need = tonumber(need) or 0,
+        enemy = enemy, text = txt,
+    }
+end
+
+-- WHY THIS USED TO STALL THE FARM.
+-- The counter lives in one TextLabel, and that label does not move. The old
+-- version walked EVERY descendant of PlayerGui to find it again on every
+-- single call -- and Blox Fruits' PlayerGui is thousands of instances, each
+-- TextLabel of which then cost an ancestor walk and a subtree walk on top.
+-- Called once every few seconds that is invisible. Called after every kill it
+-- is the pause you can watch from outside.
+--
+-- So the label is remembered. The fast path re-reads the one we hold, which is
+-- a text compare and a pattern match. The tree is only walked again when that
+-- label has actually gone -- a respawn, a UI reset, a new quest panel.
 function P.readQuest(force)
     if not force and (os.clock() - questCacheAt) < 0.5 then return questCache end
     questCacheAt = os.clock()
+
+    local fast
+    pcall(function() fast = parseCounter(questLabel) end)
+    if fast then
+        questCache = (fast.need > 0) and fast or nil
+        return questCache
+    end
+    questLabel = nil
+
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then questCache = nil return nil end
     local found
+    P.questScans += 1
     pcall(function()
         for _, d in ipairs(pg:GetDescendants()) do
-            if d:IsA("TextLabel") and type(d.Text) == "string" and #d.Text > 0
-                and not d:FindFirstAncestor("BFPHUD") and shownOnScreen(d) then
-                local have, need = string.match(d.Text, "(%d+)%s*/%s*(%d+)")
-                if have and need then
-                    local parent = d.Parent
-                    local blob = parent and blockText(parent) or string.lower(d.Text)
-                    if string.find(blob, "defeat", 1, true)
-                        or string.find(blob, "eliminate", 1, true)
-                        or string.find(blob, "kill", 1, true) then
-                        local enemy = string.match(blob, "defeat%s+%d+%s+([%a%s'%-]+)")
-                        if enemy then enemy = (enemy:gsub("%s+$", "")) end
-                        found = {
-                            have  = tonumber(have) or 0,
-                            need  = tonumber(need) or 0,
-                            enemy = enemy,
-                            text  = d.Text,
-                        }
-                        return
-                    end
+            if d:IsA("TextLabel") and not d:FindFirstAncestor("BFPHUD") then
+                local parsed = parseCounter(d)
+                if parsed then
+                    questLabel = d
+                    found = parsed
+                    return
                 end
             end
         end
@@ -1913,14 +1990,18 @@ local function step()
             countedDead[m] = os.clock()
             stats.kills += 1
             progress()
-            -- The build before this one checked the quest after every kill.
-            -- The sweep would not have looked again for SweepSeconds, which
-            -- leaves a finished count sitting there doing nothing. Cheap read,
-            -- cached for half a second anyway, and it ends the sweep the
-            -- instant the count fills so the loop can go collect the next one.
-            if CFG.QuestLoop then
+            -- DO NOT READ THE GUI HERE. We already know what the quest wants
+            -- -- need was captured when it was accepted -- and we are counting
+            -- kills ourselves. So count, and only go and LOOK once the local
+            -- count says it should be done. Seven kills out of eight now cost
+            -- nothing at all, and the eighth pays for one confirmation.
+            -- The look is still the authority: if the tracker disagrees (a kill
+            -- that was not credited, someone else got the tag) the sweep simply
+            -- carries on and asks again a kill later.
+            if CFG.QuestLoop and P.quest and (P.quest.need or 0) > 0
+                and (stats.kills - questBaseKills) >= P.quest.need then
                 local qq = P.readQuest(true)
-                if qq and qq.have >= qq.need then
+                if (not qq) or qq.have >= qq.need then
                     say("count is full - ending the sweep")
                     break
                 end
@@ -1949,7 +2030,11 @@ local function step()
             engagedModel = target.model
             lastHitAt = os.clock()
             lastHP    = target.hum.Health
-            tryDash(nd)                        -- close the gap like a player
+            -- NO DASH HERE. This is the instant the new target was chosen and
+            -- the character has not turned or moved yet, so a dash fired now
+            -- goes wherever the body was last pointing -- at the one that just
+            -- died. The closing branch below dashes once real movement toward
+            -- the new target exists.
             say(string.format("%s  %.0f studs  hp %.0f", target.name, nd, lastHP))
             task.wait()                        -- one frame, so this cannot spin
             continue
@@ -1967,7 +2052,9 @@ local function step()
             swing()
             task.wait(swingGap())
         else
-            tryDash(d)                -- still closing: dash again if it is off
+            -- station() has already pointed the body and issued the MoveTo, so
+            -- by now MoveDirection is real and tryDash can check it.
+            tryDash(d, target.root.Position - r.Position)
             progress()                -- walking is not stalling
             task.wait(0.06)
         end
@@ -2905,11 +2992,11 @@ local function buildUI()
 
         gap(v, 8)
         heading2(v, "closing the gap")
-        switchRow(v, "Dash between targets",
-            "The instant one dies, dash at the next one",
+        switchRow(v, "Dash to close a long gap",
+            "Only while already running at the target",
             function() return CFG.Dash end,
             function(x) CFG.Dash = x end)
-        sliderRow(v, "Only dash past", 4, 60, 1,
+        sliderRow(v, "Only dash past", 10, 150, 5,
             function() return CFG.DashFrom end,
             function(x) CFG.DashFrom = x end, " studs")
         sliderRow(v, "Dash no more often than", 0.2, 4, 0.1,
@@ -2928,12 +3015,19 @@ local function buildUI()
             end
         end)
         readout(v, function()
-            if not CFG.Dash then return "Dash off. It walks every gap." end
-            return string.format("Dash on %s, for anything past %d studs, at "
-                .. "most every %.1fs. It chains targets for %ds before looking "
-                .. "at the quest again.", tostring(CFG.DashKey or "Q"),
-                math.floor(CFG.DashFrom), CFG.DashCooldown,
-                math.floor(CFG.SweepSeconds))
+            if not CFG.Dash then
+                return "Dash off. It walks every gap.\n"
+                    .. "It was firing before the character had turned, so it "
+                    .. "threw you at the enemy you had just killed and then "
+                    .. "walked back. It now refuses unless you are already "
+                    .. "running at the target."
+            end
+            return string.format("Dash on %s, only past %d studs, at most "
+                .. "every %.1fs, and only while already moving at the target. "
+                .. "%d fired so far. Keep the distance above what one dash "
+                .. "covers or it overshoots and walks back.",
+                tostring(CFG.DashKey or "Q"), math.floor(CFG.DashFrom),
+                CFG.DashCooldown, stats.dashes or 0)
         end)
 
         gap(v, 8)
@@ -3191,6 +3285,9 @@ local function buildUI()
                 "damaging    " .. stats.damaging,
                 "quests      " .. stats.quests,
                 "walks       " .. stats.walks,
+                "dashes      " .. stats.dashes,
+                "gui scans   " .. tostring(P.questScans or 0)
+                    .. "   (full PlayerGui walks - should stay tiny)",
                 "retreats    " .. stats.retreats,
                 "escalations " .. stats.escalations,
                 "",
