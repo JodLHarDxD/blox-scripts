@@ -613,6 +613,9 @@ local farmSpot       = nil     -- where that species lives
 -- happens to be a stud closer. Once it is out of reach it competes on
 -- distance like everything else.
 local engagedModel   = nil
+-- While the clock is under this, the approach paths round obstacles instead
+-- of walking straight. Set by the sweep when it finds itself stuck.
+local pathUntil      = 0
 
 P.learnedGivers = {}
 P.learnedQuests = {}
@@ -1292,7 +1295,14 @@ local function station(targetRoot)
         -- plain MoveTo, which returns immediately and lets the loop keep
         -- hitting. An approach that cannot close is caught by GiveUpSeconds
         -- rather than by blocking here for twelve seconds.
-        if d > 120 then
+        if os.clock() < pathUntil then
+            -- A detour is in force. The old detour pathed once and then
+            -- handed straight back to this MoveTo, which walked straight
+            -- back into the same trunk. Now the approach keeps pathing for
+            -- as long as the detour lasts, in short chunks so the loop still
+            -- sees a kill, a nearer enemy or a stop between them.
+            walkTo(them, { arrive = want + slack, budget = 1.5 })
+        elseif d > 120 then
             walkTo(spot, { arrive = want + slack, budget = 4 })
         else
             h:MoveTo(Vector3.new(spot.X, me.Y, spot.Z))
@@ -2110,6 +2120,7 @@ local function step()
         end
         activeName, farmSpot = name, spot
         engagedModel = nil
+        pathUntil = 0
         say("target: " .. name)
         setState("FIGHT")
         progress()
@@ -2171,6 +2182,7 @@ local function step()
 
     local target, bestD = pickNext(list, root.Position)
     if not target then task.wait(0.3) return end
+    if engagedModel ~= target.model then pathUntil = 0 end
     engagedModel = target.model
     local lastHitAt   = os.clock()     -- last time this one's health moved
     local targetSince = os.clock()     -- and when we picked it at all
@@ -2178,6 +2190,11 @@ local function step()
     local lastLookAt  = 0              -- last time we looked for someone nearer
     local stuckSince  = nil            -- pushing against something since
     local jumpedAt    = nil            -- and whether we have already hopped
+    local windowAt    = nil            -- net-movement window: when it opened
+    local windowPos   = nil            --   and where the character was then
+    local creeping    = false          -- last window closed with no ground gained
+    local targetDetours = 0            -- detours spent on this one target
+    local unreachable = false          -- three detours: give it up
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -2219,11 +2236,13 @@ local function step()
         -- being chased forever.
         local giveUp = CFG.GiveUpSeconds or 12
         local expired = (not gone) and (not dead)
-            and ((os.clock() - lastHitAt) > giveUp
+            and (unreachable
+                 or (os.clock() - lastHitAt) > giveUp
                  or (os.clock() - targetSince) > giveUp * 5)
         if expired then
             blacklist[m] = os.clock() + 30
-            say("nothing landing on this one - leaving it")
+            say(unreachable and "cannot get to this one - leaving it"
+                or "nothing landing on this one - leaving it")
         end
 
         if gone or dead or expired then
@@ -2241,6 +2260,8 @@ local function step()
             lastHP      = target.hum.Health
             lastLookAt  = os.clock()
             stuckSince, jumpedAt = nil, nil
+            windowAt, windowPos, creeping = nil, nil, false
+            targetDetours, unreachable, pathUntil = 0, false, 0
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2291,6 +2312,8 @@ local function step()
                         targetSince = os.clock()
                         lastHP      = target.hum.Health
                         stuckSince, jumpedAt = nil, nil
+                        windowAt, windowPos, creeping = nil, nil, false
+                        targetDetours, unreachable, pathUntil = 0, false, 0
                         stats.switches += 1
                         say(string.format("%s is nearer  %.0f studs", target.name, nd))
                         task.wait()
@@ -2299,28 +2322,51 @@ local function step()
                 end
             end
 
-            -- ---- STUCK ON A ROOT, A STEP, A TREE. ----
-            -- Trying to move and not moving is the whole signal: MoveDirection
-            -- is where the walk is pushing, the velocity is whether anything
-            -- is coming of it. Half a second of that and it hops, which is
-            -- what clears roots and low edges. If the hop changed nothing it
-            -- stops shoving at the tree and paths round it, bounded to three
-            -- seconds so a fight is never frozen behind it.
+            -- ---- STUCK ON A ROOT, A STEP, A TRUNK. ----
+            -- Two signals, because a big trunk does not look like a wall.
+            --  fast: pushing and going nowhere (ground speed near zero).
+            --        Roots, steps, a flat wall.
+            --  slow: pushing, and the last 1.2s gained under 2.5 studs of
+            --        ground. That is the jitter against a trunk, the slide
+            --        along its face, the orbit round it -- all of which show
+            --        SPEED but no progress, so the fast signal never saw them
+            --        and the character shoved at the tree.
+            -- Half a second stuck: hop, which clears roots and low edges. A
+            -- second and a half: stop shoving and path round it, and KEEP
+            -- pathing for eight seconds (station) instead of one pass. Three
+            -- detours on the same target: it cannot be got to; leave it.
             local pushing = h.MoveDirection.Magnitude > 0.1
             local vel     = r.AssemblyLinearVelocity
             local ground  = Vector3.new(vel.X, 0, vel.Z).Magnitude
-            if pushing and ground < 1.5 then
-                stuckSince = stuckSince or os.clock()
-                local held = os.clock() - stuckSince
+            local now     = os.clock()
+            if not pushing then
+                windowAt, windowPos, creeping = nil, nil, false
+            else
+                if not windowAt then windowAt, windowPos = now, r.Position end
+                if now - windowAt >= 1.2 then
+                    local moved = r.Position - windowPos
+                    creeping = Vector3.new(moved.X, 0, moved.Z).Magnitude < 2.5
+                    windowAt, windowPos = now, r.Position
+                end
+            end
+            if pushing and (ground < 1.5 or creeping) then
+                stuckSince = stuckSince or now
+                local held = now - stuckSince
                 if held > 0.5 and not jumpedAt then
                     if CFG.JumpWhenStuck then h.Jump = true end
-                    jumpedAt = os.clock()
+                    jumpedAt = now
                     stats.hops += 1
-                elseif held > 2.0 then
-                    say("blocked - going round")
-                    stats.detours += 1
-                    walkTo(target.root.Position, { arrive = want + slack, budget = 3 })
+                elseif held > 1.5 then
                     stuckSince, jumpedAt = nil, nil
+                    windowAt, windowPos, creeping = nil, nil, false
+                    targetDetours += 1
+                    stats.detours += 1
+                    if targetDetours >= 3 then
+                        unreachable = true     -- the top of the loop parks it
+                    else
+                        say("blocked - pathing round it")
+                        pathUntil = now + 8
+                    end
                     task.wait()
                     continue
                 end
@@ -3222,9 +3268,10 @@ local function buildUI()
             .. "one it keeps looking, and if another is clearly nearer it "
             .. "turns to that one - a respawn beside you beats the untouched "
             .. "one across the camp. The only thing that beats nearest is the "
-            .. "one already inside this distance and being hit. Stuck on a "
-            .. "root on the way: it hops, and if that did nothing it paths "
-            .. "round.")
+            .. "one already inside this distance and being hit. Stuck on the "
+            .. "way - a root, or sliding against a big trunk - it hops, and "
+            .. "if that did nothing it paths round for the next eight "
+            .. "seconds. Three detours on one enemy and it is left alone.")
 
         sliderRow(v, "Keep swinging from", 0, 60, 1,
             function() return CFG.SwingFrom end,
@@ -3661,7 +3708,7 @@ local function buildUI()
                     .. (hasBuso() and "   enhancement ON" or "   enhancement OFF"),
                 "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
                 "hops        " .. stats.hops .. "   (stuck on something, jumped)",
-                "detours     " .. stats.detours .. "   (hop did nothing, pathed round)",
+                "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
                 "gui scans   " .. tostring(P.questScans or 0)
                     .. "   (full PlayerGui walks - should stay tiny)",
                 "retreats    " .. stats.retreats,
@@ -3715,6 +3762,7 @@ function P.start(name)
     blacklist   = {}
     countedDead = {}
     escalation  = 0
+    pathUntil   = 0
     lastProgressAt = os.clock()
     P.running   = true
     moveEnabled = true
