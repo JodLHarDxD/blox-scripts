@@ -569,6 +569,7 @@ P.knownGivers = KNOWN_GIVERS
 local stats = {
     kills = 0, swings = 0, damaging = 0, quests = 0,
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
+    switches = 0, hops = 0, detours = 0,
 }
 
 local state          = "IDLE"
@@ -583,13 +584,10 @@ local moveEnabled    = true
 
 local activeName     = nil     -- the ONE species being farmed
 local farmSpot       = nil     -- where that species lives
--- Which enemies this camp-clearing run has already worked. Survives across
--- sweeps on purpose: a respawn is a NEW model instance, so it is not in here
--- and is fair game, while the ones still standing untouched stay preferred.
-local sweptModels    = {}
--- The one currently being fought. It outranks everything in pickNext, because
--- a half-killed enemy is worth more than a fresh one and walking away from it
--- wastes every swing already spent.
+-- The one currently being hit. It only outranks "nearest" while it is inside
+-- swing range: a target you are landing hits on is not dropped for one that
+-- happens to be a stud closer. Once it is out of reach it competes on
+-- distance like everything else.
 local engagedModel   = nil
 
 P.learnedGivers = {}
@@ -903,11 +901,21 @@ local function swingGap() return jitter(CFG.SwingMin or 0.12, CFG.SwingMax or 0.
 -- is what "it scans to see whether it is killed" actually was.
 -- Same total gap between swings, but death is seen within a frame of it
 -- happening.
-local function swingWait(hum)
+-- It also breaks the moment the target is thrown out of reach. The fourth hit
+-- of a combo knocks these things a long way, and waiting out the rest of the
+-- gap over an empty patch of ground is time the walk after it could have had.
+-- No extra swing comes of this: swings only fire from the in-reach branch.
+local function swingWait(hum, targetRoot, reach)
     local deadline = os.clock() + swingGap()
     repeat
         task.wait()
         if not hum or hum.Parent == nil or hum.Health <= 0 then return end
+        if targetRoot and reach then
+            local _, r = parts()
+            if r and (targetRoot.Position - r.Position).Magnitude > reach + 4 then
+                return
+            end
+        end
     until os.clock() >= deadline
 end
 local function restGap()  return jitter(CFG.RestMin or 0, CFG.RestMax or 0) end
@@ -1237,26 +1245,36 @@ end
 P.liveEnemies = liveEnemies
 
 -- WHICH ONE NEXT.
--- Nearest-first on its own oscillates, and that is the "it kills three and
--- never touches the other three" bug: you kill the near one, a RESPAWN pops up
--- closer than the two standing untouched on the far side, and nearest-first
--- goes back to it. Forever. So the sweep remembers what it has already worked
--- and prefers the nearest one it has NOT, falling back to plain nearest only
--- when everything has been visited.
-local function pickNext(list, pos, seen)
+-- WHOEVER IS NEAREST. That is the whole rule, and it is the human one.
+--
+-- The version before this preferred an enemy it had NOT yet worked over one
+-- it had, on the theory that nearest-first would ping-pong between respawns
+-- and never clear a camp. That theory was wrong for a quest farm -- a kill is
+-- a kill, the quest does not care which eight -- and it produced exactly the
+-- thing you watched: the one standing beside you had been "worked" (it was
+-- picked once and then a swing threw it away), so the walk went straight past
+-- it to a fresh one on the far side of the camp.
+--
+-- Now: the one standing next to you is the one you hit. A respawn that pops
+-- up beside you beats the untouched one thirty studs off. The only thing that
+-- beats "nearest" is "already in reach and being hit" -- see engagedModel.
+local function swingReach()
+    return math.max(CFG.StandOff or 8, 1) + math.max(CFG.StandSlack or 2, 0.5) * 2
+end
+
+-- How much nearer another enemy has to be before the walk turns to it.
+-- Without a margin two enemies at nearly the same distance would trade the
+-- target back and forth every quarter second.
+local SWITCH_MARGIN = 6
+
+local function pickNext(list, pos)
     local best, bestD = nil, math.huge
-    local fresh, freshD = nil, math.huge
+    local reach = swingReach()
     for _, e in ipairs(list) do
         local d = (e.root.Position - pos).Magnitude
-        -- Already fighting this one: finish it. The sweep boundary used to cut
-        -- across a live engagement -- ten seconds elapse, the loop re-enters,
-        -- and the half-killed enemy is now "already seen" so a FRESH one wins.
-        -- That is the turning-around-mid-fight you can watch it do.
-        if e.model == engagedModel then return e, d end
+        if e.model == engagedModel and d <= reach then return e, d end
         if d < bestD then best, bestD = e, d end
-        if not seen[e.model] and d < freshD then fresh, freshD = e, d end
     end
-    if fresh then return fresh, freshD end
     return best, bestD
 end
 
@@ -1984,7 +2002,6 @@ local function step()
             return
         end
         activeName, farmSpot = name, spot
-        table.clear(sweptModels)
         engagedModel = nil
         say("target: " .. name)
         setState("FIGHT")
@@ -2043,15 +2060,16 @@ local function step()
     local want     = math.max(CFG.StandOff or 8, 1)
     local slack    = math.max(CFG.StandSlack or 2, 0.5)
     local sweepEnd = os.clock() + (CFG.SweepSeconds or 10)
-    local seen     = sweptModels
 
-    local target, bestD = pickNext(list, root.Position, seen)
+    local target, bestD = pickNext(list, root.Position)
     if not target then task.wait(0.3) return end
-    seen[target.model] = true
     engagedModel = target.model
     local lastHitAt   = os.clock()     -- last time this one's health moved
     local targetSince = os.clock()     -- and when we picked it at all
     local lastHP      = target.hum.Health
+    local lastLookAt  = 0              -- last time we looked for someone nearer
+    local stuckSince  = nil            -- pushing against something since
+    local jumpedAt    = nil            -- and whether we have already hopped
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -2106,14 +2124,15 @@ local function step()
             local _, rNow = parts()
             if not rNow then break end
             list = liveEnemies(activeName)
-            local nxt, nd = pickNext(list, rNow.Position, seen)
+            local nxt, nd = pickNext(list, rNow.Position)
             if not nxt then break end          -- camp is clear; step() decides
             target  = nxt
-            seen[target.model] = true
             engagedModel = target.model
             lastHitAt   = os.clock()
             targetSince = os.clock()
             lastHP      = target.hum.Health
+            lastLookAt  = os.clock()
+            stuckSince, jumpedAt = nil, nil
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2124,8 +2143,8 @@ local function step()
             continue
         end
 
-        local _, r = parts()
-        if not r then break end
+        local _, r, h = parts()
+        if not r or not h then break end
 
         local d = station(target.root)
         aimCameraAt(r, target.root.Position)
@@ -2134,8 +2153,67 @@ local function step()
         -- Swinging at something forty studs away lands nothing anyway.
         if d <= want + slack * 2 then
             swing()
-            swingWait(hum)            -- breaks the moment it dies
+            -- Breaks the moment it dies, or the moment it is thrown out of
+            -- reach, so the chase starts on the same frame it happens.
+            swingWait(hum, target.root, want + slack * 2)
         else
+            -- ---- SOMEBODY NEARER? Hit them instead. ----
+            -- While walking to one, the list is re-read four times a second
+            -- (cheap: names are cached, it is one pass over the folder) and
+            -- if another is closer by a clear margin the walk turns to it. A
+            -- respawn that popped up beside you beats the one thirty studs
+            -- off; one that a swing threw across the camp is left to walk
+            -- back on its own while you hit whoever is standing next to you.
+            if os.clock() - lastLookAt > 0.25 then
+                lastLookAt = os.clock()
+                list = liveEnemies(activeName)
+                local nxt, nd = pickNext(list, r.Position)
+                if nxt and nxt.model ~= target.model then
+                    local cur = (target.root.Position - r.Position).Magnitude
+                    if nd + SWITCH_MARGIN < cur then
+                        target = nxt
+                        engagedModel = target.model
+                        lastHitAt   = os.clock()
+                        targetSince = os.clock()
+                        lastHP      = target.hum.Health
+                        stuckSince, jumpedAt = nil, nil
+                        stats.switches += 1
+                        say(string.format("%s is nearer  %.0f studs", target.name, nd))
+                        task.wait()
+                        continue
+                    end
+                end
+            end
+
+            -- ---- STUCK ON A ROOT, A STEP, A TREE. ----
+            -- Trying to move and not moving is the whole signal: MoveDirection
+            -- is where the walk is pushing, the velocity is whether anything
+            -- is coming of it. Half a second of that and it hops, which is
+            -- what clears roots and low edges. If the hop changed nothing it
+            -- stops shoving at the tree and paths round it, bounded to three
+            -- seconds so a fight is never frozen behind it.
+            local pushing = h.MoveDirection.Magnitude > 0.1
+            local vel     = r.AssemblyLinearVelocity
+            local ground  = Vector3.new(vel.X, 0, vel.Z).Magnitude
+            if pushing and ground < 1.5 then
+                stuckSince = stuckSince or os.clock()
+                local held = os.clock() - stuckSince
+                if held > 0.5 and not jumpedAt then
+                    if CFG.JumpWhenStuck then h.Jump = true end
+                    jumpedAt = os.clock()
+                    stats.hops += 1
+                elseif held > 2.0 then
+                    say("blocked - going round")
+                    stats.detours += 1
+                    walkTo(target.root.Position, { arrive = want + slack, budget = 3 })
+                    stuckSince, jumpedAt = nil, nil
+                    task.wait()
+                    continue
+                end
+            else
+                stuckSince, jumpedAt = nil, nil
+            end
+
             -- station() has already pointed the body and issued the MoveTo, so
             -- by now MoveDirection is real and tryDash can check it.
             tryDash(d, target.root.Position - r.Position)
@@ -2152,8 +2230,9 @@ local function step()
         lastHP = hum.Health
     end
     -- The sweep ended with this one still alive (count filled, or the clock
-    -- ran out). Leave it flagged so the next pass picks it straight back up
-    -- instead of turning to a fresh one.
+    -- ran out). Leave it flagged: if it is still in reach when the next pass
+    -- starts it is picked straight back up rather than swapped for one a
+    -- stud closer. If it has been thrown out of reach, nearest wins.
     if target and target.hum and target.hum.Health > 0 then
         engagedModel = target.model
     else
@@ -2167,9 +2246,6 @@ local function step()
         end
         -- Anything that has left the world can go; keeping destroyed models as
         -- keys forever is a leak, and they can never match a respawn anyway.
-        for model in pairs(sweptModels) do
-            if not model.Parent then sweptModels[model] = nil end
-        end
         for model in pairs(nameCache) do
             if not model.Parent then nameCache[model] = nil end
         end
@@ -2976,6 +3052,13 @@ local function buildUI()
         sliderRow(v, "Keep the enemy at", 2, 40, 1,
             function() return CFG.StandOff end,
             function(x) CFG.StandOff = x end, " studs")
+        caption(v, "Who it hits: whoever is nearest, always. While walking to "
+            .. "one it keeps looking, and if another is clearly nearer it "
+            .. "turns to that one - a respawn beside you beats the untouched "
+            .. "one across the camp. The only thing that beats nearest is the "
+            .. "one already inside this distance and being hit. Stuck on a "
+            .. "root on the way: it hops, and if that did nothing it paths "
+            .. "round.")
         sliderRow(v, "Allowed drift", 0.5, 8, 0.5,
             function() return CFG.StandSlack end,
             function(x) CFG.StandSlack = x end, " studs")
@@ -3397,6 +3480,9 @@ local function buildUI()
                 "quests      " .. stats.quests,
                 "walks       " .. stats.walks,
                 "dashes      " .. stats.dashes,
+                "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
+                "hops        " .. stats.hops .. "   (stuck on something, jumped)",
+                "detours     " .. stats.detours .. "   (hop did nothing, pathed round)",
                 "gui scans   " .. tostring(P.questScans or 0)
                     .. "   (full PlayerGui walks - should stay tiny)",
                 "retreats    " .. stats.retreats,
