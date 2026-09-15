@@ -894,6 +894,22 @@ local function swing()
 end
 
 local function swingGap() return jitter(CFG.SwingMin or 0.12, CFG.SwingMax or 0.30) end
+
+-- WAIT OUT THE SWING GAP, BUT WATCH WHILE WAITING.
+-- task.wait(swingGap()) sleeps blind for up to a third of a second and only
+-- then looks at the target, so the killing blow was followed by the character
+-- standing over a corpse for the rest of the gap before it noticed. From
+-- outside that is indistinguishable from the script stopping to think, and it
+-- is what "it scans to see whether it is killed" actually was.
+-- Same total gap between swings, but death is seen within a frame of it
+-- happening.
+local function swingWait(hum)
+    local deadline = os.clock() + swingGap()
+    repeat
+        task.wait()
+        if not hum or hum.Parent == nil or hum.Health <= 0 then return end
+    until os.clock() >= deadline
+end
 local function restGap()  return jitter(CFG.RestMin or 0, CFG.RestMax or 0) end
 
 -- THE DASH.
@@ -1180,8 +1196,15 @@ end
 -- =========================================================
 -- TARGETING
 -- =========================================================
+-- Three gsubs per enemy, and the enemy list is re-read after every kill. The
+-- name of a model does not change, so it is worked out once and kept.
+local nameCache = {}
 local function cleanName(model)
-    return (model.Name:gsub("%s*%b[]", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+    local hit = nameCache[model]
+    if hit then return hit end
+    local n = (model.Name:gsub("%s*%b[]", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+    nameCache[model] = n
+    return n
 end
 
 local function isBlacklisted(model)
@@ -2026,8 +2049,9 @@ local function step()
     if not target then task.wait(0.3) return end
     seen[target.model] = true
     engagedModel = target.model
-    local lastHitAt = os.clock()       -- last time this one's health moved
-    local lastHP    = target.hum.Health
+    local lastHitAt   = os.clock()     -- last time this one's health moved
+    local targetSince = os.clock()     -- and when we picked it at all
+    local lastHP      = target.hum.Health
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -2061,8 +2085,16 @@ local function step()
         -- Nothing landing for GiveUpSeconds means it is behind something or
         -- out of reach. A fight that IS landing never expires, however slow
         -- the weapon: the clock is reset by damage, not by the wall.
+        -- Only counts time spent IN RANGE. A melee swing throws these things
+        -- a long way, and the walk back out to one is not the enemy being
+        -- unreachable, it is the knockback doing its job -- but the clock used
+        -- to run right through it and blacklist a perfectly good target.
+        -- A separate, much longer ceiling stops a genuinely unreachable one
+        -- being chased forever.
+        local giveUp = CFG.GiveUpSeconds or 12
         local expired = (not gone) and (not dead)
-            and (os.clock() - lastHitAt) > (CFG.GiveUpSeconds or 12)
+            and ((os.clock() - lastHitAt) > giveUp
+                 or (os.clock() - targetSince) > giveUp * 5)
         if expired then
             blacklist[m] = os.clock() + 30
             say("nothing landing on this one - leaving it")
@@ -2079,8 +2111,9 @@ local function step()
             target  = nxt
             seen[target.model] = true
             engagedModel = target.model
-            lastHitAt = os.clock()
-            lastHP    = target.hum.Health
+            lastHitAt   = os.clock()
+            targetSince = os.clock()
+            lastHP      = target.hum.Health
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2101,12 +2134,13 @@ local function step()
         -- Swinging at something forty studs away lands nothing anyway.
         if d <= want + slack * 2 then
             swing()
-            task.wait(swingGap())
+            swingWait(hum)            -- breaks the moment it dies
         else
             -- station() has already pointed the body and issued the MoveTo, so
             -- by now MoveDirection is real and tryDash can check it.
             tryDash(d, target.root.Position - r.Position)
             progress()                -- walking is not stalling
+            lastHitAt = os.clock()    -- nor is chasing one that was knocked away
             task.wait(0.06)
         end
 
@@ -2135,6 +2169,9 @@ local function step()
         -- keys forever is a leak, and they can never match a respawn anyway.
         for model in pairs(sweptModels) do
             if not model.Parent then sweptModels[model] = nil end
+        end
+        for model in pairs(nameCache) do
+            if not model.Parent then nameCache[model] = nil end
         end
     end
 
