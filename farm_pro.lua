@@ -3084,7 +3084,7 @@ local function buildUI()
         gap(v, 4)
         heading2(v, "how fast it walks")
         switchRow(v, "Set my walk speed",
-            "Off leaves the game's own value alone",
+            "Fights the game for the property, 60 times a second",
             function() return CFG.SetWalkSpeed end,
             function(x)
                 CFG.SetWalkSpeed = x
@@ -3093,6 +3093,17 @@ local function buildUI()
         sliderRow(v, "Walk speed", 8, 120, 1,
             function() return CFG.WalkSpeed end,
             function(x) CFG.WalkSpeed = x end)
+        caption(v, "Read this before switching it on. WalkSpeed is a Humanoid "
+            .. "property and it REPLICATES, and the game writes it back every "
+            .. "frame - so holding it is a property contested at 60Hz by a "
+            .. "client that should not be touching it. That is the same class "
+            .. "of thing as the flight and the magnet this build deleted, and "
+            .. "it is cheap to log. The server can also simply refuse the "
+            .. "movement, which buys the noise and none of the speed.  "
+            .. "The game already gave you a way to close a gap: the dash. That "
+            .. "one is server-granted and looks like a person, because it is "
+            .. "what a person does. Use that instead. This is left here "
+            .. "because it is your call, not because it is a good idea.")
         readout(v, function()
             local _, _, hum = parts()
             local now = hum and string.format("%.0f", hum.WalkSpeed) or "?"
