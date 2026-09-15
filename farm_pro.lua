@@ -105,6 +105,13 @@ local CFG = {
     DashFrom           = 45,
     DashCooldown       = 0.9,    -- your number; the game has its own floor too
     DashKey            = "Q",
+    -- The wiki says the dash follows your WASD keys, and this script presses
+    -- none. With no keys held the game falls back to "forward" -- which may be
+    -- the body (pinned at the target already) or the camera (yours, pointing
+    -- anywhere). This makes the camera agree before dashing, so the one case
+    -- that cannot be aimed simply does not fire. Turn it off if you find the
+    -- dash is reading MoveDirection after all and you want more of them.
+    DashNeedsCamera    = true,
 
     -- ---------- DISTANCE ----------
     -- The only range in the script.
@@ -935,10 +942,29 @@ local function tryDash(distance, toward)
     if md.Magnitude < 0.1 then return false end
 
     -- And that movement has to be at the target, not merely nonzero.
-    if toward then
-        local want = Vector3.new(toward.X, 0, toward.Z)
-        if want.Magnitude < 0.1 then return false end
-        if md.Unit:Dot(want.Unit) < 0.8 then return false end   -- ~35 degrees
+    local want = toward and Vector3.new(toward.X, 0, toward.Z) or nil
+    if want and want.Magnitude < 0.1 then want = nil end
+    if want and md.Unit:Dot(want.Unit) < 0.8 then return false end   -- ~35 deg
+
+    -- THE CAMERA HAS A VOTE, BECAUSE WE DO NOT KNOW WHOSE INPUT THE GAME READS.
+    -- The wiki is clear that the dash direction comes from the WASD keys, and
+    -- this script presses none of them -- it moves with Humanoid:MoveTo. So
+    -- the game either reads MoveDirection (checked above) or falls back to
+    -- "forward" with no keys held, and forward is either the body, which
+    -- FaceLock has already pinned at the target, or the camera, which is
+    -- yours and points wherever you left it.
+    --
+    -- That last case is the one that used to throw the character off sideways.
+    -- It cannot be fixed without taking your view, so instead the dash simply
+    -- declines when the camera disagrees. A dash that does not fire costs a
+    -- moment of walking; one in the wrong direction costs the walk back.
+    if CFG.DashNeedsCamera and want then
+        local cam = workspace.CurrentCamera
+        if not cam then return false end
+        local look = cam.CFrame.LookVector
+        look = Vector3.new(look.X, 0, look.Z)
+        if look.Magnitude < 0.1 then return false end
+        if look.Unit:Dot(want.Unit) < 0.7 then return false end   -- ~45 deg
     end
 
     lastDashAt = os.clock()
@@ -3027,6 +3053,10 @@ local function buildUI()
         sliderRow(v, "Dash no more often than", 0.2, 4, 0.1,
             function() return CFG.DashCooldown end,
             function(x) CFG.DashCooldown = x end, "s")
+        switchRow(v, "Only dash when the camera agrees",
+            "The game aims a dash by your keys, and we press none",
+            function() return CFG.DashNeedsCamera end,
+            function(x) CFG.DashNeedsCamera = x end)
         sliderRow(v, "Sweep length", 4, 40, 1,
             function() return CFG.SweepSeconds end,
             function(x) CFG.SweepSeconds = x end, "s")
