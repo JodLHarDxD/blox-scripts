@@ -200,6 +200,19 @@ local CFG = {
     -- expires, however long it takes, and one that is not moving at all is
     -- parked quickly.
     GiveUpSeconds      = 12,
+
+    -- ---------- GATHER ----------
+    -- THE MAGNET, DONE BY THE ENEMIES' OWN LEGS.
+    -- When nobody is in reach, instead of walking to the nearest one and
+    -- killing it alone, tag a few with one M1 each on the way through. Each
+    -- one tagged chases you, so they arrive in a pile and every swing lands
+    -- on several. The server's own AI does the moving, so there is nothing
+    -- for it to measure -- unlike a magnet (client writing NPC positions) or
+    -- fast travel (your character moving faster than it can).
+    Gather             = true,
+    GatherCount        = 3,      -- tag up to this many per pile
+    GatherRadius       = 60,     -- only ones within this many studs
+    GatherCooldown     = 6,      -- seconds between gathers
     JumpWhenStuck      = true,
     -- STUCK IS A CRISIS, AND A CRISIS GETS BIG ACTIONS.
     -- Target above: stand still, ground jump, stack every air jump straight
@@ -608,6 +621,7 @@ local stats = {
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
     switches = 0, hops = 0, airJumps = 0, forcedJumps = 0,
     panics = 0, panicDashes = 0, detours = 0, hakiPresses = 0,
+    gathers = 0, tagged = 0,
 }
 
 local state          = "IDLE"
@@ -2297,6 +2311,81 @@ local function retreat()
     progress()
 end
 
+-- =========================================================
+-- GATHER: A PILE, WITHOUT A MAGNET
+-- =========================================================
+-- Worth it only when nobody is already in reach (there is a walk coming
+-- either way) and at least two are close enough to tag. One next to you is
+-- just fought; that is a pile of one and it is already here.
+local lastGatherAt = 0
+local function gatherWorth(list, pos)
+    if not CFG.Gather then return false end
+    if os.clock() - lastGatherAt < (CFG.GatherCooldown or 6) then return false end
+    local reach  = swingReach()
+    local radius = CFG.GatherRadius or 60
+    local inRange = 0
+    for _, e in ipairs(list) do
+        local d = (e.root.Position - pos).Magnitude
+        if d <= reach * 1.5 then return false end
+        if d <= radius then inRange += 1 end
+    end
+    return inRange >= 2
+end
+
+-- Walk a nearest-neighbour route through up to GatherCount of them, one M1
+-- each once in reach, and move on without waiting for the kill. Three
+-- seconds per enemy at most; one that cannot be reached is skipped. Returns
+-- with the character beside the last one tagged, and the rest walking in.
+local function gatherPass(list)
+    local _, r = parts()
+    if not r or not gatherWorth(list, r.Position) then return end
+    lastGatherAt = os.clock()
+
+    local radius = CFG.GatherRadius or 60
+    local pool = {}
+    for _, e in ipairs(list) do
+        if (e.root.Position - r.Position).Magnitude <= radius then
+            table.insert(pool, e)
+        end
+    end
+    local want  = math.max(2, math.floor(CFG.GatherCount or 3))
+    local route, from = {}, r.Position
+    while #route < want and #pool > 0 do
+        local bi, bd = 1, math.huge
+        for i, e in ipairs(pool) do
+            local d = (e.root.Position - from).Magnitude
+            if d < bd then bi, bd = i, d end
+        end
+        local e = table.remove(pool, bi)
+        table.insert(route, e)
+        from = e.root.Position
+    end
+
+    stats.gathers += 1
+    setState("GATHER")
+    say(string.format("gathering %d", #route))
+    local reach   = swingReach()
+    local myEpoch = epoch
+    for _, e in ipairs(route) do
+        local deadline = os.clock() + 3
+        while os.clock() < deadline do
+            if stale(myEpoch) or not P.running or not moveEnabled then return end
+            if healthPct() < CFG.MinHealthPercent then return end
+            if not e.model.Parent or e.hum.Health <= 0 then break end
+            local d = station(e.root)
+            if d <= reach then
+                if CFG.M1 then pressM1() end
+                stats.swings += 1
+                stats.tagged += 1
+                progress()                    -- a tag is progress, not a stall
+                task.wait(0.12)
+                break
+            end
+            task.wait(0.06)
+        end
+    end
+end
+
 local function step()
     local _, root = parts()
     if not root then
@@ -2375,6 +2464,15 @@ local function step()
     -- chains: the instant one dies the next is chosen and dashed at, with no
     -- pause and no round trip through the state machine.
     setState("FIGHT")
+
+    -- Nobody in reach and a few close by: tag them first so they come to
+    -- us together. Guarded, so a failure here can never stop the fight.
+    if CFG.Gather then
+        pcall(gatherPass, list)
+        list = liveEnemies(activeName)
+        if #list == 0 then return end
+        setState("FIGHT")
+    end
 
     local want     = math.max(CFG.StandOff or 8, 1)
     local slack    = math.max(CFG.StandSlack or 2, 0.5)
@@ -2455,6 +2553,7 @@ local function step()
             list = liveEnemies(activeName)
             local nxt, nd = pickNext(list, rNow.Position)
             if not nxt then break end          -- camp is clear; step() decides
+            if gatherWorth(list, rNow.Position) then break end   -- step() gathers the next pile
             target  = nxt
             engagedModel = target.model
             lastHitAt   = os.clock()
@@ -3566,6 +3665,24 @@ local function buildUI()
             .. "out the M1 is kept going while you close, so it walks into "
             .. "hits already in the air. Set it at or below the distance above "
             .. "to swing only in reach.")
+        switchRow(v, "Gather a pile before fighting",
+            "Tag a few with one M1 each; they walk to you together",
+            function() return CFG.Gather end,
+            function(x) CFG.Gather = x end)
+        sliderRow(v, "Tag up to", 2, 5, 1,
+            function() return CFG.GatherCount end,
+            function(x) CFG.GatherCount = x end, " enemies")
+        sliderRow(v, "Gather from within", 30, 120, 5,
+            function() return CFG.GatherRadius end,
+            function(x) CFG.GatherRadius = x end, " studs")
+        caption(v, "The magnet, done by their own legs. When nobody is in "
+            .. "reach it walks through the nearest few, hits each once, and "
+            .. "moves on without waiting for the kill. Each one hit chases "
+            .. "you, so they arrive in a pile and every swing lands on "
+            .. "several. The game's own AI moves them, so there is nothing "
+            .. "unusual for the server to see. More enemies at once also "
+            .. "means more damage taken; an area skill every few swings makes "
+            .. "a pile pay off most.")
         sliderRow(v, "Allowed drift", 0.5, 8, 0.5,
             function() return CFG.StandSlack end,
             function(x) CFG.StandSlack = x end, " studs")
@@ -3990,6 +4107,7 @@ local function buildUI()
                 "haki        " .. stats.hakiPresses .. "   (J/E presses)"
                     .. (hasBuso() and "   enhancement ON" or "   enhancement OFF"),
                 "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
+                "gathers     " .. stats.gathers .. "   (piles started)   tagged " .. stats.tagged,
                 "hops        " .. stats.hops .. "   (ground jumps)",
                 "air jumps   " .. stats.airJumps .. "   (Space worked in the air)",
                 "forced      " .. stats.forcedJumps .. "   (Space ignored; engine jumped)",
