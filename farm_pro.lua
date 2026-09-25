@@ -2709,7 +2709,17 @@ local function step()
             if far < 140 then
                 say(string.format("waiting for %s to respawn", activeName))
                 setState("WAIT")
-                task.wait(jitter(1.5, 3.5))
+                -- WATCH, DO NOT SLEEP. This was one blind 1.5-3.5s sleep, so
+                -- an enemy that respawned a moment in was left standing
+                -- there for up to three seconds while you did nothing -- the
+                -- "stops and thinks" between enemies. It looks every tenth
+                -- of a second now and goes the moment one is back.
+                local myEpoch = epoch
+                local untilT  = os.clock() + jitter(1.5, 3.5)
+                while os.clock() < untilT and P.running and not stale(myEpoch) do
+                    task.wait(0.1)
+                    if #liveEnemies(activeName) > 0 then break end
+                end
                 return
             end
             if far > (CFG.MaxWalk or 1200) then
@@ -2721,8 +2731,8 @@ local function step()
             end
             setState("WALK")
             say(string.format("walking to %s  (%.0f studs)", activeName, far))
+            -- Straight into the fight on arrival: no pause after the walk.
             walkTo(farmSpot, { arrive = 20, budget = 90 })
-            task.wait(jitter(0.3, 0.8))
         else
             say("no idea where " .. tostring(activeName) .. " lives - walk there yourself")
             task.wait(3)
