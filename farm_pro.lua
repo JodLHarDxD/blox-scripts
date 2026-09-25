@@ -239,6 +239,12 @@ local CFG = {
     -- gather), and its collisions go off until it is out the other side of
     -- the trunk or wall. If where it is going is higher, it is also lifted.
     -- In a fight with Panic on, one legal burst is tried first.
+    -- READ THE GROUND FIRST. On reaching a camp its ground is read once --
+    -- heights, walls, trunks, low logs -- and every approach is planned on
+    -- that map: round what cannot be jumped, over what can, jump pressed
+    -- before the edge. Re-planned from memory as enemies move. Off: straight
+    -- runs with the stuck recovery, as before.
+    TerrainMap         = true,
     Ghost              = true,
     GhostAfter         = 1.5,    -- seconds blocked before going through
     GhostLiftMax       = 30,     -- highest lift, in studs
@@ -637,6 +643,7 @@ local stats = {
     switches = 0, hops = 0, airJumps = 0, forcedJumps = 0,
     panics = 0, panicDashes = 0, detours = 0, hakiPresses = 0,
     gathers = 0, tagged = 0, ghosts = 0, lifts = 0, ghostFalls = 0,
+    navMaps = 0, navPlans = 0, navJumps = 0, navLearned = 0,
 }
 
 local state          = "IDLE"
@@ -1210,6 +1217,554 @@ local function keepWater()
     P.waterNote = "solid - standing on the surface"
 end
 
+-- =========================================================
+-- READ THE GROUND FIRST: A MAP OF THE CAMP, AND A ROUTE ON IT
+-- =========================================================
+-- Why the approach stuck and stuttered: it ran in a straight line and only
+-- found out about a trunk, a ledge or a log by hitting it. Everything after
+-- that -- the hop, the bursts, the ghost -- was recovery, and recovery is slow
+-- by nature: it has to fail first.
+--
+-- A camp does not move. So it is read ONCE, on arrival: a grid of cells three
+-- studs apart over the ground round the enemies. Per cell, how high the floor
+-- is (one ray down). Per step between neighbouring cells, whether a body fits
+-- through at the waist (one ray across) and whether something low sits in the
+-- way at the knee (one more). A few tens of thousands of rays, spread over
+-- about a second of frames so the game never hitches -- and then nothing is
+-- scanned again.
+--
+-- Every step is then one of three things for THIS character:
+--   walk : level enough to just walk (up to NAV_STEP studs)
+--   jump : up to what your own ground jump clears (read from your jump power
+--          and the game's gravity, with a margin), or a log at the knee
+--   wall : anything taller, or a trunk / wall at the waist
+-- The approach is planned on the map (A*): round walls, over what jumps, and
+-- a little away from walls so shoulders do not catch corners. Straight runs
+-- are merged into one line, so it does not zig-zag cell to cell. The route is
+-- re-planned from memory whenever the enemy moves: milliseconds, no rays.
+--
+-- Pure Lua from here to NAV GLUE: no Roblox calls, so it can be tested
+-- offline against a made-up landscape.
+local Nav = {}
+local NAV_STEP = 1.2
+local NAV_SQ2  = math.sqrt(2)
+-- The 8 neighbours: di, dj, which of the 4 stored directions, stored on the
+-- neighbour (true) or on this cell (false).
+local NAV_DIRS = {
+    {  1,  0, 1, false }, { -1,  0, 1, true },
+    {  0,  1, 2, false }, {  0, -1, 2, true },
+    {  1,  1, 3, false }, { -1, -1, 3, true },
+    { -1,  1, 4, false }, {  1, -1, 4, true },
+}
+local NAV_FWD = { { 1, 0 }, { 0, 1 }, { 1, 1 }, { -1, 1 } }
+local NAV_DIR_OF = { [-1] = {}, [0] = {}, [1] = {} }
+for k, e in ipairs(NAV_DIRS) do NAV_DIR_OF[e[1]][e[2]] = k end
+
+function Nav.new(cx, cz, radius, cell)
+    local n = math.floor(2 * radius / cell) + 1
+    return {
+        n = n, C = cell, cx = cx, cz = cz,
+        x0 = cx - (n - 1) * cell / 2, z0 = cz - (n - 1) * cell / 2,
+        H = {}, body = { {}, {}, {}, {} }, knee = { {}, {}, {}, {} },
+        near = {}, learned = 0, ready = false, done = 0, total = 2 * n * n,
+    }
+end
+
+local function navIdx(m, i, j) return j * m.n + i + 1 end
+
+function Nav.cellOf(m, x, z)
+    local i = math.floor((x - m.x0) / m.C + 0.5)
+    local j = math.floor((z - m.z0) / m.C + 0.5)
+    if i < 0 or j < 0 or i >= m.n or j >= m.n then return nil end
+    return i, j
+end
+
+function Nav.center(m, i, j) return m.x0 + i * m.C, m.z0 + j * m.C end
+
+-- The edge from (i,j) along NAV_DIRS[k]: stored direction, the slot it is
+-- stored in, and the two cell indices. nil if the neighbour is off the map.
+local function navSlot(m, i, j, k)
+    local e = NAV_DIRS[k]
+    local bi, bj = i + e[1], j + e[2]
+    if bi < 0 or bj < 0 or bi >= m.n or bj >= m.n then return nil end
+    local a, b = navIdx(m, i, j), navIdx(m, bi, bj)
+    return e[3], (e[4] and b or a), a, b
+end
+
+-- 0 walk, 1 jump, 2 wall.
+function Nav.edge(m, i, j, k, jumpMax)
+    local d, slot, a, b = navSlot(m, i, j, k)
+    if not d then return 2 end
+    local hA, hB = m.H[a], m.H[b]
+    if not hA or not hB then return 2 end
+    if m.body[d][slot] then return 2 end
+    local rise = hB - hA
+    if rise > jumpMax then return 2 end
+    if rise > NAV_STEP or m.knee[d][slot] then return 1 end
+    return 0
+end
+
+-- Learned: this step is shut, whatever the survey said.
+function Nav.block(m, i, j, k)
+    local d, slot = navSlot(m, i, j, k)
+    if d and not m.body[d][slot] then
+        m.body[d][slot] = true
+        m.learned += 1
+    end
+end
+
+-- rayDown(x, yTop, z, len) -> floor height or nil
+-- rayFlat(x1, y, z1, x2, z2) -> true if something solid is in the way
+-- pause() is called every `budget` rays; returning false abandons the read.
+function Nav.survey(m, yTop, rayDown, rayFlat, budget, pause)
+    local n, used = m.n, 0
+    local function tick()
+        used += 1
+        if used < budget then return true end
+        used = 0
+        return pause()
+    end
+    for j = 0, n - 1 do
+        for i = 0, n - 1 do
+            local x, z = Nav.center(m, i, j)
+            m.H[navIdx(m, i, j)] = rayDown(x, yTop, z, 400)
+            m.done += 1
+            if not tick() then return false end
+        end
+    end
+    for j = 0, n - 1 do
+        for i = 0, n - 1 do
+            local a = navIdx(m, i, j)
+            local hA = m.H[a]
+            local x1, z1 = Nav.center(m, i, j)
+            for d = 1, 4 do
+                local bi, bj = i + NAV_FWD[d][1], j + NAV_FWD[d][2]
+                if hA and bi >= 0 and bj >= 0 and bi < n and bj < n then
+                    local hB = m.H[navIdx(m, bi, bj)]
+                    if hB then
+                        local x2, z2 = Nav.center(m, bi, bj)
+                        local top = math.max(hA, hB)
+                        if rayFlat(x1, top + 2.5, z1, x2, z2) then m.body[d][a] = true end
+                        if not tick() then return false end
+                        if math.abs(hB - hA) <= NAV_STEP then
+                            if rayFlat(x1, top + 1.0, z1, x2, z2) then m.knee[d][a] = true end
+                            if not tick() then return false end
+                        end
+                    end
+                end
+            end
+            m.done += 1
+        end
+    end
+    -- How many of the four straight sides are hard walls: the route pays a
+    -- little to pass close to one, so it keeps a shoulder's width off it.
+    for j = 0, n - 1 do
+        for i = 0, n - 1 do
+            local c = 0
+            for k = 1, 4 do
+                if Nav.edge(m, i, j, k, math.huge) == 2 then c += 1 end
+            end
+            m.near[navIdx(m, i, j)] = c
+        end
+    end
+    m.ready = true
+    return true
+end
+
+local function navPush(hf, hv, f, v)
+    local k = #hf + 1
+    hf[k], hv[k] = f, v
+    while k > 1 do
+        local p = k // 2
+        if hf[p] <= hf[k] then break end
+        hf[p], hf[k] = hf[k], hf[p]
+        hv[p], hv[k] = hv[k], hv[p]
+        k = p
+    end
+end
+
+local function navPop(hf, hv)
+    local n = #hf
+    local top = hv[1]
+    hf[1], hv[1] = hf[n], hv[n]
+    hf[n], hv[n] = nil, nil
+    n -= 1
+    local k = 1
+    while true do
+        local l, r, s = 2 * k, 2 * k + 1, k
+        if l <= n and hf[l] < hf[s] then s = l end
+        if r <= n and hf[r] < hf[s] then s = r end
+        if s == k then break end
+        hf[s], hf[k] = hf[k], hf[s]
+        hv[s], hv[k] = hv[k], hv[s]
+        k = s
+    end
+    return top
+end
+
+-- A diagonal may not cut a corner: both straight steps beside it must be
+-- open (a jump is open; only a wall shuts it).
+local function navCornerOK(m, i, j, k, jumpMax)
+    if k <= 4 then return true end
+    local e = NAV_DIRS[k]
+    return Nav.edge(m, i, j, NAV_DIR_OF[e[1]][0], jumpMax) < 2
+        and Nav.edge(m, i, j, NAV_DIR_OF[0][e[2]], jumpMax) < 2
+end
+
+-- Route from (sx,sz) to (gx,gz). Returns nodes {x,z,y,i,j,jump} from the
+-- start cell to the goal -- or, when the goal cannot be reached, to the
+-- reachable cell nearest it -- and whether the goal itself was reached.
+-- node.jump = the step INTO this node needs a jump.
+function Nav.plan(m, sx, sz, gx, gz, jumpMax, maxExpand)
+    local si, sj = Nav.cellOf(m, sx, sz)
+    local gi, gj = Nav.cellOf(m, gx, gz)
+    if not si or not gi then return nil, false end
+    local n, C = m.n, m.C
+    local start, goal = navIdx(m, si, sj), navIdx(m, gi, gj)
+    local function hcost(i, j)
+        local dx, dz = math.abs(i - gi), math.abs(j - gj)
+        return C * (math.max(dx, dz) + (NAV_SQ2 - 1) * math.min(dx, dz))
+    end
+    local g, came, jumpIn, closed = { [start] = 0 }, {}, {}, {}
+    local hf, hv = {}, {}
+    navPush(hf, hv, hcost(si, sj), start)
+    local best, bestH = start, hcost(si, sj)
+    local expanded, cap = 0, maxExpand or 3000
+    while #hv > 0 do
+        local a = navPop(hf, hv)
+        if a == goal then best = goal break end
+        if not closed[a] then
+            closed[a] = true
+            expanded += 1
+            if expanded > cap then break end
+            local i, j = (a - 1) % n, (a - 1) // n
+            local hh = hcost(i, j)
+            if hh < bestH then best, bestH = a, hh end
+            for k = 1, 8 do
+                local e = NAV_DIRS[k]
+                local bi, bj = i + e[1], j + e[2]
+                if bi >= 0 and bj >= 0 and bi < n and bj < n then
+                    local b = navIdx(m, bi, bj)
+                    if not closed[b] then
+                        local cls = Nav.edge(m, i, j, k, jumpMax)
+                        if cls < 2 and navCornerOK(m, i, j, k, jumpMax) then
+                            local stepLen = (k <= 4) and C or C * NAV_SQ2
+                            local cost = stepLen * (1 + 0.35 * (m.near[b] or 0))
+                                + (cls == 1 and 1.5 * C or 0)
+                            local ng = g[a] + cost
+                            if g[b] == nil or ng < g[b] then
+                                g[b], came[b], jumpIn[b] = ng, a, (cls == 1)
+                                navPush(hf, hv, ng + hcost(bi, bj), b)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local cells, a = {}, best
+    while a do
+        table.insert(cells, 1, a)
+        a = came[a]
+    end
+    local nodes = {}
+    for _, c in ipairs(cells) do
+        local i, j = (c - 1) % n, (c - 1) // n
+        local x, z = Nav.center(m, i, j)
+        table.insert(nodes, { x = x, z = z, y = m.H[c] or 0, i = i, j = j,
+            jump = jumpIn[c] or false })
+    end
+    return nodes, best == goal
+end
+
+-- Is the straight line from A to B a plain walk the whole way: no jump, no
+-- wall, no corner cut, and not brushing a wall? Checked cell to cell along
+-- the line.
+local function navLineClear(m, ax, az, bx, bz, jumpMax)
+    local dx, dz = bx - ax, bz - az
+    local steps = math.max(1, math.ceil(math.sqrt(dx * dx + dz * dz) / (m.C * 0.5)))
+    local pi, pj = Nav.cellOf(m, ax, az)
+    if not pi then return false end
+    for s = 1, steps do
+        local t = s / steps
+        local ci, cj = Nav.cellOf(m, ax + dx * t, az + dz * t)
+        if not ci then return false end
+        if ci ~= pi or cj ~= pj then
+            local di, dj = ci - pi, cj - pj
+            if math.abs(di) > 1 or math.abs(dj) > 1 then return false end
+            local k = NAV_DIR_OF[di][dj]
+            if Nav.edge(m, pi, pj, k, jumpMax) ~= 0 then return false end
+            if k > 4 and (Nav.edge(m, pi, pj, NAV_DIR_OF[di][0], jumpMax) ~= 0
+                or Nav.edge(m, pi, pj, NAV_DIR_OF[0][dj], jumpMax) ~= 0) then
+                return false
+            end
+            if s < steps and (m.near[navIdx(m, ci, cj)] or 0) > 0 then return false end
+            pi, pj = ci, cj
+        end
+    end
+    return true
+end
+
+-- Merge the cell-by-cell route into straight runs. A jump step is never
+-- merged across: both its ends stay, so the jump happens where it must.
+function Nav.smooth(m, nodes, jumpMax)
+    if #nodes <= 2 then return nodes end
+    local out, a = { nodes[1] }, 1
+    while a < #nodes do
+        local far = a + 1
+        if not nodes[a + 1].jump then
+            for c = a + 2, #nodes do
+                if nodes[c].jump then break end
+                if navLineClear(m, nodes[a].x, nodes[a].z, nodes[c].x, nodes[c].z, jumpMax) then
+                    far = c
+                else
+                    break
+                end
+            end
+        end
+        table.insert(out, nodes[far])
+        a = far
+    end
+    return out
+end
+
+-- How long a jump with take-off speed v0 takes to rise `rise` studs; nil if
+-- it never gets that high.
+function Nav.riseTime(v0, grav, rise)
+    local disc = v0 * v0 - 2 * grav * rise
+    if disc < 0 then return nil end
+    return (v0 - math.sqrt(disc)) / grav
+end
+
+-- The 8-neighbour direction closest to (dx, dz).
+function Nav.dirToward(dx, dz)
+    local a = math.atan2(dz, dx)
+    local oct = math.floor(a / (math.pi / 4) + 0.5) % 8
+    local map = { [0] = { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+                  { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 } }
+    local v = map[oct]
+    return NAV_DIR_OF[v[1]][v[2]]
+end
+-- ============ NAV GLUE ============
+-- The Roblox side. The map is read once per camp, in the background; the
+-- route is followed every frame. The fight only says WHERE it wants to be
+-- (navWant); the follower decides how to get there.
+local NAV_RADIUS, NAV_CELL = 90, 3
+local navMap, navBuilding = nil, nil
+local navGoal, navGoalAt = nil, 0
+local navPath, navPathGoal, navPathAt, navReached, navI = nil, nil, 0, false, 2
+
+local function navRays()
+    local excl = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(excl, pl.Character) end
+    end
+    local enemies = workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(excl, enemies) end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = excl
+    rp.RespectCanCollide = true
+    local function down(x, yTop, z, len)
+        local hit = workspace:Raycast(Vector3.new(x, yTop, z), Vector3.new(0, -len, 0), rp)
+        return hit and hit.Position.Y or nil
+    end
+    local function flat(x1, y, z1, x2, z2)
+        return workspace:Raycast(Vector3.new(x1, y, z1), Vector3.new(x2 - x1, 0, z2 - z1), rp) ~= nil
+    end
+    return down, flat
+end
+
+-- Read the camp, if this one has not been read. The centre is the middle of
+-- the enemies near you (that is where the running happens), else you.
+local function navEnsure(list, mePos)
+    if not CFG.TerrainMap or navBuilding then return end
+    local sx, sz, c = 0, 0, 0
+    for _, e in ipairs(list) do
+        local p = e.root.Position
+        if (p - mePos).Magnitude < 150 then sx += p.X sz += p.Z c += 1 end
+    end
+    local cx, cz = mePos.X, mePos.Z
+    if c > 0 then cx, cz = sx / c, sz / c end
+    if navMap then
+        local off = math.sqrt((navMap.cx - cx) ^ 2 + (navMap.cz - cz) ^ 2)
+        local meIn = Nav.cellOf(navMap, mePos.X, mePos.Z) ~= nil
+        if off < NAV_RADIUS * 0.5 and meIn then return end
+    end
+    local m = Nav.new(cx, cz, NAV_RADIUS, NAV_CELL)
+    navBuilding = m
+    local down, flat = navRays()
+    -- UNDER A ROOF? Read from 30 studs up, the floor is the roof of a cave or
+    -- a building. Checked on a ring round you so one tree's canopy does not
+    -- count: only when most of the ring is covered is the whole read taken
+    -- from just over head height instead.
+    local top, covered = mePos.Y + 30, 0
+    for k = 0, 7 do
+        local a = k * math.pi / 4
+        local fy = down(mePos.X + 20 * math.cos(a), top, mePos.Z + 20 * math.sin(a), 400)
+        if fy and fy > mePos.Y + 1 then covered += 1 end
+    end
+    if covered >= 6 then top = mePos.Y + 4 end
+    m.top = top
+    local myEpoch = epoch
+    task.spawn(function()
+        local ok = pcall(Nav.survey, m, top, down, flat, 400, function()
+            task.wait()
+            return (not stale(myEpoch)) and CFG.TerrainMap and navBuilding == m
+        end)
+        if navBuilding == m then navBuilding = nil end
+        if ok and m.ready then
+            navMap, navPath = m, nil
+            stats.navMaps += 1
+        end
+    end)
+end
+
+local function navHalt() navGoal, navPath = nil, nil end
+
+local function navUsable(goal)
+    if not CFG.TerrainMap then return false end
+    local m = navMap
+    if not (m and m.ready) then return false end
+    local _, r = parts()
+    if not r then return false end
+    return Nav.cellOf(m, r.Position.X, r.Position.Z) ~= nil
+        and Nav.cellOf(m, goal.X, goal.Z) ~= nil
+end
+
+local function navWant(goal) navGoal, navGoalAt = goal, os.clock() end
+
+-- Following a planned route to a goal it can actually reach?
+local function navFollowing()
+    return navGoal ~= nil and navPath ~= nil and navReached
+        and os.clock() - navGoalAt < 0.5
+end
+
+-- Your own ground jump: take-off speed, and the highest step it clears
+-- (85% of the peak, so a step is never taken at the very top of the arc).
+local function navJump(h)
+    local grav = workspace.Gravity
+    local v0
+    if h.UseJumpPower then v0 = h.JumpPower else v0 = math.sqrt(2 * grav * math.max(h.JumpHeight, 0)) end
+    if v0 < 20 then v0 = 50 end        -- jumping handed to the game's own script: assume the default
+    return v0, grav, 0.85 * v0 * v0 / (2 * grav)
+end
+
+-- The step just ahead is shut: mark it, and plan again round it.
+local function navLearnAhead()
+    local m, path = navMap, navPath
+    local _, r = parts()
+    if not (m and path and r) then return end
+    local nd = path[math.min(navI, #path)]
+    local ci, cj = Nav.cellOf(m, r.Position.X, r.Position.Z)
+    if not ci then return end
+    Nav.block(m, ci, cj, Nav.dirToward(nd.x - r.Position.X, nd.z - r.Position.Z))
+    navPath = nil
+    stats.navLearned += 1
+end
+
+-- Every frame: steer along the route and jump before each edge.
+local function navTick()
+    if not navGoal then return end
+    local now = os.clock()
+    if now - navGoalAt > 0.5 or not P.running or not CFG.TerrainMap then
+        navHalt()
+        return
+    end
+    local m = navMap
+    local _, r, h = parts()
+    if not (m and m.ready and r and h) then return end
+    local me, goal = r.Position, navGoal
+    local v0, grav, jumpMax = navJump(h)
+
+    -- Plan again: no route, the goal moved, or wandered off it. Never more
+    -- often than five times a second; a plan is a few milliseconds.
+    local replan = navPath == nil
+        or (navPathGoal and ((goal.X - navPathGoal.X) ^ 2 + (goal.Z - navPathGoal.Z) ^ 2) > 9)
+        or now - navPathAt > 1.5
+    if navPath and not replan then
+        local nd = navPath[math.min(navI, #navPath)]
+        if (nd.x - me.X) ^ 2 + (nd.z - me.Z) ^ 2 > (NAV_CELL * 6) ^ 2 then replan = true end
+    end
+    if replan and (navPath == nil or now - navPathAt > 0.2) then
+        local nodes, reached = Nav.plan(m, me.X, me.Z, goal.X, goal.Z, jumpMax, 3000)
+        navPath = nodes and Nav.smooth(m, nodes, jumpMax) or nil
+        navPathGoal, navPathAt, navReached, navI = goal, now, reached, 2
+        stats.navPlans += 1
+    end
+    local path = navPath
+    if not path or #path < 2 then
+        h:MoveTo(goal)
+        return
+    end
+
+    -- Past a point: next one. "Past" is either close to it, or already on
+    -- the far side of it along the route. A jump point is only passed by
+    -- actually getting up there.
+    while navI < #path do
+        local a, b = path[navI], path[navI + 1]
+        local ax, az = me.X - a.x, me.Z - a.z
+        local near = ax * ax + az * az < 2.5 * 2.5
+        local beyond = ax * (b.x - a.x) + az * (b.z - a.z) > 0
+        local up = me.Y > a.y + 2.2             -- standing on its level
+        if (near or beyond) and (not a.jump or up) then
+            navI += 1
+        else
+            break
+        end
+    end
+    local nd = path[navI]
+
+    -- STEER: aim ahead along the route, further the faster you are, but
+    -- never past a jump point (the run-up must line up with the jump).
+    local tx, tz, ty = nd.x, nd.z, nd.y
+    if navI == #path then
+        -- The last point: the goal itself. If the map has NO way in, it still
+        -- pushes straight at it from the nearest point, so the stuck ladder
+        -- (bursts, ghost) gets its turn instead of standing there politely.
+        local dx, dz = me.X - nd.x, me.Z - nd.z
+        if navReached or dx * dx + dz * dz < 4 * 4 then
+            tx, tz, ty = goal.X, goal.Z, goal.Y - 3
+        end
+    else
+        local look = math.clamp(h.WalkSpeed * 0.25, 5, 14)
+        local dx, dz = nd.x - me.X, nd.z - me.Z
+        local dn = math.sqrt(dx * dx + dz * dz)
+        local nx = path[navI + 1]
+        if dn < look and not nd.jump and not nx.jump then
+            local sx, sz = nx.x - nd.x, nx.z - nd.z
+            local sl = math.sqrt(sx * sx + sz * sz)
+            if sl > 0.01 then
+                local t = math.min(1, (look - dn) / sl)
+                tx, tz, ty = nd.x + sx * t, nd.z + sz * t, nd.y + (nx.y - nd.y) * t
+            end
+        end
+    end
+    h:MoveTo(Vector3.new(tx, ty + 3, tz))
+
+    -- JUMP BEFORE THE EDGE: as far ahead of it as you travel while the jump
+    -- rises to the step's height, plus a stud. Ground jumps only.
+    for k = navI, math.min(#path, navI + 1) do
+        local jn = path[k]
+        if jn.jump and k > 1 then
+            local pv = path[k - 1]
+            local ex, ez = (pv.x + jn.x) / 2, (pv.z + jn.z) / 2
+            local rise = math.max(0.8, jn.y - pv.y) + 0.6
+            local t = Nav.riseTime(v0, grav, rise) or 0.3
+            local lead = h.WalkSpeed * t + 1.0
+            local dx, dz = ex - me.X, ez - me.Z
+            if dx * dx + dz * dz <= lead * lead
+                and h.FloorMaterial ~= Enum.Material.Air
+                and now - lastJumpAt > 0.35 then
+                jump()
+                lastJumpAt = now
+                stats.navJumps += 1
+            end
+            break
+        end
+    end
+end
+
 -- (the climb and the sideways burst live after tryDash: they dash.)
 
 -- =========================================================
@@ -1526,6 +2081,7 @@ end
 -- the target and it dashes and walks forward. Returns true on real forward
 -- progress.
 local function climbBurst(targetRoot)
+    navHalt()
     local _, r, h = parts()
     if not r or not h or not targetRoot then return false end
     local start = r.Position
@@ -1570,6 +2126,7 @@ end
 -- Movement is cancelled first so the dash follows the camera and not a
 -- MoveTo. Returns true if it got forward, or at least somewhere new.
 local function lateralBurst(targetRoot, side)
+    navHalt()
     local _, r, h = parts()
     if not r or not h or not targetRoot then return false end
     local start = r.Position
@@ -1680,6 +2237,7 @@ end
 
 -- Walk a real route. arrive = how close counts as there, budget = seconds.
 local function walkTo(goal, opts)
+    navHalt()
     opts = opts or {}
     local _, root, hum = parts()
     if not root or not hum then return false end
@@ -1816,9 +2374,14 @@ local function station(targetRoot, climb)
             -- as long as the detour lasts, in short chunks so the loop still
             -- sees a kill, a nearer enemy or a stop between them.
             walkTo(them, { arrive = want + slack, budget = 1.5 })
+        elseif navUsable(climb and them or spot) then
+            -- The camp has been read: say where to be, and the follower
+            -- runs the route every frame.
+            navWant(climb and them or spot)
         elseif d > 120 then
             walkTo(spot, { arrive = want + slack, budget = 4 })
         else
+            navHalt()
             local goal = climb and them or spot
             h:MoveTo(Vector3.new(goal.X, me.Y, goal.Z))
         end
@@ -1827,9 +2390,11 @@ local function station(targetRoot, climb)
         -- CFrame on top of that only fights it mid-stride. The lock takes
         -- over once in range, where the swing needs it.
     elseif d < want - slack then
+        navHalt()
         h:MoveTo(Vector3.new(spot.X, me.Y, spot.Z))
         if CFG.FaceLock then faceTarget(r, them, true) end
     else
+        navHalt()
         h:MoveTo(me)                 -- stop; we are where we want to be
         faceTarget(r, them, CFG.FaceLock)
     end
@@ -2560,6 +3125,7 @@ end
 -- Four rungs, none of which reaches for an exploit. On foot, "stuck" nearly
 -- always means the thing is behind something.
 local function escalate(target)
+    navHalt()
     escalation = math.min(escalation + 1, 4)
     stats.escalations += 1
     lastProgressAt = os.clock()
@@ -2590,6 +3156,7 @@ end
 -- MAIN LOOP
 -- =========================================================
 local function retreat()
+    navHalt()
     stats.retreats += 1
     say("retreating - low health")
     setState("RETREAT")
@@ -2779,6 +3346,9 @@ local function step()
     -- pause and no round trip through the state machine.
     setState("FIGHT")
 
+    -- Read this camp's ground, once, in the background.
+    if CFG.TerrainMap then pcall(navEnsure, list, root.Position) end
+
     -- Nobody in reach and a few close by: tag them first so they come to
     -- us together. Guarded, so a failure here can never stop the fight.
     if CFG.Gather then
@@ -2810,6 +3380,7 @@ local function step()
     local targetDetours = 0            -- detours spent on this one target
     local unreachable = false          -- three detours: give it up
     local targetGhosts = 0             -- times it has gone through for this one
+    local targetLearn = 0              -- map corrections spent on this one
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -2878,6 +3449,7 @@ local function step()
             stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
             windowAt, windowPos, creeping = nil, nil, false
             targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
+            targetLearn = 0
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2940,6 +3512,7 @@ local function step()
                         stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
                         windowAt, windowPos, creeping = nil, nil, false
                         targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
+                        targetLearn = 0
                         stats.switches += 1
                         say(string.format("%s is nearer  %.0f studs", target.name, nd))
                         task.wait()
@@ -3003,6 +3576,19 @@ local function step()
                 local held = now - stuckSince
                 if (held > 0.3 or ledgeUp) and not panicked then
                     panicked = true
+                    -- THE MAP WAS WRONG HERE. Following a route the map said
+                    -- was open and stuck anyway: mark that step shut and
+                    -- re-plan round it, before any burst. Twice per target;
+                    -- the map keeps the lesson for the next one.
+                    if navFollowing() and targetLearn < 2 then
+                        targetLearn += 1
+                        navLearnAhead()
+                        say("map was wrong here - routing round")
+                        stuckSince, panicked = nil, false
+                        windowAt, windowPos, creeping = nil, nil, false
+                        task.wait()
+                        continue
+                    end
                     -- THROUGH IT. With Panic on, one legal burst gets its try
                     -- first; the moment one has failed, it goes through. With
                     -- Panic off it goes through straight away. Twice per
@@ -3066,6 +3652,7 @@ local function step()
             -- anywhere. The panic bursts dash on their own terms.
             -- A swing started on top of the dash cuts the dash short.
             local noDash = climb or (stuckSince ~= nil) or (now - lastJumpAt < 1.2)
+                or (navFollowing() and navPath ~= nil and #navPath > 2)
             local dashed = (not noDash)
                 and tryDash(d, target.root.Position - r.Position) or false
 
@@ -3982,6 +4569,45 @@ local function buildUI()
             .. "enemy is left alone. An enemy up on a ledge counts as out of "
             .. "reach, so it climbs to it instead of swinging into the wall.")
 
+        switchRow(v, "Read the ground first",
+            "Map the camp once; route round walls, jump before edges",
+            function() return CFG.TerrainMap end,
+            function(x)
+                CFG.TerrainMap = x
+                if not x then navHalt() end
+            end)
+        readout(v, function()
+            local line
+            if navBuilding then
+                line = string.format("Reading the ground: %d%%",
+                    math.floor(100 * navBuilding.done / math.max(navBuilding.total, 1)))
+            elseif navMap then
+                line = string.format("Map ready: %dx%d cells, %d studs each. "
+                    .. "%d steps learned shut.", navMap.n, navMap.n, navMap.C, navMap.learned)
+            else
+                line = "No map yet - it is read when a camp is reached."
+            end
+            local route = "no route"
+            if navPath and navGoal then
+                local j = 0
+                for _, nd in ipairs(navPath) do if nd.jump then j += 1 end end
+                route = string.format("route %d points, %d jumps%s", #navPath, j,
+                    navReached and "" or ", no way all the way in")
+            end
+            return line .. "\n" .. route .. string.format(".  Plans %d, jumps %d, learned %d.",
+                stats.navPlans, stats.navJumps, stats.navLearned)
+        end)
+        caption(v, "A camp does not move, so its ground is read once when you "
+            .. "get there - floor heights, walls, trunks, logs at the knee - "
+            .. "over about a second, and never scanned again. Every run to an "
+            .. "enemy is then planned on that map: round what is too tall, "
+            .. "over what your own jump clears, a little off walls so your "
+            .. "shoulders do not catch. It is steered every frame and the jump "
+            .. "is pressed BEFORE the edge, as far ahead as your speed carries "
+            .. "you while the jump rises. If you still get stuck where the map "
+            .. "said it was open, that step is marked shut and it routes round; "
+            .. "only then do the bursts and the walk-through get a turn.")
+
         switchRow(v, "Walk through it when stuck",
             "Collisions off until clear; lifted onto higher ground",
             function() return CFG.Ghost end,
@@ -4467,6 +5093,8 @@ local function buildUI()
                 "panics      " .. stats.panics .. "   (stuck bursts: climb or sideways)",
                 "panic dash  " .. stats.panicDashes .. "   (dashes spent inside bursts)",
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
+                "map         " .. stats.navMaps .. " read   plans " .. stats.navPlans
+                    .. "   jumps " .. stats.navJumps .. "   learned " .. stats.navLearned,
                 "ghosts      " .. stats.ghosts .. "   (blocked; walked through)   lifts " .. stats.lifts
                     .. "   fell " .. stats.ghostFalls,
                 "gui scans   " .. tostring(P.questScans or 0)
@@ -4551,6 +5179,24 @@ function P.start(name)
     -- The ghost watcher: every frame, whatever is walking the character.
     blockAt = nil
     track(RunService.Heartbeat:Connect(function() pcall(ghostWatch) end))
+    -- The route follower: steer and jump, every frame. It owns the legs
+    -- while it runs, so if it ever throws, the character would just stand
+    -- there. Three errors and the map switches itself off (the panel shows
+    -- Off) and the plain straight run takes over again.
+    navHalt()
+    local navErrors = 0
+    track(RunService.Heartbeat:Connect(function()
+        local ok, err = pcall(navTick)
+        if not ok then
+            navErrors += 1
+            log("nav error: " .. tostring(err))
+            if navErrors >= 3 then
+                CFG.TerrainMap = false
+                navHalt()
+                say("ground map switched itself off after errors")
+            end
+        end
+    end))
 
     track(player.Idled:Connect(function()
         pcall(function()
@@ -4601,6 +5247,7 @@ function P.stop()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
     pcall(ghostRelease)
+    navHalt()
     setState("IDLE")
     say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d quests=%d",
