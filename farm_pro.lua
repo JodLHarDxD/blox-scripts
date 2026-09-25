@@ -1179,6 +1179,37 @@ local function ghostRelease()
     end)
 end
 
+-- =========================================================
+-- WALK ON WATER
+-- =========================================================
+-- The sea in Blox Fruits is one slab, workspace.Map["WaterBase-Plane"], and it
+-- is the FLOOR you stand on in the sea: it sits under the surface, so standing
+-- on it means standing in water, which is what hurts a fruit user, and it is
+-- why getting out means climbing an island edge from below. Make the slab
+-- taller (Size.Y 80 -> 112) and its top comes up to the surface: you run ON
+-- the water. No damage, and no edge to climb, because you never went down.
+-- The public hubs all do exactly this, and one re-applies it every tenth of a
+-- second, so the game evidently puts it back; it is kept here the same way.
+-- It is your client's copy of the slab. Nobody else's sea changes.
+-- ALWAYS ON, no switch: you never want water damage, so water is land.
+local WATER_Y = 112          -- raised: the top is at the surface (the game's is 80)
+P.waterNote = "not looked yet"
+P.waterSets = 0
+
+local function keepWater()
+    local map = workspace:FindFirstChild("Map")
+    local wp = map and map:FindFirstChild("WaterBase-Plane")
+    if not (wp and wp:IsA("BasePart")) then
+        P.waterNote = "no WaterBase-Plane in workspace.Map here"
+        return
+    end
+    if math.abs(wp.Size.Y - WATER_Y) > 0.5 then
+        wp.Size = Vector3.new(wp.Size.X, WATER_Y, wp.Size.Z)
+        P.waterSets += 1
+    end
+    P.waterNote = "solid - standing on the surface"
+end
+
 -- (the climb and the sideways burst live after tryDash: they dash.)
 
 -- =========================================================
@@ -3978,6 +4009,18 @@ local function buildUI()
             .. "with Panic off it goes through at once. The server does see "
             .. "you pass through a solid - only when stuck, only until clear.")
 
+        readout(v, function()
+            return "Water: " .. tostring(P.waterNote) .. ".  Put back up "
+                .. tostring(P.waterSets) .. " times (the game resets it)."
+        end)
+        caption(v, "Water is land, always - no switch. The sea floor in this "
+            .. "game sits under the surface, so standing on it is standing IN "
+            .. "water: that is the damage, and it is why getting out meant "
+            .. "climbing an island edge from below. It is raised to the "
+            .. "surface on your screen from the moment the script loads, so a "
+            .. "lunge off the shore leaves you standing on the water and you "
+            .. "just run back. Your client only; rejoining resets it.")
+
         switchRow(v, "Panic when stuck",
             "Big bursts: stacked air jumps, sideways dashes",
             function() return CFG.Panic end,
@@ -4569,4 +4612,13 @@ function P.state() return state, statusLine, escalation end
 
 say("loaded - pick a target, then press Start")
 pcall(buildUI)
+-- Water is land from load, farm running or not, panel open or closed: the
+-- game puts the slab back, so it is looked at four times a second. Hands
+-- over only when a newer copy of this script takes over _G.BFP.
+task.spawn(function()
+    while _G.BFP == P do
+        pcall(keepWater)
+        task.wait(0.25)
+    end
+end)
 print("[BFP] loaded. Use the panel, or _G.BFP.start(\"Demonic Soul\")")
