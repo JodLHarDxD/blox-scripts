@@ -227,12 +227,10 @@ local CFG = {
     -- the next is the other kind or the other side. Four bursts hand over to
     -- pathfinding. Off: pathfinding only.
     Panic              = true,
-    -- AIR JUMPS PER CLIMB, stacked straight up with no movement held (they go
-    -- where you are moving; moving forward wastes them into the wall).
-    ClimbJumps         = 6,
-    -- If the Space key is ignored in the air (no upward kick within a tenth
-    -- of a second), ask the engine for the jump directly. Off: Space only.
-    ForceAirJump       = true,
+    -- AIR JUMPS PER CLIMB. Physics, not keys: each gives the body one
+    -- ordinary jump's upward speed at the top of the rise, straight up.
+    -- Eight is about fifty studs.
+    ClimbJumps         = 8,
     -- GHOST: WHEN ROUND HAS FAILED, THROUGH.
     -- Asked to move and gaining no ground for GhostAfter seconds, whatever
     -- is walking the character (fight, walk to the camp, walk to the giver,
@@ -640,10 +638,10 @@ P.knownGivers = KNOWN_GIVERS
 local stats = {
     kills = 0, swings = 0, damaging = 0, quests = 0,
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
-    switches = 0, hops = 0, airJumps = 0, forcedJumps = 0,
+    switches = 0, hops = 0, airJumps = 0,
     panics = 0, panicDashes = 0, detours = 0, hakiPresses = 0,
     gathers = 0, tagged = 0, ghosts = 0, lifts = 0, ghostFalls = 0,
-    navMaps = 0, navPlans = 0, navJumps = 0, navLearned = 0,
+    navMaps = 0, navPlans = 0, navJumps = 0, navLearned = 0, navClimbs = 0,
 }
 
 local state          = "IDLE"
@@ -960,26 +958,6 @@ local function openSide(r, dir)
     return lastSide
 end
 
--- THE AIR JUMP, VERIFIED. Space first: that is the game's own air jump, the
--- key you would press. If the character shows no upward kick within a tenth
--- of a second the key did not reach it, and -- if allowed -- the engine is
--- asked for the jump directly. Both are counted, so the stats page shows
--- which one is actually doing the work.
-local function airJump(r, h)
-    local before = r.AssemblyLinearVelocity.Y
-    pressKey(Enum.KeyCode.Space)
-    task.wait(0.10)
-    local after = r.AssemblyLinearVelocity.Y
-    if after > before + 8 then
-        stats.airJumps += 1
-        return true
-    end
-    if not CFG.ForceAirJump then return false end
-    local ok = pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end)
-    if ok then stats.forcedJumps += 1 end
-    return ok
-end
-
 -- =========================================================
 -- GHOST: THROUGH, WHEN ROUND HAS FAILED
 -- =========================================================
@@ -1233,11 +1211,14 @@ end
 -- about a second of frames so the game never hitches -- and then nothing is
 -- scanned again.
 --
--- Every step is then one of three things for THIS character:
---   walk : level enough to just walk (up to NAV_STEP studs)
---   jump : up to what your own ground jump clears (read from your jump power
---          and the game's gravity, with a margin), or a log at the knee
---   wall : anything taller, or a trunk / wall at the waist
+-- Every step is then one of four things for THIS character:
+--   walk  : level enough to just walk (up to NAV_STEP studs)
+--   jump  : up to what your own ground jump clears (read from your jump
+--           power and the game's gravity, with a margin), or a log at the knee
+--   climb : taller than a jump but open on top, up to NAV_CLIMB studs --
+--           a shore wall, a cliff edge. Air jumps take you up it. Costs a lot,
+--           so a stair or a ramp nearby is still preferred.
+--   wall  : anything taller than that, or a trunk / wall at the waist
 -- The approach is planned on the map (A*): round walls, over what jumps, and
 -- a little away from walls so shoulders do not catch corners. Straight runs
 -- are merged into one line, so it does not zig-zag cell to cell. The route is
@@ -1246,7 +1227,8 @@ end
 -- Pure Lua from here to NAV GLUE: no Roblox calls, so it can be tested
 -- offline against a made-up landscape.
 local Nav = {}
-local NAV_STEP = 1.2
+local NAV_STEP  = 1.2
+local NAV_CLIMB = 40       -- tallest step taken with air jumps
 local NAV_SQ2  = math.sqrt(2)
 -- The 8 neighbours: di, dj, which of the 4 stored directions, stored on the
 -- neighbour (true) or on this cell (false).
@@ -1291,7 +1273,7 @@ local function navSlot(m, i, j, k)
     return e[3], (e[4] and b or a), a, b
 end
 
--- 0 walk, 1 jump, 2 wall.
+-- 0 walk, 1 jump, 2 wall, 3 climb (straight steps only, never diagonal).
 function Nav.edge(m, i, j, k, jumpMax)
     local d, slot, a, b = navSlot(m, i, j, k)
     if not d then return 2 end
@@ -1299,7 +1281,10 @@ function Nav.edge(m, i, j, k, jumpMax)
     if not hA or not hB then return 2 end
     if m.body[d][slot] then return 2 end
     local rise = hB - hA
-    if rise > jumpMax then return 2 end
+    if rise > jumpMax then
+        if rise <= NAV_CLIMB and k <= 4 then return 3 end
+        return 2
+    end
     if rise > NAV_STEP or m.knee[d][slot] then return 1 end
     return 0
 end
@@ -1414,7 +1399,7 @@ end
 -- Route from (sx,sz) to (gx,gz). Returns nodes {x,z,y,i,j,jump} from the
 -- start cell to the goal -- or, when the goal cannot be reached, to the
 -- reachable cell nearest it -- and whether the goal itself was reached.
--- node.jump = the step INTO this node needs a jump.
+-- node.jump = the step INTO this node needs a jump; node.climb = air jumps.
 function Nav.plan(m, sx, sz, gx, gz, jumpMax, maxExpand)
     local si, sj = Nav.cellOf(m, sx, sz)
     local gi, gj = Nav.cellOf(m, gx, gz)
@@ -1425,7 +1410,7 @@ function Nav.plan(m, sx, sz, gx, gz, jumpMax, maxExpand)
         local dx, dz = math.abs(i - gi), math.abs(j - gj)
         return C * (math.max(dx, dz) + (NAV_SQ2 - 1) * math.min(dx, dz))
     end
-    local g, came, jumpIn, closed = { [start] = 0 }, {}, {}, {}
+    local g, came, jumpIn, climbIn, closed = { [start] = 0 }, {}, {}, {}, {}
     local hf, hv = {}, {}
     navPush(hf, hv, hcost(si, sj), start)
     local best, bestH = start, hcost(si, sj)
@@ -1447,13 +1432,15 @@ function Nav.plan(m, sx, sz, gx, gz, jumpMax, maxExpand)
                     local b = navIdx(m, bi, bj)
                     if not closed[b] then
                         local cls = Nav.edge(m, i, j, k, jumpMax)
-                        if cls < 2 and navCornerOK(m, i, j, k, jumpMax) then
+                        if cls ~= 2 and navCornerOK(m, i, j, k, jumpMax) then
                             local stepLen = (k <= 4) and C or C * NAV_SQ2
                             local cost = stepLen * (1 + 0.35 * (m.near[b] or 0))
                                 + (cls == 1 and 1.5 * C or 0)
+                                + (cls == 3 and 20 * C or 0)
                             local ng = g[a] + cost
                             if g[b] == nil or ng < g[b] then
-                                g[b], came[b], jumpIn[b] = ng, a, (cls == 1)
+                                g[b], came[b] = ng, a
+                                jumpIn[b], climbIn[b] = (cls == 1), (cls == 3)
                                 navPush(hf, hv, ng + hcost(bi, bj), b)
                             end
                         end
@@ -1472,7 +1459,7 @@ function Nav.plan(m, sx, sz, gx, gz, jumpMax, maxExpand)
         local i, j = (c - 1) % n, (c - 1) // n
         local x, z = Nav.center(m, i, j)
         table.insert(nodes, { x = x, z = z, y = m.H[c] or 0, i = i, j = j,
-            jump = jumpIn[c] or false })
+            jump = jumpIn[c] or false, climb = climbIn[c] or false })
     end
     return nodes, best == goal
 end
@@ -1505,16 +1492,16 @@ local function navLineClear(m, ax, az, bx, bz, jumpMax)
     return true
 end
 
--- Merge the cell-by-cell route into straight runs. A jump step is never
--- merged across: both its ends stay, so the jump happens where it must.
+-- Merge the cell-by-cell route into straight runs. A jump or a climb is
+-- never merged across: both its ends stay, so it happens where it must.
 function Nav.smooth(m, nodes, jumpMax)
     if #nodes <= 2 then return nodes end
     local out, a = { nodes[1] }, 1
     while a < #nodes do
         local far = a + 1
-        if not nodes[a + 1].jump then
+        if not (nodes[a + 1].jump or nodes[a + 1].climb) then
             for c = a + 2, #nodes do
-                if nodes[c].jump then break end
+                if nodes[c].jump or nodes[c].climb then break end
                 if navLineClear(m, nodes[a].x, nodes[a].z, nodes[c].x, nodes[c].z, jumpMax) then
                     far = c
                 else
@@ -1553,6 +1540,7 @@ local NAV_RADIUS, NAV_CELL = 90, 3
 local navMap, navBuilding = nil, nil
 local navGoal, navGoalAt = nil, 0
 local navPath, navPathGoal, navPathAt, navReached, navI = nil, nil, 0, false, 2
+local navClimbing = false
 
 local function navRays()
     local excl = {}
@@ -1650,6 +1638,69 @@ local function navJump(h)
     return v0, grav, 0.85 * v0 * v0 / (2 * grav)
 end
 
+-- AIR JUMPS THAT ALWAYS FIRE.
+-- The old climb pressed Space in the air and hoped the game's own air jump
+-- heard it -- a simulated key, checked a tenth of a second later -- with the
+-- engine's jump as the fallback. If the game runs its air jump through the
+-- server, or ignores a simulated key, or handles jumping itself (JumpPower 0,
+-- the Jumping state switched off), all of that comes back empty and the
+-- character stands at the foot of the wall.
+-- These are physics, not keys. Each time the rise tops out, the body is given
+-- one ordinary jump's worth of upward speed, straight up (no sideways drift
+-- into the wall), until the feet are over the top; then it steps forward onto
+-- it, with one more kick if it starts to drop before it is across. Nothing to
+-- hear, nothing to miss.
+-- topY = the floor height up there; (fx, fz) = a point on it to step onto.
+local function climbUp(topY, fx, fz)
+    local _, r, h = parts()
+    if not r or not h then return false end
+    local myEpoch = epoch
+    local v0  = math.max((navJump(h)), 50)
+    local cap = math.max(2, math.floor(CFG.ClimbJumps or 8))
+    local over = topY + 3 + 1.5            -- root height that puts the feet 1.5 over
+    local boosts = 0
+    local function kick(r2, h2, keepFlat)
+        boosts += 1
+        stats.airJumps += 1
+        lastJumpAt = os.clock()
+        pcall(function() h2:ChangeState(Enum.HumanoidStateType.Freefall) end)
+        local v = r2.AssemblyLinearVelocity
+        r2.AssemblyLinearVelocity = keepFlat and Vector3.new(v.X, v0, v.Z)
+            or Vector3.new(0, v0, 0)
+    end
+    h:MoveTo(r.Position)                   -- no push into the wall: straight up
+    local t0 = os.clock()
+    while os.clock() - t0 < 4 do
+        if stale(myEpoch) or not P.running then return false end
+        local _, r2, h2 = parts()
+        if not r2 or not h2 then return false end
+        if r2.Position.Y >= over then break end
+        if r2.AssemblyLinearVelocity.Y < 6 then       -- topped out (or on the ground)
+            if boosts >= cap then break end
+            kick(r2, h2, false)
+        end
+        task.wait()
+    end
+    local _, r3, h3 = parts()
+    if not r3 or not h3 then return false end
+    h3:MoveTo(Vector3.new(fx, topY + 3, fz))
+    local t1 = os.clock()
+    while os.clock() - t1 < 1.2 do
+        if stale(myEpoch) or not P.running then return false end
+        local _, r4, h4 = parts()
+        if not r4 or not h4 then return false end
+        if h4.FloorMaterial ~= Enum.Material.Air and r4.Position.Y > topY + 1.5 then
+            return true                     -- standing on top
+        end
+        if r4.AssemblyLinearVelocity.Y < -4 and r4.Position.Y < over and boosts < cap then
+            kick(r4, h4, true)
+        end
+        task.wait()
+    end
+    local _, r5 = parts()
+    return r5 ~= nil and r5.Position.Y > topY + 1.5
+end
+
 -- The step just ahead is shut: mark it, and plan again round it.
 local function navLearnAhead()
     local m, path = navMap, navPath
@@ -1665,7 +1716,7 @@ end
 
 -- Every frame: steer along the route and jump before each edge.
 local function navTick()
-    if not navGoal then return end
+    if navClimbing or not navGoal then return end
     local now = os.clock()
     if now - navGoalAt > 0.5 or not P.running or not CFG.TerrainMap then
         navHalt()
@@ -1707,13 +1758,34 @@ local function navTick()
         local near = ax * ax + az * az < 2.5 * 2.5
         local beyond = ax * (b.x - a.x) + az * (b.z - a.z) > 0
         local up = me.Y > a.y + 2.2             -- standing on its level
-        if (near or beyond) and (not a.jump or up) then
+        if (near or beyond) and (not (a.jump or a.climb) or up) then
             navI += 1
         else
             break
         end
     end
     local nd = path[navI]
+
+    -- CLIMB: at the foot of a step too tall to jump but open on top, air-jump
+    -- straight up it. Its own task, so the frame is not held; the follower
+    -- waits for it and re-plans from wherever it ends up.
+    if nd.climb and navI > 1 then
+        local pv = path[navI - 1]
+        local ex, ez = (pv.x + nd.x) / 2, (pv.z + nd.z) / 2
+        local dx, dz = ex - me.X, ez - me.Z
+        if dx * dx + dz * dz <= (NAV_CELL + 0.5) ^ 2 then
+            navClimbing = true
+            stats.navClimbs += 1
+            say("air-jumping up the wall")
+            local top, fx, fz = nd.y, nd.x, nd.z
+            task.spawn(function()
+                pcall(climbUp, top, fx, fz)
+                navClimbing = false
+                navPath = nil
+            end)
+            return
+        end
+    end
 
     -- STEER: aim ahead along the route, further the faster you are, but
     -- never past a jump point (the run-up must line up with the jump).
@@ -1731,7 +1803,7 @@ local function navTick()
         local dx, dz = nd.x - me.X, nd.z - me.Z
         local dn = math.sqrt(dx * dx + dz * dz)
         local nx = path[navI + 1]
-        if dn < look and not nd.jump and not nx.jump then
+        if dn < look and not (nd.jump or nd.climb or nx.jump or nx.climb) then
             local sx, sz = nx.x - nd.x, nx.z - nd.z
             local sl = math.sqrt(sx * sx + sz * sz)
             if sl > 0.01 then
@@ -2072,14 +2144,9 @@ local function panicGuard(myEpoch)
     return stale(myEpoch) or not P.running or not moveEnabled
 end
 
--- CLIMB BURST: stand still, jump, stack every air jump STRAIGHT UP, then go
--- forward off the top.
--- The air jump goes where you are moving. The build before this held
--- forward the whole time, so every air jump was spent into the face of the
--- ledge and the character never got high. Movement is cancelled first, the
--- jumps stack vertically, and only then -- at the top -- the camera turns to
--- the target and it dashes and walks forward. Returns true on real forward
--- progress.
+-- CLIMB BURST: when stuck under an enemy that is up on something, air-jump
+-- straight up to its floor and step onto it (climbUp: physics, not keys).
+-- Returns true on real progress.
 local function climbBurst(targetRoot)
     navHalt()
     local _, r, h = parts()
@@ -2089,36 +2156,14 @@ local function climbBurst(targetRoot)
     flat = Vector3.new(flat.X, 0, flat.Z)
     if flat.Magnitude < 0.5 then return false end
     local dir = flat.Unit
-    local n   = math.max(1, math.floor(CFG.ClimbJumps or 6))
-    local myEpoch = epoch
-
-    h:MoveTo(r.Position)                         -- STOP. No forward input.
-    task.wait(0.12)
-    jump()
-    stats.hops += 1
-    lastJumpAt = os.clock()
-    task.wait(0.35)
-
-    for _ = 1, n do
-        if panicGuard(myEpoch) then return false end
-        local _, r2, h2 = parts()
-        if not r2 or not h2 then return false end
-        h2:MoveTo(r2.Position)                   -- still: the jump goes UP
-        airJump(r2, h2)
-        lastJumpAt = os.clock()
-        task.wait(0.3)
-    end
-
-    -- At the top: forward. Camera at the target, dash, and walk.
-    local _, r3, h3 = parts()
-    if not r3 or not h3 then return false end
+    -- Up to the enemy's floor (its root stands about three studs over it)
+    -- with air jumps that always fire, then forward onto it.
     local goal = targetRoot.Position
-    h3:MoveTo(Vector3.new(goal.X, r3.Position.Y, goal.Z))
-    dashDir(r3, dir)
-    task.wait(0.7)
+    local ok = climbUp(goal.Y - 3, goal.X, goal.Z)
+    stats.hops += 1
     local _, r4 = parts()
     if not r4 then return false end
-    return (r4.Position - start):Dot(dir) > 4
+    return ok or (r4.Position - start):Dot(dir) > 4
 end
 
 -- SIDEWAYS BURST: two dashes to one side, then forward again. Twenty studs
@@ -4589,9 +4634,12 @@ local function buildUI()
             end
             local route = "no route"
             if navPath and navGoal then
-                local j = 0
-                for _, nd in ipairs(navPath) do if nd.jump then j += 1 end end
-                route = string.format("route %d points, %d jumps%s", #navPath, j,
+                local j, c = 0, 0
+                for _, nd in ipairs(navPath) do
+                    if nd.jump then j += 1 end
+                    if nd.climb then c += 1 end
+                end
+                route = string.format("route %d points, %d jumps, %d climbs%s", #navPath, j, c,
                     navReached and "" or ", no way all the way in")
             end
             return line .. "\n" .. route .. string.format(".  Plans %d, jumps %d, learned %d.",
@@ -4601,7 +4649,8 @@ local function buildUI()
             .. "get there - floor heights, walls, trunks, logs at the knee - "
             .. "over about a second, and never scanned again. Every run to an "
             .. "enemy is then planned on that map: round what is too tall, "
-            .. "over what your own jump clears, a little off walls so your "
+            .. "over what your own jump clears, UP walls too tall to jump "
+            .. "(air jumps, up to 40 studs), a little off walls so your "
             .. "shoulders do not catch. It is steered every frame and the jump "
             .. "is pressed BEFORE the edge, as far ahead as your speed carries "
             .. "you while the jump rises. If you still get stuck where the map "
@@ -4654,16 +4703,14 @@ local function buildUI()
         sliderRow(v, "Air jumps per climb", 2, 12, 1,
             function() return CFG.ClimbJumps end,
             function(x) CFG.ClimbJumps = x end, "")
-        switchRow(v, "Force the air jump if Space is ignored",
-            "The engine jump, only when the key showed no kick",
-            function() return CFG.ForceAirJump end,
-            function(x) CFG.ForceAirJump = x end)
-        caption(v, "The air jump goes where you are moving, so the climb "
-            .. "cancels all movement first and stacks the jumps straight up; "
-            .. "only at the top does it turn to the enemy and dash forward. "
-            .. "Each air jump is checked: Space is pressed, and if the "
-            .. "character got no upward kick the engine is asked directly. "
-            .. "The stats page shows which of the two is doing the work.")
+        caption(v, "Air jumps are physics, not keys. Pressing Space in the "
+            .. "air and hoping the game's own air jump hears it is what left "
+            .. "you standing at the foot of shore walls. Now, each time the "
+            .. "rise tops out, the body gets one ordinary jump's worth of "
+            .. "upward speed, straight up with no drift into the wall, until "
+            .. "the feet are over the top - then it steps onto it. Used by the "
+            .. "ground map at walls it marks as climbable, and by the stuck "
+            .. "burst when the enemy is above you.")
 
         sliderRow(v, "Keep swinging from", 0, 60, 1,
             function() return CFG.SwingFrom end,
@@ -5088,13 +5135,13 @@ local function buildUI()
                 "switches    " .. stats.switches .. "   (turned to a nearer one mid-walk)",
                 "gathers     " .. stats.gathers .. "   (piles started)   tagged " .. stats.tagged,
                 "hops        " .. stats.hops .. "   (ground jumps)",
-                "air jumps   " .. stats.airJumps .. "   (Space worked in the air)",
-                "forced      " .. stats.forcedJumps .. "   (Space ignored; engine jumped)",
+                "air jumps   " .. stats.airJumps .. "   (physics kicks, climbing)",
                 "panics      " .. stats.panics .. "   (stuck bursts: climb or sideways)",
                 "panic dash  " .. stats.panicDashes .. "   (dashes spent inside bursts)",
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
                 "map         " .. stats.navMaps .. " read   plans " .. stats.navPlans
-                    .. "   jumps " .. stats.navJumps .. "   learned " .. stats.navLearned,
+                    .. "   jumps " .. stats.navJumps .. "   climbs " .. stats.navClimbs
+                    .. "   learned " .. stats.navLearned,
                 "ghosts      " .. stats.ghosts .. "   (blocked; walked through)   lifts " .. stats.lifts
                     .. "   fell " .. stats.ghostFalls,
                 "gui scans   " .. tostring(P.questScans or 0)
