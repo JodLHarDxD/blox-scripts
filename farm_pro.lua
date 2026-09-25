@@ -17,6 +17,9 @@
                  does not own. It was also why enemies arrived outside their
                  own area and stopped taking damage.
       HOVER      gravity cancelled every frame, collisions switched off.
+      WALK SPEED the hold that wrote Humanoid.WalkSpeed every frame. Your
+                 race, fruit and gear already make you fast; the farm now
+                 never writes the property at all.
       WIDE HITBOX the old hook set the combat controller's hitbox to 150 studs.
                  That is the artificial range this build refuses to have: what
                  lands is what your weapon actually reaches, and DISTANCE below
@@ -26,7 +29,8 @@
                  There is one target now. It is the one you picked.
 
     WHAT IS YOURS TO SET
-      SPEED      swing rate, attack cooldown and walk speed are all sliders.
+      SPEED      swing rate and attack cooldown are sliders; walk speed is
+                 the game's own and is never touched.
                  Nothing sets them behind your back and nothing is capped.
       WEAPON     the farm never changes your weapon unless you pick one. Pick
                  one and it stays picked, whatever the game tries to equip.
@@ -103,9 +107,6 @@ local CFG = {
     -- never touched by this.
     FastAttack         = false,
     AttackSpeed        = 0.35,
-    -- Walk speed. Off, the game's value stands.
-    SetWalkSpeed       = false,
-    WalkSpeed          = 16,
     -- DASH. Blox Fruits binds it to Q, and a player leans on it constantly:
     -- into a target, out of a hit, and above all BETWEEN targets. Walking the
     -- gap is most of why the farm was slower than you are.
@@ -723,41 +724,6 @@ local function playerLevel()
     local d = player:FindFirstChild("Data")
     local l2 = d and d:FindFirstChild("Level")
     return l2 and tonumber(l2.Value) or nil
-end
-
--- YOUR walk speed, if you asked for one. Off means the game's value stands --
--- it is not read, not saved and not restored, because nothing was changed.
--- WHY SETTING THIS ONCE DID NOTHING.
--- Blox Fruits writes WalkSpeed itself, constantly: on spawn, on damage, when
--- a state changes, and whenever its own movement code decides to. A single
--- write survives about one frame and is then overwritten.
---
--- Worse, the one write was happening in the OUTER loop, and the fight loop
--- stays inside itself for up to SweepSeconds. So across an entire ten second
--- sweep -- the fights and every gap walked between enemies -- this was never
--- called once. Setting 107 and feeling no difference is exactly what that
--- produces.
---
--- It is held on Heartbeat now, so the game can take it back as often as it
--- likes and it goes straight back on the next frame.
-P.speedResets = 0       -- how many times the game has taken it back
-local function keepSpeed()
-    if not CFG.SetWalkSpeed then return end
-    local _, _, hum = parts()
-    if hum and math.abs(hum.WalkSpeed - CFG.WalkSpeed) > 0.05 then
-        P.speedResets += 1
-        pcall(function() hum.WalkSpeed = CFG.WalkSpeed end)
-    end
-end
-
-local speedConn = nil
-local function startSpeedHold()
-    if speedConn then return end
-    speedConn = track(RunService.Heartbeat:Connect(keepSpeed))
-end
-local function stopSpeedHold()
-    if speedConn then pcall(function() speedConn:Disconnect() end) end
-    speedConn = nil
 end
 
 -- =========================================================
@@ -1705,8 +1671,6 @@ local function walkTo(goal, opts)
         local _, r, h = parts()
         if not r or not h then return false end
         if (r.Position - goal).Magnitude <= arrive then return true end
-        keepSpeed()
-
         local ok = pcall(function() path:ComputeAsync(r.Position, goal) end)
         local points = (ok and path.Status == Enum.PathStatus.Success)
             and path:GetWaypoints() or nil
@@ -2707,7 +2671,6 @@ local function step()
     end
 
     keepWeapon()
-    keepSpeed()
     pcall(keepHaki)
 
     -- ---------- THE QUEST LOOP ----------
@@ -3733,7 +3696,6 @@ local function buildUI()
         navRow(v, "Speed", function()
             local bits = { string.format("%.2f-%.2fs", CFG.SwingMin, CFG.SwingMax) }
             if CFG.FastAttack then table.insert(bits, "fast") end
-            if CFG.SetWalkSpeed then table.insert(bits, "ws " .. math.floor(CFG.WalkSpeed)) end
             return table.concat(bits, "  ·  ")
         end, "speed")
         hairline(v)
@@ -4205,39 +4167,11 @@ local function buildUI()
 
         gap(v, 4)
         heading2(v, "how fast it walks")
-        switchRow(v, "Set my walk speed",
-            "Fights the game for the property, 60 times a second",
-            function() return CFG.SetWalkSpeed end,
-            function(x)
-                CFG.SetWalkSpeed = x
-                say(x and ("walk speed " .. math.floor(CFG.WalkSpeed)) or "walk speed free")
-            end)
-        sliderRow(v, "Walk speed", 8, 120, 1,
-            function() return CFG.WalkSpeed end,
-            function(x) CFG.WalkSpeed = x end)
-        caption(v, "Read this before switching it on. WalkSpeed is a Humanoid "
-            .. "property and it REPLICATES, and the game writes it back every "
-            .. "frame - so holding it is a property contested at 60Hz by a "
-            .. "client that should not be touching it. That is the same class "
-            .. "of thing as the flight and the magnet this build deleted, and "
-            .. "it is cheap to log. The server can also simply refuse the "
-            .. "movement, which buys the noise and none of the speed.  "
-            .. "The game already gave you a way to close a gap: the dash. That "
-            .. "one is server-granted and looks like a person, because it is "
-            .. "what a person does. Use that instead. This is left here "
-            .. "because it is your call, not because it is a good idea.")
         readout(v, function()
             local _, _, hum = parts()
-            local now = hum and string.format("%.0f", hum.WalkSpeed) or "?"
-            if not CFG.SetWalkSpeed then
-                return "Free. Currently " .. now .. ", and nothing is changing it."
-            end
-            return string.format("Holding %d. The humanoid reads %s right now, "
-                .. "and the game has taken it back %d times (it is put straight "
-                .. "back each frame). If that number climbs and the reading "
-                .. "still matches, it is working; if the reading will not "
-                .. "change at all, the server is refusing it.",
-                math.floor(CFG.WalkSpeed), now, P.speedResets or 0)
+            return "The game's own: " .. (hum and string.format("%.0f", hum.WalkSpeed) or "?")
+                .. " right now. Race, fruit and gear set it; the farm never "
+                .. "writes it."
         end)
     end
 
@@ -4440,10 +4374,7 @@ local function buildUI()
                 "distance    " .. math.floor(CFG.StandOff) .. " studs"
                     .. "   swinging from " .. math.floor(CFG.SwingFrom or 0),
                 "walkspeed   " .. (hum and string.format("%.0f", hum.WalkSpeed) or "?")
-                    .. (CFG.SetWalkSpeed
-                        and ("  held at " .. math.floor(CFG.WalkSpeed)
-                             .. ", " .. (P.speedResets or 0) .. " resets")
-                        or "  free"),
+                    .. "  (the game's own - never written)",
                 "fast attack " .. (CFG.FastAttack
                     and (P.fastOK and "on" or ("on, " .. tostring(P.fastNote))) or "off"),
                 "",
@@ -4526,7 +4457,6 @@ function P.start(name)
     setState("RESOLVE")
 
     keepWeapon()
-    startSpeedHold()
     -- If Enhancement is off at start, this is a fresh life and both go back
     -- on -- see keepHaki. Otherwise the life is treated as settled, and
     -- Observation gets its timed look straight away: the dodge counter is
@@ -4576,7 +4506,6 @@ function P.start(name)
             end
         end
         keepWeapon()
-        keepSpeed()
         pcall(installFastAttack)
         progress()
         -- Haki comes back through keepHaki on the next step: it sees the new
@@ -4594,7 +4523,6 @@ function P.stop()
     moveEnabled = false
     task.delay(0.3, function() moveEnabled = true end)
     pcall(releaseCamera)
-    pcall(stopSpeedHold)
     pcall(cancelWalk)
     if fastConn then pcall(function() fastConn:Disconnect() end) fastConn = nil end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
