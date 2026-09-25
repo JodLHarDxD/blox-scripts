@@ -140,6 +140,13 @@ local CFG = {
     --   fruit M1 whose hitbox starts out from the body : 12-18
     StandOff           = 8,
     StandSlack         = 2,      -- drift allowed before it corrects
+    -- HOLD GROUND. A Kitsune M1 drags you forward on every click, so a long
+    -- fight walks you across the map -- into the sea, where it hurts. On:
+    -- the spot where the swinging starts is held, every lunge (and every
+    -- knockback) is put back the same frame, and an enemy thrown away is
+    -- given HoldWait seconds to walk back into your M1 before it is chased.
+    HoldGround         = true,
+    HoldWait           = 2,
     -- KEEP THE M1 GOING WHILE IT COMES BACK.
     -- A swing or a skill throws the enemy away and it walks straight back at
     -- you. Its attack reach and your swing reach are about the same, so if
@@ -636,7 +643,7 @@ local stats = {
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
     switches = 0, hops = 0, airJumps = 0, forcedJumps = 0,
     panics = 0, panicDashes = 0, detours = 0, hakiPresses = 0,
-    gathers = 0, tagged = 0, ghosts = 0, lifts = 0, ghostFalls = 0,
+    gathers = 0, tagged = 0, ghosts = 0, lifts = 0, ghostFalls = 0, holds = 0,
 }
 
 local state          = "IDLE"
@@ -1806,6 +1813,50 @@ local function station(targetRoot, climb)
 end
 
 -- =========================================================
+-- HOLD GROUND
+-- =========================================================
+-- Some M1s move YOU: Kitsune's drags the body forward on every click. Each one
+-- is small, but a fight is hundreds of clicks and they all point the same way
+-- -- after the enemy, which the same click has just thrown further off. So the
+-- character creeps across the ground and, near a shore, into the water.
+--
+-- The fix does not care HOW the game moves you (a velocity, a tween, a CFrame
+-- write): every frame, if the body is off the held spot by more than a
+-- fraction of a stud, it is put back there, and its sideways speed is zeroed.
+-- Only X and Z are held. Height is left to physics, so a jump or a fall still
+-- happens. The spot is set by the first swing on a target and dropped when
+-- the target changes, the enemy has been out of reach for HoldWait seconds
+-- (then it is chased as usual), or it comes too close and has to be backed
+-- off from.
+local holdAt       = nil     -- Vector3 being held, or nil
+local lastInReachAt = 0
+
+local function holdPin()
+    if not holdAt or not CFG.HoldGround or not P.running then return end
+    local _, r = parts()
+    if not r then holdAt = nil return end
+    local p = r.Position
+    if Vector3.new(p.X - holdAt.X, 0, p.Z - holdAt.Z).Magnitude < 0.3 then return end
+    local turn = r.CFrame - p                     -- keep the facing
+    r.CFrame = CFrame.new(holdAt.X, p.Y, holdAt.Z) * turn
+    local v = r.AssemblyLinearVelocity
+    r.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+    stats.holds += 1
+end
+
+-- While held: do not walk, just face it. Returns the flat distance, the same
+-- number station() would have.
+local function holdFace(targetRoot)
+    local _, r, h = parts()
+    if not r or not h or not targetRoot then return math.huge end
+    local flat = targetRoot.Position - r.Position
+    local d = Vector3.new(flat.X, 0, flat.Z).Magnitude
+    if h.MoveDirection.Magnitude > 0.1 then h:MoveTo(r.Position) end
+    faceTarget(r, targetRoot.Position, CFG.FaceLock)
+    return d
+end
+
+-- =========================================================
 -- TARGETING
 -- =========================================================
 -- Three gsubs per enemy, and the enemy list is re-read after every kill. The
@@ -2847,6 +2898,7 @@ local function step()
             stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
             windowAt, windowPos, creeping = nil, nil, false
             targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
+            holdAt = nil
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2869,7 +2921,24 @@ local function step()
         local dy    = math.abs(target.root.Position.Y - r.Position.Y)
         local climb = dy > 6
         setChase(target.root.Position)     -- tells the ghost how high "there" is
-        local d = station(target.root, climb)
+
+        -- HOLD GROUND: keep the spot while it is being hit or is walking
+        -- back from a throw; let go to back off from one too close, or to
+        -- chase one that has not come back within HoldWait.
+        if holdAt then
+            local tf = target.root.Position - r.Position
+            local td = Vector3.new(tf.X, 0, tf.Z).Magnitude
+            if not CFG.HoldGround or climb or td < want - slack
+                or os.clock() - lastInReachAt > (CFG.HoldWait or 2) then
+                holdAt = nil
+            end
+        end
+        local d
+        if holdAt then
+            d = holdFace(target.root)
+        else
+            d = station(target.root, climb)
+        end
         aimCameraAt(r, target.root.Position)
 
         -- reach is where a swing connects. swingFrom is further out: while
@@ -2882,6 +2951,13 @@ local function step()
         local closing   = (not inReach) and d <= swingFrom
 
         if inReach then
+            if CFG.HoldGround then
+                lastInReachAt = os.clock()
+                if not holdAt then
+                    local _, rh = parts()
+                    holdAt = rh and rh.Position or nil
+                end
+            end
             swing()
             -- Breaks the moment it dies, or the moment it is thrown past the
             -- swing window, so the chase starts on the same frame it happens.
@@ -2909,6 +2985,7 @@ local function step()
                         stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
                         windowAt, windowPos, creeping = nil, nil, false
                         targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
+                        holdAt = nil
                         stats.switches += 1
                         say(string.format("%s is nearer  %.0f studs", target.name, nd))
                         task.wait()
@@ -3035,6 +3112,7 @@ local function step()
             -- anywhere. The panic bursts dash on their own terms.
             -- A swing started on top of the dash cuts the dash short.
             local noDash = climb or (stuckSince ~= nil) or (now - lastJumpAt < 1.2)
+                or (holdAt ~= nil)
             local dashed = (not noDash)
                 and tryDash(d, target.root.Position - r.Position) or false
 
@@ -3064,6 +3142,7 @@ local function step()
         end
         lastHP = hum.Health
     end
+    holdAt = nil
     -- The sweep ended with this one still alive (count filled, or the clock
     -- ran out). Leave it flagged: if it is still in reach when the next pass
     -- starts it is picked straight back up rather than swapped for one a
@@ -4034,6 +4113,25 @@ local function buildUI()
             .. "over the enemy. It closes in AND backs off to hold the number, "
             .. "so the enemy stays in front of you either way.")
 
+        switchRow(v, "Hold my spot while hitting",
+            "Every M1 lunge and knockback is put back the same frame",
+            function() return CFG.HoldGround end,
+            function(x) CFG.HoldGround = x end)
+        sliderRow(v, "Let a thrown one walk back for", 0, 6, 0.5,
+            function() return CFG.HoldWait end,
+            function(x) CFG.HoldWait = x end, " s")
+        readout(v, function()
+            return (holdAt and "Holding a spot now." or "Not holding.")
+                .. "  Lunges put back: " .. stats.holds .. "."
+        end)
+        caption(v, "A Kitsune M1 drags you forward on every click, after the "
+            .. "enemy the same click just threw - so a long fight walks you "
+            .. "into the sea. On: the spot where the swinging starts is held "
+            .. "sideways (jumps and falls still happen), and an enemy thrown "
+            .. "away gets this many seconds to walk back into your M1 before "
+            .. "it is chased. One that comes too close is still backed off "
+            .. "from. A new target starts a new spot.")
+
         switchRow(v, "Lock the body on the target",
             "A melee swing goes where the body points",
             function() return CFG.FaceLock end,
@@ -4426,6 +4524,7 @@ local function buildUI()
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
                 "ghosts      " .. stats.ghosts .. "   (blocked; walked through)   lifts " .. stats.lifts
                     .. "   fell " .. stats.ghostFalls,
+                "holds       " .. stats.holds .. "   (lunges/knockbacks put back on the spot)",
                 "gui scans   " .. tostring(P.questScans or 0)
                     .. "   (full PlayerGui walks - should stay tiny)",
                 "retreats    " .. stats.retreats,
@@ -4508,6 +4607,9 @@ function P.start(name)
     -- The ghost watcher: every frame, whatever is walking the character.
     blockAt = nil
     track(RunService.Heartbeat:Connect(function() pcall(ghostWatch) end))
+    -- Hold ground: puts the body back on its spot after every lunge.
+    holdAt = nil
+    track(RunService.Heartbeat:Connect(function() pcall(holdPin) end))
 
     track(player.Idled:Connect(function()
         pcall(function()
@@ -4558,6 +4660,7 @@ function P.stop()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
     pcall(ghostRelease)
+    holdAt = nil
     setState("IDLE")
     say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d quests=%d",
