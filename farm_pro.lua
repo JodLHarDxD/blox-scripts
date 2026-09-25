@@ -145,10 +145,9 @@ local CFG = {
     -- you. Its attack reach and your swing reach are about the same, so if
     -- the M1 only starts once it is inside reach, it is a race at the
     -- boundary -- and when the NPC wins it, its hit stuns you and it chains.
-    -- From this many studs out the M1 is kept running while it comes AT you,
-    -- so it walks into hits already in the air and is stunned before it can
-    -- swing. Not while you run at one that is standing or leaving: swinging
-    -- slows your run. At or below the swing reach this does nothing extra.
+    -- From this many studs out the M1 is kept running while you close, so it
+    -- walks into hits already in the air and is stunned before it can swing.
+    -- At or below the swing reach this does nothing extra.
     SwingFrom          = 30,
     -- FACING. A melee M1 -- a sword, or a fighting style like Sanguine Art --
     -- swings where the BODY points, so the body is pinned at the target and
@@ -3029,17 +3028,9 @@ local function step()
             local dashed = (not noDash)
                 and tryDash(d, target.root.Position - r.Position) or false
 
-            -- ---- CLOSING: keep the M1 running -- at one COMING AT YOU. ----
+            -- ---- CLOSING: keep the M1 running. ----
             -- M1 only. Skills stay on their in-reach cadence; burning one at
             -- an enemy twenty studs out is what "wasting the special" is.
-            -- This exists for the thrown enemy walking back into you. Swinging
-            -- slows your own run, so against one that is standing still or
-            -- moving away it only made every approach slower than your legs:
-            -- then it runs at your full speed and swings once in reach.
-            local ev = target.root.AssemblyLinearVelocity
-            local incoming = dirT ~= nil
-                and Vector3.new(ev.X, 0, ev.Z):Dot(-dirT) > 4
-            closing = closing and incoming
             if closing and CFG.M1 and not dashed then
                 stats.swings += 1
                 pressM1()
@@ -4002,11 +3993,9 @@ local function buildUI()
             .. "its reach is about the same as yours. If the M1 only starts "
             .. "once it is in reach, it is a race at the boundary, and when "
             .. "the NPC wins it you are stunned and it chains. From this far "
-            .. "out the M1 is kept going while it comes at you, so it walks "
-            .. "into hits already in the air. Only while it is coming AT you: "
-            .. "swinging slows your own run, so an enemy standing still or "
-            .. "moving away gets your full speed and a swing once in reach. "
-            .. "Set it at or below the distance above to swing only in reach.")
+            .. "out the M1 is kept going while you close, so it walks into "
+            .. "hits already in the air. Set it at or below the distance above "
+            .. "to swing only in reach.")
         switchRow(v, "Gather a pile before fighting",
             "Tag a few with one M1 each; they walk to you together",
             function() return CFG.Gather end,
