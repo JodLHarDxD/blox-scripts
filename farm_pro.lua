@@ -1700,15 +1700,32 @@ local function walkTo(goal, opts)
 
                 -- MoveToFinished waits its full eight seconds on a waypoint
                 -- that cannot be reached, so it is raced against a short clock.
+                --
+                -- NEVER ARRIVE, NEVER STOP. A Humanoid halts the instant it
+                -- reaches its MoveTo point. With waypoints eight studs apart
+                -- and a look every tenth of a second, a fast character (Mink,
+                -- Kitsune, a speed helmet) got to each one well inside that
+                -- tenth and stood there until the next look: run, stop, run,
+                -- stop, the whole way to the camp or the giver. Now it looks
+                -- every frame and hands over the next waypoint while this one
+                -- is still a tenth of a second of travel away, so the body is
+                -- never told it has arrived. The speed is the game's; this
+                -- only stops throwing it away.
                 local reached, stamp = false, r3.Position
                 local wpDeadline = os.clock() + 3
+                local lastWp = (i == #points)
                 while os.clock() < wpDeadline do
                     if stale(myEpoch) then return false end
-                    local _, r4 = parts()
-                    if not r4 then return false end
-                    if (r4.Position - wp.Position).Magnitude < 5 then reached = true break end
+                    local _, r4, h4 = parts()
+                    if not r4 or not h4 then return false end
                     if (r4.Position - goal).Magnitude <= arrive then return true end
-                    task.wait(0.1)
+                    local off  = wp.Position - r4.Position
+                    local lead = lastWp and 4 or math.clamp(h4.WalkSpeed * 0.1, 4, 8)
+                    if Vector3.new(off.X, 0, off.Z).Magnitude < lead and math.abs(off.Y) < 6 then
+                        reached = true
+                        break
+                    end
+                    task.wait()
                 end
 
                 if not reached then
