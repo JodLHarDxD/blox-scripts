@@ -32,6 +32,10 @@
                  one and it stays picked, whatever the game tries to equip.
       DISTANCE   how far in front of you the enemy is held. A sword wants it
                  close; a fruit M1 wants a gap.
+      GHOST      collisions DO go off again, but only when the character has
+                 been blocked for a moment, and only until it is through.
+                 On by default because you asked for it; one switch turns it
+                 off (Attack -> Walk through it when stuck).
 
     EVERY MODE ON THE PANEL IS A SWITCH THAT READS On OR Off.
 
@@ -70,11 +74,12 @@ local CFG = {
 
     -- ---------- AFTER A DEATH ----------
     -- A death drops the tool and turns both haki off. Enhancement (J) is
-    -- re-asserted whenever the character is missing it; Observation (E) is
-    -- pressed once per life after a death. See keepHaki for why E is never
-    -- pressed blind.
+    -- re-asserted whenever the character is missing it. Observation (E) is
+    -- checked after every death AND every KenEvery seconds, and E is pressed
+    -- only when the dodge counter is gone. See keepHaki.
     AutoBuso           = true,
     AutoKen            = true,
+    KenEvery           = 300,    -- seconds between Observation checks (5 min)
 
     -- ---------- ATTACK ----------
     -- Independent switches, not a mode. M1 alone is enough for most weapons.
@@ -227,6 +232,15 @@ local CFG = {
     -- If the Space key is ignored in the air (no upward kick within a tenth
     -- of a second), ask the engine for the jump directly. Off: Space only.
     ForceAirJump       = true,
+    -- GHOST: WHEN ROUND HAS FAILED, THROUGH.
+    -- Asked to move and gaining no ground for GhostAfter seconds, whatever
+    -- is walking the character (fight, walk to the camp, walk to the giver,
+    -- gather), and its collisions go off until it is out the other side of
+    -- the trunk or wall. If where it is going is higher, it is also lifted.
+    -- In a fight with Panic on, one legal burst is tried first.
+    Ghost              = true,
+    GhostAfter         = 1.5,    -- seconds blocked before going through
+    GhostLiftMax       = 30,     -- highest lift, in studs
     Debug              = false,
 }
 
@@ -621,7 +635,7 @@ local stats = {
     escalations = 0, retreats = 0, walks = 0, dashes = 0, startedAt = 0,
     switches = 0, hops = 0, airJumps = 0, forcedJumps = 0,
     panics = 0, panicDashes = 0, detours = 0, hakiPresses = 0,
-    gathers = 0, tagged = 0,
+    gathers = 0, tagged = 0, ghosts = 0, lifts = 0, ghostFalls = 0,
 }
 
 local state          = "IDLE"
@@ -993,6 +1007,212 @@ local function airJump(r, h)
     return ok
 end
 
+-- =========================================================
+-- GHOST: THROUGH, WHEN ROUND HAS FAILED
+-- =========================================================
+-- Five builds tried to get round a trunk the legal way -- hops, stacked air
+-- jumps, sideways dashes, pathfinding -- and every one of them lived inside
+-- the fight. The walk to the camp, the walk to the quest giver and the gather
+-- pass had nothing but Humanoid.Jump, so a trunk on any of those walks was
+-- "pushes forward and stays there", with none of the recovery ever running.
+--
+-- So this watches the CHARACTER, not any one routine. Whoever is walking it:
+-- if it is being asked to move (MoveDirection) and has gained under three
+-- studs that way for GhostAfter seconds, it is blocked, and blocked turns its
+-- collisions off. It walks straight through the trunk or the wall. The
+-- Humanoid stands on the floor by a ray, not by collision, so the ground still
+-- holds it. If where it is going is higher -- a ledge, higher ground -- it is
+-- also lifted: one upward kick, sized by gravity to clear the height, while it
+-- keeps going forward.
+--
+-- Collisions come back only once the body is clear of every solid part.
+-- Turning them on while inside a trunk would have the engine throw the
+-- character out of it, which is worse than the trunk.
+--
+-- The cost, said plainly: the server sees your position pass through a solid.
+-- It only happens after being blocked, and only until you are through.
+local ghosting    = false
+local ghostSince  = 0
+local ghostWhy    = ""
+local ghostGen    = 0
+local ghostOrig   = {}      -- part -> CanCollide before the ghost, to restore
+local ghostConn   = nil
+local ghostLifts  = 0
+local lastLiftAt  = 0
+local lastClearAt = 0
+local ghostFrom   = nil     -- where the character stood when it went ghost
+local ghostQuietUntil = 0   -- after a fall-through, leave it to the legal ladder
+local blockAt, blockPos = nil, nil
+-- Where the walk is really going. The fight flattens its MoveTo to your own
+-- height, so Humanoid.WalkToPoint alone would never say "up"; whoever is
+-- chasing something writes it here, and it goes stale in half a second.
+local chaseGoal, chaseGoalAt = nil, 0
+local function setChase(pos) chaseGoal, chaseGoalAt = pos, os.clock() end
+
+local function charParts(char)
+    local out = {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then table.insert(out, d) end
+    end
+    return out
+end
+
+local function ghostOff()
+    if ghostConn then pcall(function() ghostConn:Disconnect() end) ghostConn = nil end
+    if not ghosting then return end
+    ghosting = false
+    for part, was in pairs(ghostOrig) do
+        if part.Parent then pcall(function() part.CanCollide = was end) end
+    end
+    table.clear(ghostOrig)
+end
+P.ghostOff = ghostOff
+P.ghosting = function() return ghosting, ghostWhy end
+
+-- Is the body inside anything solid? The root, the torso and the head are
+-- asked against real geometry (not bounding boxes, which for a tree mesh
+-- take in the whole canopy). Legs are left out: they touch the floor.
+-- Every player and every enemy is excluded; only the world counts.
+local function bodyClear(char)
+    local excl = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(excl, pl.Character) end
+    end
+    local enemies = workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(excl, enemies) end
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Exclude
+    op.FilterDescendantsInstances = excl
+    op.RespectCanCollide = true
+    for _, n in ipairs({ "HumanoidRootPart", "UpperTorso", "Torso", "Head" }) do
+        local p = char:FindFirstChild(n)
+        if p and p:IsA("BasePart") then
+            local ok, hits = pcall(function() return workspace:GetPartsInPart(p, op) end)
+            if ok and hits and #hits > 0 then return false end
+        end
+    end
+    return true
+end
+
+local function ghostOn(why)
+    if not CFG.Ghost then return end
+    local char = player.Character
+    if not char then return end
+    ghostGen += 1
+    ghostSince, ghostWhy, ghostLifts = os.clock(), why or "blocked", 0
+    say("ghost - " .. ghostWhy)
+    if ghosting then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    ghostFrom = root and root.Position or nil
+    ghosting = true
+    stats.ghosts += 1
+    local list, listAt = charParts(char), os.clock()
+    -- Stepped runs before physics, every frame. The Humanoid puts collision
+    -- back on some of its own parts each step, so one write is not enough.
+    ghostConn = RunService.Stepped:Connect(function()
+        if player.Character ~= char then ghostOff() return end
+        if os.clock() - listAt > 0.5 then list, listAt = charParts(char), os.clock() end
+        for _, p in ipairs(list) do
+            if ghostOrig[p] == nil then ghostOrig[p] = p.CanCollide end
+            p.CanCollide = false
+        end
+    end)
+end
+
+-- Runs every Heartbeat while the farm runs.
+local function ghostWatch()
+    local char, r, h = parts()
+    if not char or not r or not h then blockAt = nil return end
+    local now = os.clock()
+
+    if ghosting then
+        local g = (chaseGoal and now - chaseGoalAt < 0.5) and chaseGoal
+            or (h.WalkToPoint + Vector3.new(0, 3, 0))       -- a path point is at the feet
+
+        -- FELL THROUGH. The Humanoid finds the floor with a ray from the
+        -- root, and a ray that starts inside something thick (a cliff, a
+        -- hill) may find no floor at all. Well below where the ghost began
+        -- AND below where it is going is not a walk down, it is a fall.
+        -- Back to where it started, solid again, and the ghost stays quiet
+        -- for ten seconds so the bursts and the pathing get their turn.
+        if ghostFrom and r.Position.Y < ghostFrom.Y - 10 and r.Position.Y < g.Y - 4 then
+            local back = ghostFrom + Vector3.new(0, 2, 0)
+            ghostOff()
+            pcall(function()
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.CFrame = CFrame.new(back) * (r.CFrame - r.CFrame.Position)
+            end)
+            ghostQuietUntil, blockAt = now + 10, nil
+            stats.ghostFalls += 1
+            say("ghost fell through - back, trying the long way")
+            return
+        end
+
+        -- LIFT: where it is going is above it.
+        if CFG.Ghost and P.running and h.MoveDirection.Magnitude > 0.1
+            and ghostLifts < 3 and now - lastLiftAt > 1.2 then
+            local rise = g.Y - r.Position.Y
+            if rise > 4 then
+                lastLiftAt = now
+                ghostLifts += 1
+                stats.lifts += 1
+                local height = math.clamp(rise + 5, 6, CFG.GhostLiftMax or 30)
+                local vy = math.sqrt(2 * workspace.Gravity * height)
+                pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                local v = r.AssemblyLinearVelocity
+                r.AssemblyLinearVelocity = Vector3.new(v.X, vy, v.Z)
+                ghostSince = now              -- the ghost lasts the flight
+                say(string.format("ghost - lifting %.0f studs", height))
+            end
+        end
+        -- OFF: only once through, and never inside something.
+        if now - ghostSince > 1.5 and now - lastClearAt > 0.2 then
+            lastClearAt = now
+            if bodyClear(char) then
+                ghostOff()
+                blockAt = nil
+                say("through")
+            end
+        end
+        return
+    end
+
+    if not P.running or not CFG.Ghost or not moveEnabled or now < ghostQuietUntil then
+        blockAt = nil
+        return
+    end
+    local md = h.MoveDirection
+    local dir = Vector3.new(md.X, 0, md.Z)
+    -- Not being asked to move, stunned, or held by the game: not blocked.
+    if dir.Magnitude < 0.1 or h.WalkSpeed < 2 or r.Anchored then blockAt = nil return end
+    dir = dir.Unit
+    if not blockAt then blockAt, blockPos = now, r.Position return end
+    local moved = r.Position - blockPos
+    if Vector3.new(moved.X, 0, moved.Z):Dot(dir) >= 3 then
+        blockAt, blockPos = now, r.Position       -- gaining ground; start over
+    elseif now - blockAt >= (CFG.GhostAfter or 1.5) then
+        blockAt = nil
+        ghostOn("blocked, going through")
+    end
+end
+
+-- On stop the watcher goes, but a body left inside a trunk must not get its
+-- collisions back there. Wait until it is clear (or five seconds), then off --
+-- unless a new run has taken the ghost over in the meantime.
+local function ghostRelease()
+    if not ghosting then ghostOff() return end
+    local gen = ghostGen
+    task.spawn(function()
+        local t0 = os.clock()
+        while ghosting and os.clock() - t0 < 5 do
+            local c = player.Character
+            if not c or bodyClear(c) then break end
+            task.wait(0.2)
+        end
+        if ghostGen == gen then ghostOff() end
+    end)
+end
+
 -- (the climb and the sideways burst live after tryDash: they dash.)
 
 -- =========================================================
@@ -1006,24 +1226,47 @@ end
 -- while it is on. So it is re-asserted whenever it is missing, capped at
 -- three presses per life so a wrong marker name can never become a toggle
 -- war.
--- Observation cannot be read back from here, and E is a toggle, so pressing
--- it blind would turn it OFF if it was on. It is pressed exactly once per
--- life, and only after the character has proved it is taking input (the
--- Enhancement press landed). At farm start, if Enhancement is already on,
--- your setup is trusted and E is not touched.
+-- OBSERVATION CAN BE READ AFTER ALL. While it is on, the game shows its dodge
+-- counter, and that counter is an ImageLabel directly under
+-- PlayerGui.ScreenGui -- the same check the public hubs use for their own
+-- auto-Ken. Present = on, gone = off. E is a toggle, so it is pressed ONLY
+-- when the counter is gone: a press can never turn an on Observation off.
+-- It is looked at after every death and every KenEvery seconds (5 minutes).
+--
+-- The marker is trusted once it has been seen. Until then, a press that does
+-- not make it appear is a miss; two misses in a row (two presses, so E is
+-- left where it started) and the timed check stops pressing and says so on
+-- the panel. A new life still gets its one press either way: a death always
+-- turns Observation off, so that press is safe with or without a marker.
 P.busoOK   = false
 P.kenDone  = false
-local kenChar     = nil    -- the life E has been pressed for
+local kenChar     = nil    -- the life E has been checked for
 local seenChar    = nil
 local seenCharAt  = 0
 local busoTries   = 0
 local lastBusoAt  = 0
+local kenNextAt   = 0      -- next timed look
+local kenVerifyAt = nil    -- a press is waiting to be checked at this time
+local kenSeen     = false  -- the marker has been seen: it is real
+local kenMisses   = 0
+local kenBlind    = false  -- marker never seen and two presses missed
+P.kenNote = "not checked yet"
 
 local function hasBuso()
     local char = player.Character
     return char ~= nil and char:FindFirstChild("HasBuso") ~= nil
 end
 P.hasBuso = hasBuso
+
+-- true = on, false = off, nil = cannot tell (no ScreenGui to look in).
+local function kenOn()
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    local sg = pg and pg:FindFirstChild("ScreenGui")
+    if not sg then return nil end
+    return sg:FindFirstChild("ImageLabel") ~= nil
+end
+P.kenOn = kenOn
+P.kenNextIn = function() return math.max(0, kenNextAt - os.clock()) end
 
 local function keepHaki()
     local char, root, hum = parts()
@@ -1049,21 +1292,67 @@ local function keepHaki()
         end
     end
 
-    if CFG.AutoKen and kenChar ~= char then
+    if not CFG.AutoKen then return end
+    local now = os.clock()
+    local on  = kenOn()
+    if on then kenSeen, kenBlind, kenMisses = true, false, 0 end
+
+    -- The last press: did the counter come up?
+    if kenVerifyAt and now >= kenVerifyAt then
+        kenVerifyAt = nil
+        if on then
+            P.kenNote = "ON - E worked, dodge counter showing"
+        elseif on == false then
+            -- Out of dodges puts Observation on a cooldown and E does nothing
+            -- until it ends; or the marker is wrong. Look again soon.
+            kenMisses += 1
+            kenNextAt = now + 20
+            if not kenSeen and kenMisses >= 2 then
+                kenBlind = true
+                P.kenNote = "E pressed twice, dodge counter never appeared - "
+                    .. "timed check paused (a death still gets its one press)"
+            else
+                P.kenNote = "E pressed, counter not up yet - trying again in 20s"
+            end
+        end
+    end
+    if kenVerifyAt then return end
+
+    local newLife = (kenChar ~= char)
+    if not newLife and now < kenNextAt then return end
+
+    -- A new life waits until the character has proved it takes input (the
+    -- Enhancement press landed). A timed look on a settled life does not.
+    if newLife then
         local ready
         if CFG.AutoBuso then
             ready = hasBuso()
         else
-            ready = (os.clock() - seenCharAt) > 3
+            ready = (now - seenCharAt) > 3
         end
-        if ready then
-            kenChar = char
-            P.kenDone = true
-            stats.hakiPresses += 1
-            pressKey(Enum.KeyCode.E)
-            say("observation - pressing E")
-        end
+        if not ready then return end
     end
+    kenChar   = char
+    kenNextAt = now + math.max(30, CFG.KenEvery or 300)
+    P.kenDone = true
+
+    if on then
+        P.kenNote = "ON - checked, left alone"
+        return
+    end
+    if on == false and kenBlind and not newLife then
+        P.kenNote = "counter not showing, but the marker is unproven - not pressing"
+        return
+    end
+    if on == nil and not newLife then
+        P.kenNote = "cannot see PlayerGui.ScreenGui - timed check skipped"
+        return
+    end
+    stats.hakiPresses += 1
+    pressKey(Enum.KeyCode.E)
+    say("observation off - pressing E")
+    P.kenNote = "OFF - pressed E, checking"
+    if on ~= nil then kenVerifyAt = now + 2.5 end
 end
 
 local SKILL_KEYS = {
@@ -2372,6 +2661,7 @@ local function gatherPass(list)
             if stale(myEpoch) or not P.running or not moveEnabled then return end
             if healthPct() < CFG.MinHealthPercent then return end
             if not e.model.Parent or e.hum.Health <= 0 then break end
+            setChase(e.root.Position)
             local d = station(e.root)
             if d <= reach then
                 if CFG.M1 then pressM1() end
@@ -2495,6 +2785,7 @@ local function step()
     local creeping    = false          -- last window closed with no ground gained
     local targetDetours = 0            -- detours spent on this one target
     local unreachable = false          -- three detours: give it up
+    local targetGhosts = 0             -- times it has gone through for this one
     say(string.format("%s  %.0f studs  hp %.0f%s", target.name, bestD, lastHP,
         escalation > 0 and ("  [esc " .. escalation .. "]") or ""))
 
@@ -2562,7 +2853,7 @@ local function step()
             lastLookAt  = os.clock()
             stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
             windowAt, windowPos, creeping = nil, nil, false
-            targetDetours, unreachable, pathUntil = 0, false, 0
+            targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
             -- NO DASH HERE. This is the instant the new target was chosen and
             -- the character has not turned or moved yet, so a dash fired now
             -- goes wherever the body was last pointing -- at the one that just
@@ -2584,6 +2875,7 @@ local function step()
         -- the ray sees the ledge, and the jump takes it up.
         local dy    = math.abs(target.root.Position.Y - r.Position.Y)
         local climb = dy > 6
+        setChase(target.root.Position)     -- tells the ghost how high "there" is
         local d = station(target.root, climb)
         aimCameraAt(r, target.root.Position)
 
@@ -2623,7 +2915,7 @@ local function step()
                         lastHP      = target.hum.Health
                         stuckSince, panicked, targetPanics, lateralSide = nil, false, 0, nil
                         windowAt, windowPos, creeping = nil, nil, false
-                        targetDetours, unreachable, pathUntil = 0, false, 0
+                        targetDetours, unreachable, pathUntil, targetGhosts = 0, false, 0, 0
                         stats.switches += 1
                         say(string.format("%s is nearer  %.0f studs", target.name, nd))
                         task.wait()
@@ -2679,12 +2971,29 @@ local function step()
             end
             local stuck = pushing and (ground < 1.5 or creeping)
             local ledgeUp = ledge and climb
+            -- Going through already: give it the time to get out the far side
+            -- instead of calling that "stuck" and firing a burst mid-trunk.
+            if ghosting and now - ghostSince < 2.5 then stuck, ledgeUp = false, false end
             if stuck or ledgeUp then
                 stuckSince = stuckSince or now
                 local held = now - stuckSince
                 if (held > 0.3 or ledgeUp) and not panicked then
                     panicked = true
-                    if CFG.Panic and dirT and targetPanics < 4 then
+                    -- THROUGH IT. With Panic on, one legal burst gets its try
+                    -- first; the moment one has failed, it goes through. With
+                    -- Panic off it goes through straight away. Twice per
+                    -- target, then the bursts and the pathing below as before.
+                    local goThrough = CFG.Ghost and dirT and targetGhosts < 2
+                        and now >= ghostQuietUntil
+                        and ((not CFG.Panic) or targetPanics >= 1)
+                    if goThrough then
+                        targetGhosts += 1
+                        ghostOn(climb and "going up and through" or "going through")
+                        stuckSince, panicked = nil, false
+                        windowAt, windowPos, creeping = nil, nil, false
+                        task.wait()
+                        continue
+                    elseif CFG.Panic and dirT and targetPanics < 4 then
                         targetPanics += 1
                         stats.panics += 1
                         -- Above: climb first, then sideways. Level: sideways
@@ -3580,10 +3889,16 @@ local function buildUI()
             "Checked every pass; J is pressed when the character lacks it",
             function() return CFG.AutoBuso end,
             function(x) CFG.AutoBuso = x end)
-        switchRow(v, "Observation (E) - back on after a death",
-            "Once per life, after the Enhancement press has landed",
+        switchRow(v, "Observation (E) - keep it on",
+            "Checked after a death and on a timer; E only when it is off",
             function() return CFG.AutoKen end,
             function(x) CFG.AutoKen = x end)
+        sliderRow(v, "Check Observation every", 1, 15, 1,
+            function() return (CFG.KenEvery or 300) / 60 end,
+            function(x)
+                CFG.KenEvery = x * 60
+                kenNextAt = math.min(kenNextAt, os.clock() + CFG.KenEvery)
+            end, " min")
         readout(v, function()
             local lines = {}
             table.insert(lines, "Held now: " .. tostring(P.heldTool() or "nothing")
@@ -3596,20 +3911,27 @@ local function buildUI()
                 table.insert(lines, "Enhancement: not managed.")
             end
             if CFG.AutoKen then
-                table.insert(lines, (kenChar == player.Character)
-                    and "Observation: E pressed this life, or trusted from start."
-                    or  "Observation: will press E once the character is taking input.")
+                local on = kenOn()
+                table.insert(lines, "Observation now: "
+                    .. (on == true and "ON (dodge counter showing)"
+                        or on == false and "OFF (no dodge counter)"
+                        or "cannot tell (no PlayerGui.ScreenGui)")
+                    .. string.format(".  Next look in %d:%02d.",
+                        math.floor(P.kenNextIn() / 60), math.floor(P.kenNextIn() % 60)))
+                table.insert(lines, "Last: " .. tostring(P.kenNote))
             else
                 table.insert(lines, "Observation: not managed.")
             end
             return table.concat(lines, "\n")
         end)
-        caption(v, "E is a toggle and cannot be read back, so it is never "
-            .. "pressed blind. At start, if Enhancement is already on, your "
-            .. "setup is trusted and E is left alone. If Enhancement is off at "
-            .. "start it is a fresh life, and both go back on. If the "
-            .. "Enhancement line above says OFF while you can see it is on, "
-            .. "the marker name is wrong - tell me.")
+        caption(v, "E is a toggle, so it is pressed only when the dodge "
+            .. "counter is gone - it can never turn an Observation that is on "
+            .. "off. It is looked at on the timer above and after every death. "
+            .. "If 'Observation now' says OFF while you can see your dodges, "
+            .. "the marker is wrong: after two presses that do not bring it "
+            .. "up (so E ends where it started) the timer stops pressing and "
+            .. "says so under Last. If the Enhancement line says OFF while "
+            .. "you can see it is on, that marker is wrong - tell me.")
     end
 
     -- =====================================================
@@ -3636,6 +3958,33 @@ local function buildUI()
             .. "to pathfinding for eight seconds; three of those and the "
             .. "enemy is left alone. An enemy up on a ledge counts as out of "
             .. "reach, so it climbs to it instead of swinging into the wall.")
+
+        switchRow(v, "Walk through it when stuck",
+            "Collisions off until clear; lifted onto higher ground",
+            function() return CFG.Ghost end,
+            function(x)
+                CFG.Ghost = x
+                if not x then pcall(ghostRelease) end
+            end)
+        sliderRow(v, "Blocked for", 0.5, 5, 0.5,
+            function() return CFG.GhostAfter end,
+            function(x) CFG.GhostAfter = x end, " s")
+        readout(v, function()
+            local on, why = P.ghosting()
+            return (on and ("Going through now - " .. tostring(why)) or "Solid.")
+                .. "  Gone through " .. stats.ghosts .. " times, lifted "
+                .. stats.lifts .. "."
+        end)
+        caption(v, "The farm walks, the quest walk, the gather and the fight "
+            .. "are all watched the same way: asked to move and gaining no "
+            .. "ground for this long, and the character's collisions go off. "
+            .. "It walks straight through the trunk or the wall, still "
+            .. "standing on the floor. If where it is going is higher - a "
+            .. "ledge, higher land - it is kicked up to that height as well. "
+            .. "Collisions come back only once it is clear of everything "
+            .. "solid. In a fight with Panic on, one burst is tried first; "
+            .. "with Panic off it goes through at once. The server does see "
+            .. "you pass through a solid - only when stuck, only until clear.")
 
         switchRow(v, "Panic when stuck",
             "Big bursts: stacked air jumps, sideways dashes",
@@ -4114,6 +4463,8 @@ local function buildUI()
                 "panics      " .. stats.panics .. "   (stuck bursts: climb or sideways)",
                 "panic dash  " .. stats.panicDashes .. "   (dashes spent inside bursts)",
                 "detours     " .. stats.detours .. "   (hop did nothing, pathed round for 8s)",
+                "ghosts      " .. stats.ghosts .. "   (blocked; walked through)   lifts " .. stats.lifts
+                    .. "   fell " .. stats.ghostFalls,
                 "gui scans   " .. tostring(P.questScans or 0)
                     .. "   (full PlayerGui walks - should stay tiny)",
                 "retreats    " .. stats.retreats,
@@ -4176,13 +4527,14 @@ function P.start(name)
 
     keepWeapon()
     startSpeedHold()
-    -- Trust your setup at start. If Enhancement is on, Observation is left
-    -- exactly as you have it. If Enhancement is off, this is a fresh life and
-    -- both go back on -- see keepHaki. With Enhancement not managed there is
-    -- nothing to infer from, so E is never pressed at start.
+    -- If Enhancement is off at start, this is a fresh life and both go back
+    -- on -- see keepHaki. Otherwise the life is treated as settled, and
+    -- Observation gets its timed look straight away: the dodge counter is
+    -- read, and E is pressed only if it is not showing.
     seenChar, seenCharAt = player.Character, os.clock() - 10
     busoTries = 0
     P.kenDone = false
+    kenNextAt, kenVerifyAt, kenMisses, kenBlind = 0, nil, 0, false
     if CFG.AutoBuso and not hasBuso() then
         kenChar = nil
     else
@@ -4192,6 +4544,10 @@ function P.start(name)
     -- at all until CFG.FastAttack is on.
     pcall(installFastAttack)
     if not (gui and gui.Parent) then pcall(buildUI) end
+
+    -- The ghost watcher: every frame, whatever is walking the character.
+    blockAt = nil
+    track(RunService.Heartbeat:Connect(function() pcall(ghostWatch) end))
 
     track(player.Idled:Connect(function()
         pcall(function()
@@ -4243,6 +4599,7 @@ function P.stop()
     if fastConn then pcall(function() fastConn:Disconnect() end) fastConn = nil end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     table.clear(conns)
+    pcall(ghostRelease)
     setState("IDLE")
     say("stopped")
     print(string.format("[BFP] stopped. kills=%d swings=%d quests=%d",
