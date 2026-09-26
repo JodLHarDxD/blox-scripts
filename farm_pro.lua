@@ -4637,6 +4637,9 @@ local function buildUI()
                     CFG.Target = nil
                     activeName = nil
                     P.lockedQuest = nil
+                    -- A new target takes ITS quest from the table: any quest,
+                    -- tier or giver typed by hand was for the old one.
+                    CFG.QuestName, CFG.QuestTier, CFG.QuestGiverName = nil, nil, nil
                     setState("RESOLVE")
                     say("target: by level")
                 end)
@@ -4648,6 +4651,9 @@ local function buildUI()
                         CFG.Target = n
                         activeName = nil
                         P.lockedQuest = nil
+                        -- A new target takes ITS quest from the table: any quest,
+                        -- tier or giver typed by hand was for the old one.
+                        CFG.QuestName, CFG.QuestTier, CFG.QuestGiverName = nil, nil, nil
                         setState("RESOLVE")
                         say("target: " .. n)
                     end)
@@ -4662,6 +4668,7 @@ local function buildUI()
             CFG.Target = val
             activeName = nil
             P.lockedQuest = nil
+            CFG.QuestName, CFG.QuestTier, CFG.QuestGiverName = nil, nil, nil
             setState("RESOLVE")
             say("target: " .. val)
             signature = nil
@@ -5385,7 +5392,10 @@ end
 -- =========================================================
 function P.start(name)
     if P.running then P.stop() end
-    if type(name) == "string" and #name > 0 then CFG.Target = name end
+    if type(name) == "string" and #name > 0 and name ~= CFG.Target then
+        CFG.Target = name
+        CFG.QuestName, CFG.QuestTier, CFG.QuestGiverName = nil, nil, nil
+    end
 
     for k in pairs(stats) do stats[k] = 0 end
     stats.startedAt = os.clock()
