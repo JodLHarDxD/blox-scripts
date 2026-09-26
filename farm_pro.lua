@@ -653,6 +653,9 @@ local blacklist      = {}
 local countedDead    = {}
 local conns          = {}
 local moveEnabled    = true
+-- The invisible floor kept at the deep sea's surface (Submerged Island).
+-- Declared here so every ray and overlap the script casts can leave it out.
+local waterFloor     = nil
 
 local activeName     = nil     -- the ONE species being farmed
 local farmSpot       = nil     -- where that species lives
@@ -926,6 +929,7 @@ local function rayHit(r, dir, len, yOff)
     if char then table.insert(excl, char) end
     local enemies = workspace:FindFirstChild("Enemies")
     if enemies then table.insert(excl, enemies) end
+    if waterFloor then table.insert(excl, waterFloor) end
     local ok, hit = pcall(function()
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
@@ -1031,6 +1035,7 @@ local function bodyClear(char)
     end
     local enemies = workspace:FindFirstChild("Enemies")
     if enemies then table.insert(excl, enemies) end
+    if waterFloor then table.insert(excl, waterFloor) end
     local op = OverlapParams.new()
     op.FilterType = Enum.RaycastFilterType.Exclude
     op.FilterDescendantsInstances = excl
@@ -1193,6 +1198,163 @@ local function keepWater()
         P.waterSets += 1
     end
     P.waterNote = "solid - standing on the surface"
+end
+
+-- ---------------------------------------------------------
+-- THE DEEP SEA: SUBMERGED ISLAND
+-- ---------------------------------------------------------
+-- Submerged Island is not ON the sea, it is at the BOTTOM of it: about
+-- 1900-2200 studs below sea level, reached only by the submarine at Tiki
+-- Outpost, with a sea of its own round it. The slab raised above is the one
+-- at sea level, nowhere near there -- which is why water was land on every
+-- island from Port Town to the Sea of Treats and not on this one.
+--
+-- Nothing public says what that deep sea is made of, so all three things a
+-- Roblox sea can be are handled -- and ONLY down there (below DEEP_Y), so no
+-- other island is touched:
+--   * its own floor slab like the one at sea level (a part named WaterBase):
+--     raised the same way, 32 taller, so its top comes up 16;
+--   * terrain water: the surface is read from the voxels under you;
+--   * a see-through water part you sink into: its top.
+-- For the last two an invisible floor is kept at the surface, under your
+-- feet, following you every frame; if you are already under the surface you
+-- are lifted onto it. The panel says which one it found.
+local DEEP_Y = -1000
+local deepNote = "not down there"
+local deepSurf, deepSurfAt, deepLiftAt = nil, 0, 0
+local slabOrig = {}
+P.deepLifts = 0
+P.deepNote = function() return deepNote end
+
+local function deepExcl()
+    local excl = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then table.insert(excl, pl.Character) end
+    end
+    local enemies = workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(excl, enemies) end
+    if waterFloor then table.insert(excl, waterFloor) end
+    return excl
+end
+
+-- The highest terrain water in this column between yLo and yHi, or nil; and
+-- whether it reached the very top of the window (the surface is higher).
+local function terrainWaterTop(x, z, yLo, yHi)
+    local region = Region3.new(Vector3.new(x - 2, yLo, z - 2),
+        Vector3.new(x + 2, yHi, z + 2)):ExpandToGrid(4)
+    local mats, occs = workspace.Terrain:ReadVoxels(region, 4)
+    local sz = mats.Size
+    local minY = region.CFrame.Position.Y - region.Size.Y / 2
+    for iy = sz.Y, 1, -1 do
+        for ix = 1, sz.X do
+            for iz = 1, sz.Z do
+                if mats[ix][iy][iz] == Enum.Material.Water then
+                    return minY + (iy - 1) * 4 + 4 * math.min(1, occs[ix][iy][iz] or 1),
+                        iy == sz.Y
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Water parts in this column: the top of the highest one you would sink into
+-- (not collidable, named water or made of water), and any floor slab named
+-- WaterBase.
+local function partWater(pos, yLo, yHi)
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Exclude
+    op.FilterDescendantsInstances = deepExcl()
+    op.RespectCanCollide = false
+    local hits = workspace:GetPartBoundsInBox(CFrame.new(pos.X, (yLo + yHi) / 2, pos.Z),
+        Vector3.new(4, yHi - yLo, 4), op)
+    local top, slab = nil, nil
+    for _, part in ipairs(hits) do
+        local n = string.lower(part.Name)
+        if string.find(n, "waterbase", 1, true) then
+            slab = slab or part
+        elseif not part.CanCollide and (string.find(n, "water", 1, true)
+            or part.Material == Enum.Material.Water) then
+            local t = part.Position.Y + part.Size.Y / 2
+            if t <= yHi and (not top or t > top) then top = t end
+        end
+    end
+    return top, slab
+end
+
+local function parkFloor()
+    if waterFloor and waterFloor.Parent then waterFloor.Parent = nil end
+end
+
+local function deepTick()
+    local _, r, h = parts()
+    if not r or not h then parkFloor() return end
+    local pos, now = r.Position, os.clock()
+    if pos.Y > DEEP_Y then
+        parkFloor()
+        deepSurf, deepNote = nil, "not down there"
+        return
+    end
+
+    -- Read the surface ten times a second; follow it every frame.
+    if now - deepSurfAt > 0.1 then
+        deepSurfAt = now
+        local yLo, yHi = pos.Y - 60, pos.Y + 12
+        local okT, tw, capped = pcall(terrainWaterTop, pos.X, pos.Z, yLo, yHi)
+        if not okT then tw, capped = nil, false end
+        -- Deep under: the water fills the window to its top, so the surface
+        -- is higher still. Look further up, 64 studs at a time. Still water
+        -- 256 up is the ocean itself, not a sea to stand on: no floor.
+        local climbs = 0
+        while tw and capped and climbs < 4 do
+            climbs += 1
+            local ok2, t2, c2 = pcall(terrainWaterTop, pos.X, pos.Z, tw - 4, tw + 64)
+            if not ok2 or not t2 then break end
+            tw, capped = t2, c2
+        end
+        if tw and capped then tw = nil end
+        local okP, pw, slab = pcall(partWater, pos, yLo, yHi)
+        if not okP then pw, slab = nil, nil end
+        if slab then
+            local o = slabOrig[slab] or slab.Size.Y
+            slabOrig[slab] = o
+            if math.abs(slab.Size.Y - (o + 32)) > 0.5 then
+                slab.Size = Vector3.new(slab.Size.X, o + 32, slab.Size.Z)
+            end
+        end
+        deepSurf = tw or pw
+        if tw and pw then deepSurf = math.max(tw, pw) end
+        if deepSurf then
+            deepNote = string.format("%s at Y %.0f - standing on it",
+                tw and "terrain water" or ("water part"), deepSurf)
+        elseif slab then
+            deepNote = "deep floor slab '" .. slab.Name .. "' raised"
+        else
+            deepNote = "no water under you here"
+        end
+    end
+    if not deepSurf then parkFloor() return end
+
+    if not waterFloor then
+        local f = Instance.new("Part")
+        f.Name = "BFP_WaterFloor"
+        f.Anchored, f.CanCollide, f.CanTouch = true, true, false
+        f.Transparency = 1
+        f.Size = Vector3.new(24, 1, 24)
+        waterFloor = f
+    end
+    waterFloor.CFrame = CFrame.new(pos.X, deepSurf - 0.5, pos.Z)
+    if waterFloor.Parent ~= workspace then waterFloor.Parent = workspace end
+
+    -- Under the surface already: up onto it.
+    local feet = pos.Y - (h.HipHeight + r.Size.Y / 2)
+    if feet < deepSurf - 0.75 and deepSurf - feet < 300 and now - deepLiftAt > 0.4 then
+        deepLiftAt = now
+        r.CFrame = r.CFrame + Vector3.new(0, deepSurf - feet + 0.2, 0)
+        local v = r.AssemblyLinearVelocity
+        r.AssemblyLinearVelocity = Vector3.new(v.X, math.max(v.Y, 0), v.Z)
+        P.deepLifts += 1
+    end
 end
 
 -- =========================================================
@@ -1549,6 +1711,7 @@ local function navRays()
     end
     local enemies = workspace:FindFirstChild("Enemies")
     if enemies then table.insert(excl, enemies) end
+    if waterFloor then table.insert(excl, waterFloor) end
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Exclude
     rp.FilterDescendantsInstances = excl
@@ -4687,6 +4850,8 @@ local function buildUI()
         readout(v, function()
             return "Water: " .. tostring(P.waterNote) .. ".  Put back up "
                 .. tostring(P.waterSets) .. " times (the game resets it)."
+                .. "\nDeep sea (Submerged Island): " .. P.deepNote()
+                .. ".  Lifted out " .. tostring(P.deepLifts) .. " times."
         end)
         caption(v, "Water is land, always - no switch. The sea floor in this "
             .. "game sits under the surface, so standing on it is standing IN "
@@ -4694,7 +4859,10 @@ local function buildUI()
             .. "climbing an island edge from below. It is raised to the "
             .. "surface on your screen from the moment the script loads, so a "
             .. "lunge off the shore leaves you standing on the water and you "
-            .. "just run back. Your client only; rejoining resets it.")
+            .. "just run back. Your client only; rejoining resets it. "
+            .. "Submerged Island is at the bottom of the sea with a sea of its "
+            .. "own, far below the one raised above; down there only, an "
+            .. "invisible floor is kept at that sea's surface under your feet.")
 
         switchRow(v, "Panic when stuck",
             "Big bursts: stacked air jumps, sideways dashes",
@@ -5314,5 +5482,16 @@ task.spawn(function()
         pcall(keepWater)
         task.wait(0.25)
     end
+end)
+-- The deep sea (Submerged Island) is checked every frame, from load, farm
+-- running or not. Does nothing at all above DEEP_Y.
+local deepConn
+deepConn = RunService.Heartbeat:Connect(function()
+    if _G.BFP ~= P then
+        deepConn:Disconnect()
+        parkFloor()
+        return
+    end
+    pcall(deepTick)
 end)
 print("[BFP] loaded. Use the panel, or _G.BFP.start(\"Demonic Soul\")")
