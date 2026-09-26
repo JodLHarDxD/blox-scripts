@@ -350,6 +350,15 @@ local LEVELS = {
     {2525,2549,"Isle Champion",Vector3.new(-16848.9,21.7,1041.4)},
     {2550,2574,"Serpent Hunter",Vector3.new(-16621.4,121.4,1290.7)},
     {2575,2600,"Skull Slayer",Vector3.new(-16811.6,84.6,1542.2)},
+    -- Submerged Island, Update 27.1: the bottom of the sea under Tiki Outpost
+    -- (Y about -2000), reached only by the submarine. Spots from public farm
+    -- tables (two agree on each).
+    {2600,2624,"Reef Bandit",Vector3.new(10943.1,-2083.0,9177.3)},
+    {2625,2649,"Coral Pirate",Vector3.new(10713.4,-2093.0,9307.1)},
+    {2650,2674,"Sea Chanter",Vector3.new(10647.6,-2077.6,10080.0)},
+    {2675,2699,"Ocean Prophet",Vector3.new(11056.1,-2001.7,10117.4)},
+    {2700,2724,"High Disciple",Vector3.new(9843.6,-1993.5,9696.5)},
+    {2725,2800,"Grand Devotee",Vector3.new(9591.1,-1993.5,9808.7)},
 }
 P.levels = LEVELS
 
@@ -452,6 +461,14 @@ local QUESTS = {
     ["Isle Champion"]         = { "TikiQuest2", 2 },
     ["Serpent Hunter"]        = { "TikiQuest3", 1 },
     ["Skull Slayer"]          = { "TikiQuest3", 2 },
+    -- Submerged Island. Ocean Prophet's tier is from the wiki and one table;
+    -- the first accept probes tiers anyway and locks the one that matches.
+    ["Reef Bandit"]           = { "SubmergedQuest1", 1 },
+    ["Coral Pirate"]          = { "SubmergedQuest1", 2 },
+    ["Sea Chanter"]           = { "SubmergedQuest2", 1 },
+    ["Ocean Prophet"]         = { "SubmergedQuest2", 2 },
+    ["High Disciple"]         = { "SubmergedQuest3", 1 },
+    ["Grand Devotee"]         = { "SubmergedQuest3", 2 },
 }
 P.quests = QUESTS
 
@@ -520,6 +537,12 @@ local GIVER_POS = {
     ["Isle Champion"]         = Vector3.new(-16541.0, 54.8, 1051.5),
     ["Serpent Hunter"]        = Vector3.new(-16665.2, 104.6, 1579.7),
     ["Skull Slayer"]          = Vector3.new(-16665.2, 104.6, 1579.7),
+    ["Reef Bandit"]           = Vector3.new(10780.1, -2087.7, 9261.9),
+    ["Coral Pirate"]          = Vector3.new(10780.1, -2087.7, 9261.9),
+    ["Sea Chanter"]           = Vector3.new(10883.6, -2086.2, 10032.2),
+    ["Ocean Prophet"]         = Vector3.new(10883.6, -2086.2, 10032.2),
+    ["High Disciple"]         = Vector3.new(9635.9, -1992.4, 9614.4),
+    ["Grand Devotee"]         = Vector3.new(9635.9, -1992.4, 9614.4),
 }
 P.giverPositions = GIVER_POS
 
@@ -604,6 +627,12 @@ local GIVER_NAMES = {
     ["Isle Champion"]         = "Tiki Quest Giver 2",
     ["Serpent Hunter"]        = "Tiki Quest Giver 3",
     ["Skull Slayer"]          = "Tiki Quest Giver 3",
+    ["Reef Bandit"]           = "Submerged Quest Giver 1",
+    ["Coral Pirate"]          = "Submerged Quest Giver 1",
+    ["Sea Chanter"]           = "Submerged Quest Giver 2",
+    ["Ocean Prophet"]         = "Submerged Quest Giver 2",
+    ["High Disciple"]         = "Submerged Quest Giver 3",
+    ["Grand Devotee"]         = "Submerged Quest Giver 3",
 }
 P.giverNames = GIVER_NAMES
 
