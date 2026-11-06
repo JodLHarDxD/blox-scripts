@@ -47,6 +47,10 @@
         _G.BFP.start()          _G.BFP.stop()          _G.BFP.config
 ]]
 
+-- Through Roblox's scheduler first (2026-11-06): on Roblox 0.746 + Velocity 1.5.8
+-- a script running straight on from game:HttpGet dies on its first print.
+task.wait()
+
 if _G.BFP and _G.BFP.stop then pcall(_G.BFP.stop) end
 
 local Players      = game:GetService("Players")
